@@ -1,0 +1,26 @@
+project_id = "eapkylxvmqxbootmorfr"
+
+[functions.analyze-insights]
+verify_jwt = false
+
+[functions.export-csv]
+enabled = true
+verify_jwt = true
+import_map = "./functions/export-csv/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/export-csv/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/export-csv/*.html" ]
+
+[functions.cleanup-deleted]
+enabled = true
+verify_jwt = true
+import_map = "./functions/cleanup-deleted/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/cleanup-deleted/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/cleanup-deleted/*.html" ]

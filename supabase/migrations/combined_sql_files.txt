@@ -1,0 +1,2278 @@
+===== 20251230191046_57c8574d-bd64-4a89-96b1-69c7dcc11e93.sql =====
+
+-- Create profiles table for user business information
+CREATE TABLE public.profiles (
+  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  business_name TEXT NOT NULL DEFAULT 'My Business',
+  business_logo TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS on profiles
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- Profiles policies
+CREATE POLICY "Users can view their own profile"
+ON public.profiles FOR SELECT
+USING (auth.uid() = id);
+
+CREATE POLICY "Users can update their own profile"
+ON public.profiles FOR UPDATE
+USING (auth.uid() = id);
+
+CREATE POLICY "Users can insert their own profile"
+ON public.profiles FOR INSERT
+WITH CHECK (auth.uid() = id);
+
+-- Create forms table
+CREATE TABLE public.forms (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT,
+  questions JSONB NOT NULL DEFAULT '[]'::jsonb,
+  perk TEXT NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT true,
+  capture_name BOOLEAN NOT NULL DEFAULT true,
+  capture_email BOOLEAN NOT NULL DEFAULT false,
+  capture_phone BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS on forms
+ALTER TABLE public.forms ENABLE ROW LEVEL SECURITY;
+
+-- Forms policies
+CREATE POLICY "Users can CRUD their own forms"
+ON public.forms FOR ALL
+USING (auth.uid() = owner_id);
+
+CREATE POLICY "Anyone can read active forms"
+ON public.forms FOR SELECT
+USING (active = true);
+
+-- Create responses table
+CREATE TABLE public.responses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  form_id UUID NOT NULL REFERENCES public.forms(id) ON DELETE CASCADE,
+  customer_name TEXT,
+  customer_email TEXT,
+  customer_phone TEXT,
+  answers JSONB NOT NULL DEFAULT '{}'::jsonb,
+  redemption_code TEXT UNIQUE NOT NULL,
+  perk_redeemed BOOLEAN NOT NULL DEFAULT false,
+  additional_feedback TEXT,
+  submitted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS on responses
+ALTER TABLE public.responses ENABLE ROW LEVEL SECURITY;
+
+-- Responses policies
+CREATE POLICY "Form owners can view responses"
+ON public.responses FOR SELECT
+USING (
+  EXISTS (
+    SELECT 1 FROM public.forms
+    WHERE forms.id = responses.form_id
+    AND forms.owner_id = auth.uid()
+  )
+);
+
+CREATE POLICY "Form owners can update responses"
+ON public.responses FOR UPDATE
+USING (
+  EXISTS (
+    SELECT 1 FROM public.forms
+    WHERE forms.id = responses.form_id
+    AND forms.owner_id = auth.uid()
+  )
+);
+
+CREATE POLICY "Form owners can delete responses"
+ON public.responses FOR DELETE
+USING (
+  EXISTS (
+    SELECT 1 FROM public.forms
+    WHERE forms.id = responses.form_id
+    AND forms.owner_id = auth.uid()
+  )
+);
+
+CREATE POLICY "Anyone can create responses"
+ON public.responses FOR INSERT
+WITH CHECK (true);
+
+-- Create function to update timestamps
+CREATE OR REPLACE FUNCTION public.update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SET search_path = public;
+
+-- Triggers for timestamp updates
+CREATE TRIGGER update_profiles_updated_at
+BEFORE UPDATE ON public.profiles
+FOR EACH ROW
+EXECUTE FUNCTION public.update_updated_at_column();
+
+CREATE TRIGGER update_forms_updated_at
+BEFORE UPDATE ON public.forms
+FOR EACH ROW
+EXECUTE FUNCTION public.update_updated_at_column();
+
+-- Function to handle new user signup - creates profile
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, business_name)
+  VALUES (NEW.id, COALESCE(NEW.raw_user_meta_data ->> 'business_name', 'My Business'));
+  RETURN NEW;
+END;
+$$;
+
+-- Trigger to create profile on signup
+CREATE TRIGGER on_auth_user_created
+AFTER INSERT ON auth.users
+FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- Create storage bucket for business logos
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('logos', 'logos', true);
+
+-- Storage policies for logos
+CREATE POLICY "Anyone can view logos"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'logos');
+
+CREATE POLICY "Authenticated users can upload their own logo"
+ON storage.objects FOR INSERT
+WITH CHECK (bucket_id = 'logos' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+CREATE POLICY "Users can update their own logo"
+ON storage.objects FOR UPDATE
+USING (bucket_id = 'logos' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+CREATE POLICY "Users can delete their own logo"
+ON storage.objects FOR DELETE
+USING (bucket_id = 'logos' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+
+===== 20251231013117_b1d5c669-909b-43cf-8a4d-6e2ab4a7d60b.sql =====
+
+-- Rename description column to internal_goal
+ALTER TABLE public.forms RENAME COLUMN description TO internal_goal;
+
+
+===== 20251231021645_9de3a8a8-76c6-474e-be44-58aa9bbeeab8.sql =====
+
+-- Allow anyone to read profiles for displaying business info on customer forms
+CREATE POLICY "Anyone can view profiles for public display"
+ON public.profiles
+FOR SELECT
+USING (true);
+
+
+===== 20251231025647_7fc3ab32-4254-4da4-9d53-b995f2b6c324.sql =====
+
+-- Drop the public read policy from forms table
+DROP POLICY IF EXISTS "Anyone can read active forms" ON public.forms;
+
+-- Create a secure view that only exposes public-safe columns
+CREATE OR REPLACE VIEW public.public_forms AS
+SELECT 
+  id,
+  name,
+  perk,
+  questions,
+  capture_name,
+  capture_email,
+  capture_phone,
+  active,
+  created_at,
+  updated_at
+FROM public.forms
+WHERE active = true;
+
+-- Grant access to the view for anonymous and authenticated users
+GRANT SELECT ON public.public_forms TO anon;
+GRANT SELECT ON public.public_forms TO authenticated;
+
+
+===== 20260108031843_d531eea6-f3be-4c08-a40e-55e751fca352.sql =====
+
+-- Add notes column to profiles table
+ALTER TABLE public.profiles 
+ADD COLUMN notes TEXT DEFAULT NULL;
+
+
+===== 20260108032110_c49d066f-80f6-4b8a-9959-b83b48fb3070.sql =====
+
+-- Add notes column to responses table for responder notes
+ALTER TABLE public.responses 
+ADD COLUMN notes TEXT DEFAULT NULL;
+
+
+===== 20260108052446_8b46bee0-6d86-47a5-98f2-049d3f6baec5.sql =====
+
+-- Create a function to get profile data for a form (accessible by anyone)
+CREATE OR REPLACE FUNCTION public.get_form_profile(form_id_param UUID)
+RETURNS TABLE (
+  business_name TEXT,
+  business_logo TEXT
+) 
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT 
+    p.business_name,
+    p.business_logo
+  FROM profiles p
+  INNER JOIN forms f ON f.owner_id = p.id
+  WHERE f.id = form_id_param
+  AND f.active = true;
+$$;
+
+
+===== 20260114194317_8f08c481-e6d7-4d48-a6bf-afc1bfeda8a1.sql =====
+
+-- Create form_visits table to track QR scans/page visits
+CREATE TABLE public.form_visits (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    form_id uuid NOT NULL REFERENCES public.forms(id) ON DELETE CASCADE,
+    visitor_id text NOT NULL,
+    referrer text,
+    user_agent text,
+    visited_at timestamp with time zone NOT NULL DEFAULT now()
+);
+
+-- Create index for faster lookups
+CREATE INDEX idx_form_visits_form_id ON public.form_visits(form_id);
+CREATE INDEX idx_form_visits_visitor_id ON public.form_visits(visitor_id);
+
+-- Enable RLS
+ALTER TABLE public.form_visits ENABLE ROW LEVEL SECURITY;
+
+-- Anyone can insert visits (public forms)
+CREATE POLICY "Anyone can create form visits"
+ON public.form_visits
+FOR INSERT
+WITH CHECK (true);
+
+-- Form owners can view visits for their forms
+CREATE POLICY "Form owners can view visits"
+ON public.form_visits
+FOR SELECT
+USING (EXISTS (
+    SELECT 1 FROM public.forms
+    WHERE forms.id = form_visits.form_id
+    AND forms.owner_id = auth.uid()
+));
+
+-- Create flow_sessions table to track journey through forms
+CREATE TABLE public.flow_sessions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    form_id uuid NOT NULL REFERENCES public.forms(id) ON DELETE CASCADE,
+    visitor_id text NOT NULL,
+    current_node_id text,
+    visited_nodes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    partial_answers jsonb NOT NULL DEFAULT '{}'::jsonb,
+    status text NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'completed', 'abandoned')),
+    started_at timestamp with time zone NOT NULL DEFAULT now(),
+    last_activity_at timestamp with time zone NOT NULL DEFAULT now(),
+    completed_at timestamp with time zone,
+    response_id uuid REFERENCES public.responses(id) ON DELETE SET NULL
+);
+
+-- Create indexes for faster lookups
+CREATE INDEX idx_flow_sessions_form_id ON public.flow_sessions(form_id);
+CREATE INDEX idx_flow_sessions_visitor_id ON public.flow_sessions(visitor_id);
+CREATE INDEX idx_flow_sessions_status ON public.flow_sessions(status);
+
+-- Enable RLS
+ALTER TABLE public.flow_sessions ENABLE ROW LEVEL SECURITY;
+
+-- Anyone can create sessions (public forms)
+CREATE POLICY "Anyone can create flow sessions"
+ON public.flow_sessions
+FOR INSERT
+WITH CHECK (true);
+
+-- Anyone can update their own sessions (matched by visitor_id)
+CREATE POLICY "Visitors can update their own sessions"
+ON public.flow_sessions
+FOR UPDATE
+USING (true)
+WITH CHECK (true);
+
+-- Form owners can view sessions for their forms
+CREATE POLICY "Form owners can view sessions"
+ON public.flow_sessions
+FOR SELECT
+USING (EXISTS (
+    SELECT 1 FROM public.forms
+    WHERE forms.id = flow_sessions.form_id
+    AND forms.owner_id = auth.uid()
+));
+
+-- Create storage bucket for form uploads
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('form-uploads', 'form-uploads', true);
+
+-- Storage policies for form-uploads bucket
+-- Anyone can upload to responses path (customer uploads)
+CREATE POLICY "Anyone can upload response images"
+ON storage.objects
+FOR INSERT
+WITH CHECK (bucket_id = 'form-uploads' AND (storage.foldername(name))[1] = 'responses');
+
+-- Anyone can view uploaded images (public bucket)
+CREATE POLICY "Anyone can view form uploads"
+ON storage.objects
+FOR SELECT
+USING (bucket_id = 'form-uploads');
+
+-- Authenticated users can upload to forms path (section images)
+CREATE POLICY "Authenticated users can upload form section images"
+ON storage.objects
+FOR INSERT
+WITH CHECK (bucket_id = 'form-uploads' AND (storage.foldername(name))[1] = 'forms' AND auth.role() = 'authenticated');
+
+-- Authenticated users can update their uploads
+CREATE POLICY "Authenticated users can update form uploads"
+ON storage.objects
+FOR UPDATE
+USING (bucket_id = 'form-uploads' AND auth.role() = 'authenticated');
+
+-- Authenticated users can delete their uploads
+CREATE POLICY "Authenticated users can delete form uploads"
+ON storage.objects
+FOR DELETE
+USING (bucket_id = 'form-uploads' AND auth.role() = 'authenticated');
+
+
+===== 20260204192537_78725d14-e92f-4910-ab07-7bf4a1cfdca0.sql =====
+
+-- Re-add policy allowing public read access to active forms
+-- This is required for:
+-- 1. The public_forms view to work for anonymous users
+-- 2. Foreign key validation when inserting responses/flow_sessions
+CREATE POLICY "Anyone can read active forms"
+ON public.forms
+FOR SELECT
+USING (active = true);
+
+
+===== 20260204193236_282295a4-dcb1-4619-bede-21eb7fa611f5.sql =====
+
+-- Fix responses table - drop restrictive and create permissive
+DROP POLICY IF EXISTS "Anyone can create responses" ON public.responses;
+CREATE POLICY "Anyone can create responses" ON public.responses 
+  FOR INSERT TO public WITH CHECK (true);
+
+-- Fix flow_sessions table - drop restrictive and create permissive
+DROP POLICY IF EXISTS "Anyone can create flow sessions" ON public.flow_sessions;
+CREATE POLICY "Anyone can create flow sessions" ON public.flow_sessions 
+  FOR INSERT TO public WITH CHECK (true);
+
+-- Fix form_visits table - drop restrictive and create permissive
+DROP POLICY IF EXISTS "Anyone can create form visits" ON public.form_visits;
+CREATE POLICY "Anyone can create form visits" ON public.form_visits 
+  FOR INSERT TO public WITH CHECK (true);
+
+
+===== 20260204194734_aae0c263-1216-4373-a1ba-3dc5efa582c2.sql =====
+
+-- Allow anyone to read responses for active forms
+-- This enables INSERT...RETURNING to work for anonymous submissions
+CREATE POLICY "Anyone can read responses for active forms"
+ON public.responses
+FOR SELECT
+USING (
+  EXISTS (
+    SELECT 1 FROM forms 
+    WHERE forms.id = responses.form_id 
+    AND forms.active = true
+  )
+);
+
+
+===== 20260207021502_5ed0be5c-4980-4846-a802-25167056f316.sql =====
+
+-- Fix flow_sessions RLS policies - they need to be PERMISSIVE, not RESTRICTIVE
+
+-- Drop existing restrictive policies
+DROP POLICY IF EXISTS "Anyone can create flow sessions" ON public.flow_sessions;
+DROP POLICY IF EXISTS "Form owners can view sessions" ON public.flow_sessions;
+DROP POLICY IF EXISTS "Visitors can update their own sessions" ON public.flow_sessions;
+
+-- Re-create as PERMISSIVE policies (default)
+CREATE POLICY "Anyone can create flow sessions"
+  ON public.flow_sessions
+  FOR INSERT
+  TO public
+  WITH CHECK (true);
+
+CREATE POLICY "Form owners can view sessions"
+  ON public.flow_sessions
+  FOR SELECT
+  TO authenticated
+  USING (EXISTS (
+    SELECT 1 FROM forms
+    WHERE forms.id = flow_sessions.form_id
+    AND forms.owner_id = auth.uid()
+  ));
+
+CREATE POLICY "Visitors can update their own sessions"
+  ON public.flow_sessions
+  FOR UPDATE
+  TO public
+  USING (true)
+  WITH CHECK (true);
+
+
+===== 20260214012000_phase1_schema.sql =====
+
+-- Phase 1 Schema Changes for Soberish Pilot
+
+-- 1. Create Stores Table
+CREATE TABLE public.stores (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    location TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS for stores
+ALTER TABLE public.stores ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own stores"
+ON public.stores FOR ALL
+USING (auth.uid() = owner_id);
+
+-- 2. Create Zones Table
+CREATE TABLE public.zones (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS for zones
+ALTER TABLE public.zones ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own zones"
+ON public.zones FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = zones.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 3. Create Products Table
+CREATE TABLE public.products (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    image_url TEXT,
+    sku TEXT,
+    price DECIMAL(10, 2),
+    in_stock BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS for products
+ALTER TABLE public.products ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own products"
+ON public.products FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = products.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 4. Create Tags Table (for product matching)
+CREATE TABLE public.tags (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    category TEXT, -- e.g., 'Mood', 'Flavor', 'Strength'
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
+);
+
+-- Enable RLS for tags
+ALTER TABLE public.tags ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own tags"
+ON public.tags FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = tags.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 5. Product Tags Junction
+CREATE TABLE public.product_tags (
+    product_id UUID REFERENCES public.products(id) ON DELETE CASCADE,
+    tag_id UUID REFERENCES public.tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (product_id, tag_id)
+);
+
+-- Enable RLS for product_tags
+ALTER TABLE public.product_tags ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own product tags"
+ON public.product_tags FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.products
+        JOIN public.stores ON products.store_id = stores.id
+        WHERE products.id = product_tags.product_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 6. Add optional store_id and zone_id to forms
+ALTER TABLE public.forms
+ADD COLUMN store_id UUID REFERENCES public.stores(id) ON DELETE SET NULL,
+ADD COLUMN zone_id UUID REFERENCES public.zones(id) ON DELETE SET NULL,
+ADD COLUMN flow_type TEXT DEFAULT 'standard'; -- 'standard', 'entrance', 'zone'
+
+-- 7. Add Triggers for updated_at
+CREATE TRIGGER update_stores_updated_at
+BEFORE UPDATE ON public.stores
+FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+CREATE TRIGGER update_zones_updated_at
+BEFORE UPDATE ON public.zones
+FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+CREATE TRIGGER update_products_updated_at
+BEFORE UPDATE ON public.products
+FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+
+
+===== 20260214013500_customer_profiles.sql =====
+
+-- Create customers table
+CREATE TABLE IF NOT EXISTS public.customers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID REFERENCES public.stores(id),
+    name TEXT,
+    email TEXT,
+    phone TEXT,
+    traits JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Indexes for faster lookups
+CREATE INDEX IF NOT EXISTS idx_customers_store_id ON public.customers(store_id);
+CREATE INDEX IF NOT EXISTS idx_customers_email ON public.customers(email);
+CREATE INDEX IF NOT EXISTS idx_customers_phone ON public.customers(phone);
+
+-- Add unique constraints (careful with nullable fields)
+-- Ensure unique email per store
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_store_email ON public.customers(store_id, email) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_customers_store_phone ON public.customers(store_id, phone) WHERE phone IS NOT NULL;
+
+-- Enable RLS
+ALTER TABLE public.customers ENABLE ROW LEVEL SECURITY;
+
+-- Policies for anon/auth access (similar to responses)
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.customers for INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.customers for SELECT TO anon, authenticated USING (true);
+CREATE POLICY "Enable update for anon/authenticated users" ON public.customers for UPDATE TO anon, authenticated USING (true);
+
+
+
+===== 20260215000000_merge_traits.sql =====
+
+-- Function to safely merge customer traits (JSONB)
+-- This allows us to accumulate tags/preferences over time instead of overwriting them.
+-- Usage: SELECT merge_customer_traits('store_uuid', 'email@example.com', '{"tags": ["new_tag"]}'::jsonb);
+
+CREATE OR REPLACE FUNCTION public.merge_customer_traits(
+    p_store_id UUID,
+    p_email TEXT,
+    p_phone TEXT,
+    p_name TEXT,
+    p_new_traits JSONB
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_customer_id UUID;
+    v_current_traits JSONB;
+    v_merged_traits JSONB;
+BEGIN
+    -- 1. Try to find existing customer by email OR phone within this store
+    SELECT id, traits INTO v_customer_id, v_current_traits
+    FROM public.customers
+    WHERE store_id = p_store_id
+    AND (
+        (p_email IS NOT NULL AND email = p_email)
+        OR 
+        (p_phone IS NOT NULL AND phone = p_phone)
+    )
+    LIMIT 1;
+
+    -- 2. If customer exists, merge traits
+    IF v_customer_id IS NOT NULL THEN
+        -- Simple merge: Shallow merge of top-level keys. 
+        -- For "tags" array, we want to combine unique values.
+        
+        -- Logic:
+        -- A) Merge top-level keys (new overwrites old for scalars)
+        -- B) Specifically handle 'tags' key to be a set union
+        
+        SELECT 
+            jsonb_set(
+                COALESCE(v_current_traits, '{}'::jsonb) || p_new_traits, -- Base merge
+                '{tags}', -- Target path
+                (
+                    SELECT jsonb_agg(DISTINCT elem)
+                    FROM (
+                        SELECT jsonb_array_elements(COALESCE(v_current_traits->'tags', '[]'::jsonb)) AS elem
+                        UNION
+                        SELECT jsonb_array_elements(COALESCE(p_new_traits->'tags', '[]'::jsonb)) AS elem
+                    ) t
+                )
+            )
+        INTO v_merged_traits;
+
+        -- Update the customer
+        UPDATE public.customers
+        SET 
+            traits = v_merged_traits,
+            name = COALESCE(p_name, name), -- Update name if provided
+            email = COALESCE(p_email, email), -- Update identifiers if provided (and not conflicting)
+            phone = COALESCE(p_phone, phone),
+            updated_at = now()
+        WHERE id = v_customer_id;
+        
+        RETURN v_customer_id;
+    
+    ELSE
+        -- 3. If new customer, insert
+        INSERT INTO public.customers (store_id, email, phone, name, traits)
+        VALUES (p_store_id, p_email, p_phone, p_name, p_new_traits)
+        RETURNING id INTO v_customer_id;
+        
+        RETURN v_customer_id;
+    END IF;
+END;
+$$;
+
+
+
+===== 20260215000500_analytics_schema.sql =====
+
+-- Add zone_id to form_visits to track where scans mimic
+-- This allows us to see "Red Wine Zone" vs "Entrance" performance
+
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='form_visits' AND column_name='zone_id') THEN
+        ALTER TABLE public.form_visits ADD COLUMN zone_id UUID REFERENCES public.zones(id) ON DELETE SET NULL;
+    END IF;
+END $$;
+
+-- Index for faster analytics queries
+CREATE INDEX IF NOT EXISTS idx_form_visits_zone_id ON public.form_visits(zone_id);
+
+-- Update RLS if needed (usually public insert is already allowed for anon)
+-- existing policies on form_visits should cover this if they allow INSERT for anon.
+
+
+
+===== 20260217000000_zone_tags.sql =====
+
+-- Migration: zone_tags junction table
+-- Phase 1: Critical schema gap - zones need many-to-many relationship with tags
+
+CREATE TABLE public.zone_tags (
+    zone_id UUID REFERENCES public.zones(id) ON DELETE CASCADE,
+    tag_id UUID REFERENCES public.tags(id) ON DELETE CASCADE,
+    PRIMARY KEY (zone_id, tag_id)
+);
+
+-- Enable RLS (Row Level Security)
+ALTER TABLE public.zone_tags ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Users can only manage zone_tags for zones they own
+CREATE POLICY "Users can CRUD their own zone tags"
+ON public.zone_tags FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.zones
+        JOIN public.stores ON zones.store_id = stores.id
+        WHERE zones.id = zone_tags.zone_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- Indexes for performance
+CREATE INDEX idx_zone_tags_zone_id ON public.zone_tags(zone_id);
+CREATE INDEX idx_zone_tags_tag_id ON public.zone_tags(tag_id);
+
+-- Comments for documentation
+COMMENT ON TABLE public.zone_tags IS 'Junction table linking zones to tags for recommendation filtering';
+COMMENT ON COLUMN public.zone_tags.zone_id IS 'Reference to zone';
+COMMENT ON COLUMN public.zone_tags.tag_id IS 'Reference to tag';
+
+
+
+===== 20260217000100_tag_constraint_type.sql =====
+
+-- Migration: Tag constraint type
+-- Phase 1: Distinguish hard constraints (No-sugar, THC-free) from soft preferences (Social, Calm)
+
+ALTER TABLE public.tags
+ADD COLUMN is_hard_constraint BOOLEAN DEFAULT false;
+
+-- Add index for efficient filtering by constraint type
+CREATE INDEX idx_tags_constraint_type ON public.tags(store_id, is_hard_constraint);
+
+-- Comments for documentation
+COMMENT ON COLUMN public.tags.is_hard_constraint IS 'True for strict requirements (No-sugar, THC-free, Vegan), false for preferences (Social, Calm, Focus). Hard constraints filter products with AND logic, soft preferences use ANY logic.';
+
+
+
+===== 20260217000200_product_staff_picks.sql =====
+
+-- Migration: Product staff picks and zone assignment
+-- Phase 1: Add fallback recommendations and zone-first filtering support
+
+ALTER TABLE public.products
+ADD COLUMN is_staff_pick BOOLEAN DEFAULT false,
+ADD COLUMN zone_id UUID REFERENCES public.zones(id) ON DELETE SET NULL;
+
+-- Partial index for quick staff pick queries (only index where true)
+CREATE INDEX idx_products_staff_pick ON public.products(store_id, is_staff_pick) WHERE is_staff_pick = true;
+
+-- Index for zone-based filtering
+CREATE INDEX idx_products_zone ON public.products(zone_id);
+
+-- Comments for documentation
+COMMENT ON COLUMN public.products.is_staff_pick IS 'True for products to show when no tag matches found (fallback recommendations). Should be 2-3 per zone or 4-6 globally per store.';
+COMMENT ON COLUMN public.products.zone_id IS 'Optional zone assignment for zone-first filtering. When customer scans zone QR, products from this zone are prioritized.';
+
+
+
+===== 20260217100000_zone_education_copy.sql =====
+
+-- Migration: Add zone education fields
+-- Purpose: Support zone content injection with What/When/Who format
+
+ALTER TABLE public.zones
+ADD COLUMN zone_what TEXT DEFAULT '',
+ADD COLUMN zone_when TEXT DEFAULT '',
+ADD COLUMN zone_who TEXT DEFAULT '';
+
+-- Backfill existing zones with placeholder copy
+UPDATE public.zones 
+SET 
+  zone_what = 'Explore this curated selection.',
+  zone_when = 'Browse anytime.',
+  zone_who = 'Everyone is welcome.'
+WHERE zone_what IS NULL OR zone_what = '';
+
+-- Add comments for documentation
+COMMENT ON COLUMN zones.zone_what IS 'What is this zone about? (1 sentence)';
+COMMENT ON COLUMN zones.zone_when IS 'When to explore this zone? (1 sentence)';
+COMMENT ON COLUMN zones.zone_who IS 'Who is this for? (1 sentence)';
+
+
+
+===== 20260218000000_store_integrations.sql =====
+
+-- Migration: Store Integrations
+-- Stores API keys for third-party integrations (Squarespace, Lightspeed, Shopify)
+
+CREATE TABLE public.store_integrations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL CHECK (platform IN ('squarespace', 'lightspeed', 'shopify')),
+    api_key TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    UNIQUE (store_id, platform)
+);
+
+-- Enable RLS
+ALTER TABLE public.store_integrations ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own integrations"
+ON public.store_integrations FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = store_integrations.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- Trigger for updated_at
+CREATE TRIGGER update_store_integrations_updated_at
+BEFORE UPDATE ON public.store_integrations
+FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+COMMENT ON TABLE public.store_integrations IS 'Stores third-party platform API keys per store. One row per platform per store.';
+
+
+
+===== 20260221162020_tag_description.sql =====
+
+-- Migration: Add description to tags
+-- Phase 1: Support explanatory text for tags
+
+ALTER TABLE public.tags
+ADD COLUMN description TEXT;
+
+-- Comments for documentation
+COMMENT ON COLUMN public.tags.description IS 'An explanatory description of the tag.';
+
+
+
+===== 20260222012000_phase1_schema_updates.sql =====
+
+-- Products
+ALTER TABLE public.products
+  ADD COLUMN IF NOT EXISTS in_stock       boolean DEFAULT true,
+  ADD COLUMN IF NOT EXISTS featured_from  timestamptz,
+  ADD COLUMN IF NOT EXISTS active         boolean DEFAULT true,
+  ADD COLUMN IF NOT EXISTS deleted_at     timestamptz,
+  ADD COLUMN IF NOT EXISTS lightspeed_sku_id varchar;
+  
+DO $$ 
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'products_lightspeed_sku_id_key') THEN
+    ALTER TABLE public.products ADD CONSTRAINT products_lightspeed_sku_id_key UNIQUE (lightspeed_sku_id);
+  END IF;
+END $$;
+
+-- Zones
+ALTER TABLE public.zones
+  ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+
+-- Customers
+ALTER TABLE public.customers
+  ADD COLUMN IF NOT EXISTS last_active    timestamptz,
+  ADD COLUMN IF NOT EXISTS visit_count    int DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS skus_shown_all text[],
+  ADD COLUMN IF NOT EXISTS last_seen      timestamptz,
+  ADD COLUMN IF NOT EXISTS zones_saved    text[],
+  ADD COLUMN IF NOT EXISTS location_id    varchar,
+  ADD COLUMN IF NOT EXISTS anon_id        varchar,
+  ADD COLUMN IF NOT EXISTS deleted_at     timestamptz;
+
+DO $$ 
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'customers_phone_key') THEN
+    ALTER TABLE public.customers ADD CONSTRAINT customers_phone_key UNIQUE (phone);
+  END IF;
+END $$;
+
+-- Admin users
+DO $$ 
+BEGIN
+  ALTER TABLE public.admin_users
+    ADD COLUMN IF NOT EXISTS role varchar NOT NULL DEFAULT 'staff';
+EXCEPTION
+  WHEN undefined_table THEN
+    NULL;
+END $$;
+
+DO $$ 
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'admin_users_role_check') THEN
+    ALTER TABLE public.admin_users ADD CONSTRAINT admin_users_role_check CHECK (role IN ('owner', 'staff'));
+  END IF;
+EXCEPTION
+  WHEN undefined_table THEN
+    NULL;
+END $$;
+
+-- New tables
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id           varchar PRIMARY KEY,
+  display_name varchar NOT NULL,
+  description  text,
+  is_default   boolean DEFAULT false,
+  zones        text[],
+  created_at   timestamptz DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.profile_rules (
+  id         uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  profile_id uuid NOT NULL REFERENCES public.profiles(id),
+  question   varchar NOT NULL,
+  answer     varchar NOT NULL,
+  weight     int NOT NULL,
+  created_at timestamptz DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.locations (
+  id             varchar PRIMARY KEY,
+  display_name   varchar,
+  timezone       varchar,
+  address        varchar,
+  qr_entry_code  varchar
+);
+
+CREATE TABLE IF NOT EXISTS public.customer_visits (
+  id               uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  customer_id      uuid REFERENCES public.customers(id),
+  location_id      varchar REFERENCES public.locations(id),
+  visited_at       timestamptz DEFAULT now(),
+  profile_at_visit varchar,
+  skus_shown       text[],
+  zones_scanned    text[]
+);
+
+CREATE TABLE IF NOT EXISTS public.zone_store_config (
+  zone_id              varchar,
+  location_id          varchar,
+  location_description varchar,
+  PRIMARY KEY (zone_id, location_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.sku_profile_copy (
+  sku_id         varchar,
+  profile_id     uuid,
+  copy_override  text,
+  PRIMARY KEY (sku_id, profile_id)
+);
+
+CREATE TABLE IF NOT EXISTS public.analytics_events (
+  id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  anon_id     varchar,
+  customer_id uuid,
+  event_type  varchar,
+  payload     jsonb,
+  location_id varchar,
+  created_at  timestamptz DEFAULT now()
+);
+
+
+
+===== 20260222120000_dashboard_metrics.sql =====
+
+CREATE OR REPLACE FUNCTION get_form_metrics(p_form_ids varchar[])
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_entry_scans int;
+  v_quiz_completions int;
+  v_profiles_created int;
+BEGIN
+  -- 1. Entry scans: form_visits, deduplicated by visitor_id in 10-min windows
+  WITH visit_windows AS (
+    SELECT visitor_id, floor(extract(epoch from visited_at)/600) as window_id
+    FROM form_visits
+    WHERE form_id = ANY(p_form_ids)
+    GROUP BY 1, 2
+  )
+  SELECT count(*) INTO v_entry_scans FROM visit_windows;
+
+  -- 2. Quiz completions: Responses reaching profile result.
+  SELECT count(id) INTO v_quiz_completions
+  FROM responses
+  WHERE form_id = ANY(p_form_ids);
+
+  -- 3. Profiles created: responses with non-null phone
+  SELECT count(DISTINCT customer_phone) INTO v_profiles_created
+  FROM responses
+  WHERE form_id = ANY(p_form_ids) AND customer_phone IS NOT NULL;
+
+  RETURN json_build_object(
+    'entry_scans', COALESCE(v_entry_scans, 0),
+    'quiz_completions', COALESCE(v_quiz_completions, 0),
+    'profiles_created', COALESCE(v_profiles_created, 0)
+  );
+END;
+$$;
+
+
+
+===== 20260222123000_fix_admin_users.sql =====
+
+-- Fix conflicting 'profiles' table issue
+
+-- 1. Rename the original business owners table to admin_users
+ALTER TABLE IF EXISTS public.profiles RENAME TO admin_users;
+
+-- 2. Drop the foreign key from profile_rules if it was erroneously attached to admin_users
+ALTER TABLE IF EXISTS public.profile_rules DROP CONSTRAINT IF EXISTS profile_rules_profile_id_fkey;
+
+-- 3. Now create the intended consumer profiles table correctly
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id           varchar PRIMARY KEY,
+  display_name varchar NOT NULL,
+  description  text,
+  is_default   boolean DEFAULT false,
+  zones        text[],
+  created_at   timestamptz DEFAULT now()
+);
+
+-- 4. Re-attach the foreign key to the new correctly structured consumer profiles table
+DO $$ 
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'profile_rules') THEN
+    -- Must cast to varchar matching the new profiles table
+    ALTER TABLE public.profile_rules ALTER COLUMN profile_id TYPE varchar USING profile_id::varchar;
+
+    ALTER TABLE public.profile_rules 
+      ADD CONSTRAINT profile_rules_profile_id_fkey 
+      FOREIGN KEY (profile_id) REFERENCES public.profiles(id) ON DELETE CASCADE;
+  ELSE
+    CREATE TABLE IF NOT EXISTS public.profile_rules (
+      id         uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+      profile_id varchar NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+      question   varchar NOT NULL,
+      answer     varchar NOT NULL,
+      weight     int NOT NULL,
+      created_at timestamptz DEFAULT now()
+    );
+  END IF;
+EXCEPTION
+  WHEN duplicate_object THEN
+    NULL;
+END $$;
+
+-- 5. Fix the trigger function for new user signups to point to admin_users
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.admin_users (id, business_name)
+  VALUES (NEW.id, COALESCE(NEW.raw_user_meta_data ->> 'business_name', 'My Business'));
+  RETURN NEW;
+END;
+$$;
+
+-- 6. Add the role column to admin_users since it was silently skipped before
+ALTER TABLE public.admin_users ADD COLUMN IF NOT EXISTS role varchar NOT NULL DEFAULT 'staff';
+
+-- 7. Add role check constraint
+DO $$ 
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'admin_users_role_check') THEN
+    ALTER TABLE public.admin_users ADD CONSTRAINT admin_users_role_check CHECK (role IN ('owner', 'staff'));
+  END IF;
+END $$;
+
+-- 8. Enable RLS and re-create policies for admin_users
+ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view their own profile" ON public.admin_users;
+CREATE POLICY "Users can view their own profile"
+ON public.admin_users FOR SELECT
+USING (auth.uid() = id);
+
+DROP POLICY IF EXISTS "Users can update their own profile" ON public.admin_users;
+CREATE POLICY "Users can update their own profile"
+ON public.admin_users FOR UPDATE
+USING (auth.uid() = id);
+
+DROP POLICY IF EXISTS "Users can insert their own profile" ON public.admin_users;
+CREATE POLICY "Users can insert their own profile"
+ON public.admin_users FOR INSERT
+WITH CHECK (auth.uid() = id);
+
+-- 9. Consumer profiles need to be globally readable (for the quiz engine)
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Anyone can read consumer profiles" ON public.profiles;
+CREATE POLICY "Anyone can read consumer profiles"
+ON public.profiles FOR SELECT
+USING (true);
+
+-- 10. profile_rules needs to be globally readable
+ALTER TABLE public.profile_rules ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Anyone can read profile rules" ON public.profile_rules;
+CREATE POLICY "Anyone can read profile rules"
+ON public.profile_rules FOR SELECT
+USING (true);
+
+
+
+===== 20260222142815_set_owner_role.sql =====
+
+-- Update all existing admin_users to 'owner' role so they have full access.
+-- The previous migration added the column with a default of 'staff', which hid the dashboard tabs for existing users.
+UPDATE public.admin_users SET role = 'owner';
+
+
+
+===== 20260222143410_set_owner_default.sql =====
+
+-- Change the default value of the role column in admin_users to 'owner'
+ALTER TABLE public.admin_users ALTER COLUMN role SET DEFAULT 'owner';
+
+
+
+===== 20260223235600_add_tags_logger_saved_schema.sql =====
+
+-- 1. Create customer_tags table
+CREATE TABLE IF NOT EXISTS public.customer_tags (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    customer_id UUID REFERENCES public.customers(id) ON DELETE CASCADE, -- Nullable for purely anonymous that never sign up
+    session_id TEXT NOT NULL, -- Ties anonymous interactions together
+    tag_id UUID NOT NULL REFERENCES public.tags(id) ON DELETE CASCADE,
+    source TEXT, -- e.g., 'quiz', 'question-1', 'session-question'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_customer_tags_store_id ON public.customer_tags(store_id);
+CREATE INDEX IF NOT EXISTS idx_customer_tags_customer_id ON public.customer_tags(customer_id);
+CREATE INDEX IF NOT EXISTS idx_customer_tags_session_id ON public.customer_tags(session_id);
+
+-- Enable RLS for customer_tags
+ALTER TABLE public.customer_tags ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.customer_tags FOR INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.customer_tags FOR SELECT TO anon, authenticated USING (true);
+CREATE POLICY "Users can CRUD their own store customer tags" ON public.customer_tags FOR ALL USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = customer_tags.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 2. Create interactions table
+CREATE TABLE IF NOT EXISTS public.interactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    customer_id UUID REFERENCES public.customers(id) ON DELETE CASCADE, -- Nullable
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL, -- 'qr_scan', 'quiz_answer', 'product_shown', 'item_saved', 'identity_captured'
+    metadata JSONB DEFAULT '{}'::jsonb, -- e.g., { "question_id": "q1", "answer": "yes", "product_id": "123" }
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_interactions_store_id ON public.interactions(store_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_customer_id ON public.interactions(customer_id);
+CREATE INDEX IF NOT EXISTS idx_interactions_session_id ON public.interactions(session_id);
+
+-- Enable RLS for interactions
+ALTER TABLE public.interactions ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.interactions FOR INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.interactions FOR SELECT TO anon, authenticated USING (true);
+CREATE POLICY "Users can CRUD their own store interactions" ON public.interactions FOR ALL USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = interactions.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 3. Create saved_items table
+CREATE TABLE IF NOT EXISTS public.saved_items (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    customer_id UUID REFERENCES public.customers(id) ON DELETE CASCADE, -- Usually set, but could be null initially and backfilled
+    session_id TEXT NOT NULL,
+    product_id UUID NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- NOTE: Intentionally not making unique (customer_id, product_id) at DB level to allow guest session saves before linking, 
+    -- will manage duplication at application/linking level. Or we can just use a unique constraint if customer_id IS NOT NULL.
+);
+
+-- Partial unique index to enforce unique saves for known customers
+CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_items_unique_customer_product 
+ON public.saved_items (customer_id, product_id) 
+WHERE customer_id IS NOT NULL;
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_saved_items_store_id ON public.saved_items(store_id);
+CREATE INDEX IF NOT EXISTS idx_saved_items_customer_id ON public.saved_items(customer_id);
+CREATE INDEX IF NOT EXISTS idx_saved_items_session_id ON public.saved_items(session_id);
+
+-- Enable RLS for saved_items
+ALTER TABLE public.saved_items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.saved_items FOR INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.saved_items FOR SELECT TO anon, authenticated USING (true);
+CREATE POLICY "Enable delete for anon/authenticated users" ON public.saved_items FOR DELETE TO anon, authenticated USING (true);
+CREATE POLICY "Users can CRUD their own store saved items" ON public.saved_items FOR ALL USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = saved_items.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 4. Function to backfill customer_id on identity capture
+CREATE OR REPLACE FUNCTION public.link_anonymous_session(
+    p_store_id UUID,
+    p_session_id TEXT,
+    p_customer_id UUID
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Update customer_tags
+    UPDATE public.customer_tags
+    SET customer_id = p_customer_id
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Update interactions
+    UPDATE public.interactions
+    SET customer_id = p_customer_id
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Update saved_items
+    -- Handle potential conflicts where the customer might have already saved the item in a previous session
+    -- We'll safely update where not exists, and copy over
+    
+    -- 1. Insert any saved items from this session that the customer DOES NOT already have
+    INSERT INTO public.saved_items (store_id, customer_id, session_id, product_id)
+    SELECT p_store_id, p_customer_id, p_session_id, si.product_id
+    FROM public.saved_items si
+    WHERE si.session_id = p_session_id 
+      AND si.store_id = p_store_id 
+      AND si.customer_id IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM public.saved_items existing
+          WHERE existing.customer_id = p_customer_id
+            AND existing.product_id = si.product_id
+      );
+
+    -- 2. Delete the anonymous ones since they are either moved or duplicated
+    DELETE FROM public.saved_items
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+END;
+$$;
+
+
+
+===== 20260226235100_public_catalog_reads.sql =====
+
+-- Enable public read access to products
+CREATE POLICY "Enable public read access for products" 
+ON public.products FOR SELECT 
+USING (true);
+
+-- Enable public read access to tags
+CREATE POLICY "Enable public read access for tags" 
+ON public.tags FOR SELECT 
+USING (true);
+
+-- Enable public read access to product_tags
+CREATE POLICY "Enable public read access for product_tags" 
+ON public.product_tags FOR SELECT 
+USING (true);
+
+
+
+===== 20260303000000_global_inventory.sql =====
+
+-- 1. Add owner_id to products
+ALTER TABLE public.products
+ADD COLUMN owner_id UUID REFERENCES auth.users(id) ON DELETE CASCADE;
+
+-- 2. Populate owner_id from the existing store_id relation
+UPDATE public.products p
+SET owner_id = s.owner_id
+FROM public.stores s
+WHERE p.store_id = s.id;
+
+-- Make owner_id NOT NULL after populating
+ALTER TABLE public.products
+ALTER COLUMN owner_id SET NOT NULL;
+
+-- 3. Create store_products junction table
+CREATE TABLE public.store_products (
+    store_id UUID NOT NULL REFERENCES public.stores(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
+    PRIMARY KEY (store_id, product_id)
+);
+
+-- Enable RLS for store_products
+ALTER TABLE public.store_products ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can CRUD their own store products"
+ON public.store_products FOR ALL
+USING (
+    EXISTS (
+        SELECT 1 FROM public.stores
+        WHERE stores.id = store_products.store_id
+        AND stores.owner_id = auth.uid()
+    )
+);
+
+-- 4. Migrate existing product-store relationships
+INSERT INTO public.store_products (store_id, product_id)
+SELECT store_id, id FROM public.products WHERE store_id IS NOT NULL;
+
+-- 5. Update RLS on products to use owner_id directly instead of checking stores
+DROP POLICY IF EXISTS "Users can CRUD their own products" ON public.products;
+
+CREATE POLICY "Users can CRUD their own products"
+ON public.products FOR ALL
+USING (auth.uid() = owner_id);
+
+-- 6. We will NOT drop store_id yet to avoid hard-breaking existing queries 
+-- that might happen in the split-second before the frontend updates.
+-- But we MUST remove the NOT NULL constraint for global products.
+ALTER TABLE public.products ALTER COLUMN store_id DROP NOT NULL;
+-- ALTER TABLE public.products DROP COLUMN store_id;
+
+
+
+===== 20260303000001_global_inventory_fix.sql =====
+
+-- Remove the NOT NULL constraint for global products.
+ALTER TABLE public.products ALTER COLUMN store_id DROP NOT NULL;
+
+
+
+===== 20260304150000_tags_optional_store.sql =====
+
+-- Migration: Allow tags to be created without a store (global/owner-level tags)
+-- Previously store_id was NOT NULL, blocking tag creation from the Tag Manager
+-- when no specific store is selected.
+
+-- 1. Make store_id nullable (remove NOT NULL constraint)
+ALTER TABLE public.tags
+  ALTER COLUMN store_id DROP NOT NULL;
+
+-- 2. Drop the existing RLS policy which requires a valid store match
+DROP POLICY IF EXISTS "Users can CRUD their own tags" ON public.tags;
+
+-- 3. Recreate the policy to allow:
+--    a) Tags tied to a store the user owns (existing behavior)
+--    b) Tags with no store (store_id IS NULL) where the auth user is authenticated
+--       These act as global/owner-level tags.
+CREATE POLICY "Users can CRUD their own tags"
+ON public.tags FOR ALL
+USING (
+  (
+    store_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM public.stores
+      WHERE stores.id = tags.store_id
+        AND stores.owner_id = auth.uid()
+    )
+  )
+  OR
+  (
+    store_id IS NULL AND auth.uid() IS NOT NULL
+  )
+)
+WITH CHECK (
+  (
+    store_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM public.stores
+      WHERE stores.id = tags.store_id
+        AND stores.owner_id = auth.uid()
+    )
+  )
+  OR
+  (
+    store_id IS NULL AND auth.uid() IS NOT NULL
+  )
+);
+
+
+
+===== 20260305222905_add_show_start_page.sql =====
+
+-- Add show_start_page to forms table
+ALTER TABLE public.forms ADD COLUMN IF NOT EXISTS show_start_page BOOLEAN NOT NULL DEFAULT true;
+
+
+
+===== 20260307000001_analytics_enrich.sql =====
+
+-- ============================================================
+-- Analytics Enrichment Migration
+-- Additive only — no breaking changes, no existing data modified
+-- ============================================================
+
+-- ── 1. flow_sessions: add missing tracking fields ─────────────────────────────
+
+ALTER TABLE public.flow_sessions
+  ADD COLUMN IF NOT EXISTS drop_off_node_id  TEXT,          -- node where user abandoned (set in markAbandoned)
+  ADD COLUMN IF NOT EXISTS total_time_seconds INT,           -- seconds from start→complete (set in completeSession)
+  ADD COLUMN IF NOT EXISTS flow_version       TEXT DEFAULT 'v1';  -- which version of the flow was shown
+
+-- ── 2. form_visits: mark return visitors ──────────────────────────────────────
+
+ALTER TABLE public.form_visits
+  ADD COLUMN IF NOT EXISTS is_return_visitor BOOLEAN DEFAULT false;  -- true if visitor_id seen before for this form
+
+-- ── 3. customers: track recency + visit frequency ─────────────────────────────
+
+ALTER TABLE public.customers
+  ADD COLUMN IF NOT EXISTS last_active  TIMESTAMPTZ,    -- updated on every visit/session linkage
+  ADD COLUMN IF NOT EXISTS visit_count  INT DEFAULT 1;  -- incremented each time identity is linked
+
+-- ── 4. saved_items: POS placeholder for future purchase linking ───────────────
+-- Stays NULL forever until a POS integration writes here.
+-- Allows querying "saved but not purchased" without schema changes later.
+
+ALTER TABLE public.saved_items
+  ADD COLUMN IF NOT EXISTS purchased_at TIMESTAMPTZ;    -- NULL = not purchased; set by POS integration
+
+-- ── 5. forms: version field for A/B tracking ─────────────────────────────────
+
+ALTER TABLE public.forms
+  ADD COLUMN IF NOT EXISTS flow_version TEXT DEFAULT 'v1';
+
+-- ── 6. visitor_location_journeys: cross-location cross-session tracking ───────
+-- One row per (visitor_id, store_id, session_id) — tiny table.
+-- Lets you see "same browser visited store A and store B".
+
+CREATE TABLE IF NOT EXISTS public.visitor_location_journeys (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  visitor_id   TEXT            NOT NULL,   -- localStorage mirour_visitor_id (device fingerprint)
+  customer_id  UUID REFERENCES public.customers(id) ON DELETE SET NULL,  -- set when identity captured
+  store_id     UUID REFERENCES public.stores(id) ON DELETE CASCADE,
+  session_id   TEXT,                        -- matches flow_sessions.id
+  visited_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Unique: one row per visitor per session to avoid duplicate writes
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vlj_unique_visitor_session
+  ON public.visitor_location_journeys (visitor_id, session_id)
+  WHERE session_id IS NOT NULL;
+
+-- Lookup indexes
+CREATE INDEX IF NOT EXISTS idx_vlj_visitor    ON public.visitor_location_journeys (visitor_id);
+CREATE INDEX IF NOT EXISTS idx_vlj_customer   ON public.visitor_location_journeys (customer_id);
+CREATE INDEX IF NOT EXISTS idx_vlj_store      ON public.visitor_location_journeys (store_id);
+CREATE INDEX IF NOT EXISTS idx_vlj_visited_at ON public.visitor_location_journeys (visited_at DESC);
+
+-- RLS: anonymous shoppers can insert (they write their own journey row)
+--      authenticated store owners can read their store's journeys
+ALTER TABLE public.visitor_location_journeys ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Anon can insert journeys"
+  ON public.visitor_location_journeys
+  FOR INSERT TO anon, authenticated
+  WITH CHECK (true);
+
+CREATE POLICY "Owners can read journeys"
+  ON public.visitor_location_journeys
+  FOR SELECT TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.stores
+      WHERE stores.id = visitor_location_journeys.store_id
+        AND stores.owner_id = auth.uid()
+    )
+  );
+
+-- ── 7. Update link_anonymous_session to also backfill visitor_location_journeys ─
+
+CREATE OR REPLACE FUNCTION public.link_anonymous_session(
+    p_store_id   UUID,
+    p_session_id TEXT,
+    p_customer_id UUID
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- Backfill customer_id on customer_tags
+    UPDATE public.customer_tags
+    SET customer_id = p_customer_id
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Backfill customer_id on interactions
+    UPDATE public.interactions
+    SET customer_id = p_customer_id
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Move anonymous saved_items → customer-linked rows
+    INSERT INTO public.saved_items (store_id, customer_id, session_id, product_id)
+    SELECT p_store_id, p_customer_id, p_session_id, si.product_id
+    FROM public.saved_items si
+    WHERE si.session_id = p_session_id
+      AND si.store_id   = p_store_id
+      AND si.customer_id IS NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM public.saved_items ex
+          WHERE ex.customer_id = p_customer_id AND ex.product_id = si.product_id
+      );
+
+    DELETE FROM public.saved_items
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Backfill customer_id on visitor_location_journeys
+    UPDATE public.visitor_location_journeys
+    SET customer_id = p_customer_id
+    WHERE session_id = p_session_id AND store_id = p_store_id AND customer_id IS NULL;
+
+    -- Bump visit_count + last_active on customer record
+    UPDATE public.customers
+    SET
+      visit_count = COALESCE(visit_count, 1) + 1,
+      last_active = now()
+    WHERE id = p_customer_id;
+
+END;
+$$;
+
+
+
+===== 20260307000002_analytics_functions.sql =====
+
+-- ============================================================
+-- Analytics Functions — Touchpoint & Location Metrics
+-- Safe: CREATE OR REPLACE won't drop anything
+-- Called by new dashboard hooks only (not existing app code)
+-- ============================================================
+
+-- ── 1. Per-touchpoint (per-form) analytics ────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION public.get_touchpoint_metrics(p_form_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_result JSON;
+BEGIN
+  SELECT json_build_object(
+
+    -- Scan volume
+    'total_scans',
+    (SELECT COUNT(*) FROM public.form_visits WHERE form_id = p_form_id),
+
+    'unique_visitors',
+    (SELECT COUNT(DISTINCT visitor_id) FROM public.form_visits WHERE form_id = p_form_id),
+
+    'return_visitors',
+    (SELECT COUNT(*) FROM public.form_visits WHERE form_id = p_form_id AND is_return_visitor = true),
+
+    -- Completion funnel
+    'completion_rate',
+    (
+      SELECT ROUND(
+        100.0 * COUNT(*) FILTER (WHERE status = 'completed') /
+        NULLIF(COUNT(*), 0), 1
+      )
+      FROM public.flow_sessions WHERE form_id = p_form_id
+    ),
+
+    'abandonment_rate',
+    (
+      SELECT ROUND(
+        100.0 * COUNT(*) FILTER (WHERE status = 'abandoned') /
+        NULLIF(COUNT(*), 0), 1
+      )
+      FROM public.flow_sessions WHERE form_id = p_form_id
+    ),
+
+    -- Time in flow
+    'avg_time_seconds',
+    (
+      SELECT ROUND(AVG(total_time_seconds))
+      FROM public.flow_sessions
+      WHERE form_id = p_form_id AND status = 'completed' AND total_time_seconds IS NOT NULL
+    ),
+
+    -- Identity capture rate (% of scanners who gave phone/email)
+    'profile_capture_rate',
+    (
+      SELECT ROUND(
+        100.0 * COUNT(DISTINCT COALESCE(customer_phone, customer_email)) /
+        NULLIF((SELECT COUNT(DISTINCT visitor_id) FROM public.form_visits WHERE form_id = p_form_id), 0),
+        1
+      )
+      FROM public.responses
+      WHERE form_id = p_form_id
+        AND (customer_phone IS NOT NULL OR customer_email IS NOT NULL)
+    ),
+
+    -- Where people dropped off
+    'drop_off_by_node',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.drop_offs DESC), '[]'::json)
+      FROM (
+        SELECT drop_off_node_id, COUNT(*) AS drop_offs
+        FROM public.flow_sessions
+        WHERE form_id = p_form_id
+          AND status = 'abandoned'
+          AND drop_off_node_id IS NOT NULL
+        GROUP BY 1
+        ORDER BY 2 DESC
+      ) t
+    ),
+
+    -- Which products were saved most
+    'most_saved_products',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.saves DESC), '[]'::json)
+      FROM (
+        SELECT p.id AS product_id, p.name, COUNT(*) AS saves
+        FROM public.saved_items si
+        JOIN public.products p ON p.id = si.product_id
+        JOIN public.flow_sessions fs ON fs.id::text = si.session_id
+        WHERE fs.form_id = p_form_id
+        GROUP BY p.id, p.name
+        ORDER BY saves DESC
+        LIMIT 10
+      ) t
+    ),
+
+    -- Peak scan hours
+    'peak_hours',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.scans DESC), '[]'::json)
+      FROM (
+        SELECT EXTRACT(HOUR FROM visited_at)::int AS hour, COUNT(*) AS scans
+        FROM public.form_visits
+        WHERE form_id = p_form_id
+        GROUP BY 1
+        ORDER BY scans DESC
+      ) t
+    ),
+
+    -- Response distribution per question
+    'response_distribution',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.count DESC), '[]'::json)
+      FROM (
+        SELECT
+          kv.key   AS question_id,
+          kv.value::text AS answer,
+          COUNT(*) AS count
+        FROM public.responses r,
+          LATERAL jsonb_each(r.answers) AS kv
+        WHERE r.form_id = p_form_id
+        GROUP BY 1, 2
+        ORDER BY count DESC
+      ) t
+    ),
+
+    -- Flow versions (A/B breakdown)
+    'flow_versions',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)
+      FROM (
+        SELECT flow_version, COUNT(*) AS sessions
+        FROM public.flow_sessions
+        WHERE form_id = p_form_id AND flow_version IS NOT NULL
+        GROUP BY 1
+      ) t
+    )
+
+  ) INTO v_result;
+
+  RETURN v_result;
+END;
+$$;
+
+
+-- ── 2. Per-store (location) rollup analytics ──────────────────────────────────
+
+CREATE OR REPLACE FUNCTION public.get_location_metrics(p_store_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_result JSON;
+BEGIN
+  SELECT json_build_object(
+
+    -- Total scan volume across all touchpoints in this store
+    'total_scans',
+    (
+      SELECT COUNT(*) FROM public.form_visits fv
+      JOIN public.forms f ON f.id = fv.form_id
+      WHERE f.store_id = p_store_id
+    ),
+
+    'unique_visitors',
+    (
+      SELECT COUNT(DISTINCT fv.visitor_id) FROM public.form_visits fv
+      JOIN public.forms f ON f.id = fv.form_id
+      WHERE f.store_id = p_store_id
+    ),
+
+    -- New vs returning
+    'new_vs_returning',
+    (
+      SELECT json_build_object(
+        'new',       COUNT(*) FILTER (WHERE NOT fv.is_return_visitor),
+        'returning', COUNT(*) FILTER (WHERE fv.is_return_visitor)
+      )
+      FROM public.form_visits fv
+      JOIN public.forms f ON f.id = fv.form_id
+      WHERE f.store_id = p_store_id
+    ),
+
+    -- Identified customers (gave phone or email)
+    'total_customers_identified',
+    (
+      SELECT COUNT(*) FROM public.customers
+      WHERE store_id = p_store_id
+        AND (phone IS NOT NULL OR email IS NOT NULL)
+    ),
+
+    -- Cross-location: unique visitors seen at multiple stores
+    'cross_location_visitors',
+    (
+      SELECT COUNT(DISTINCT visitor_id) FROM public.visitor_location_journeys
+      WHERE store_id = p_store_id
+        AND visitor_id IN (
+          SELECT visitor_id FROM public.visitor_location_journeys
+          GROUP BY visitor_id HAVING COUNT(DISTINCT store_id) > 1
+        )
+    ),
+
+    -- Top performing touchpoints
+    'top_touchpoints',
+    (
+      SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.scans DESC), '[]'::json)
+      FROM (
+        SELECT f.id AS form_id, f.name, z.name AS zone_name, COUNT(fv.id) AS scans
+        FROM public.form_visits fv
+        JOIN public.forms f ON f.id = fv.form_id
+        LEFT JOIN public.zones z ON z.id = f.zone_id
+        WHERE f.store_id = p_store_id
+        GROUP BY f.id, f.name, z.name
+        ORDER BY scans DESC
+        LIMIT 10
+      ) t
+    ),
+
+    -- Items saved but not purchased (remarketing pool)
+    'saves_without_purchase',
+    (
+      SELECT COUNT(*) FROM public.saved_items
+      WHERE store_id = p_store_id
+        AND customer_id IS NOT NULL
+        AND purchased_at IS NULL
+    ),
+
+    -- VIP customers (visit_count >= 3)
+    'vip_customer_count',
+    (
+      SELECT COUNT(*) FROM public.customers
+      WHERE store_id = p_store_id AND visit_count >= 3
+    ),
+
+    -- Lapsed visitors (last_active > 7 days ago, but have phone/email)
+    'lapsed_count',
+    (
+      SELECT COUNT(*) FROM public.customers
+      WHERE store_id = p_store_id
+        AND last_active < now() - INTERVAL '7 days'
+        AND (phone IS NOT NULL OR email IS NOT NULL)
+    )
+
+  ) INTO v_result;
+
+  RETURN v_result;
+END;
+$$;
+
+
+-- ── 3. Cross-session return visit query helper ────────────────────────────────
+-- Returns all sessions for a given visitor_id across all forms in a store.
+-- Used in the customer profile page to show "Return visits" timeline.
+
+CREATE OR REPLACE FUNCTION public.get_visitor_sessions(
+  p_store_id  UUID,
+  p_visitor_id TEXT
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_result JSON;
+BEGIN
+  SELECT COALESCE(json_agg(row_to_json(t) ORDER BY t.started_at DESC), '[]'::json)
+  INTO v_result
+  FROM (
+    SELECT
+      fs.id            AS session_id,
+      fs.form_id,
+      f.name           AS flow_name,
+      fs.status,
+      fs.flow_version,
+      fs.visited_nodes,
+      fs.partial_answers,
+      fs.drop_off_node_id,
+      fs.total_time_seconds,
+      fs.started_at,
+      fs.completed_at,
+      fs.last_activity_at
+    FROM public.flow_sessions fs
+    JOIN public.forms f ON f.id = fs.form_id
+    WHERE f.store_id  = p_store_id
+      AND fs.visitor_id = p_visitor_id
+    ORDER BY fs.started_at DESC
+    LIMIT 50
+  ) t;
+
+  RETURN v_result;
+END;
+$$;
+
+
+
+===== 20260307000003_remarketing_views.sql =====
+
+-- ============================================================
+-- Remarketing & Segmentation Views
+-- Safe: CREATE OR REPLACE VIEW, no existing tables modified
+-- ============================================================
+
+-- ── 1. All opted-in contacts with segmentation flags ─────────────────────────
+-- "Opted in" = gave phone or email through a flow.
+-- This is the master remarketing list.
+
+CREATE OR REPLACE VIEW public.remarketing_contacts AS
+SELECT
+  c.id              AS customer_id,
+  c.store_id,
+  c.name,
+  c.email,
+  c.phone,
+  c.traits,
+  c.created_at      AS opted_in_at,
+  c.last_active,
+  COALESCE(c.visit_count, 1)  AS visit_count,
+
+  -- VIP: visited 3+ times
+  (COALESCE(c.visit_count, 1) >= 3)   AS is_vip,
+
+  -- Cross-location: has visited more than one store
+  (
+    SELECT COUNT(DISTINCT store_id) > 1
+    FROM public.visitor_location_journeys vlj
+    WHERE vlj.customer_id = c.id
+  )                                     AS is_cross_location,
+
+  -- Engagement: did they complete at least one flow?
+  EXISTS (
+    SELECT 1 FROM public.responses r
+    WHERE r.customer_phone = c.phone
+       OR r.customer_email = c.email
+  )                                     AS completed_flow,
+
+  -- Saved item count
+  (
+    SELECT COUNT(*)
+    FROM public.saved_items si
+    WHERE si.customer_id = c.id
+  )                                     AS saved_item_count,
+
+  -- Saves without purchase (remarketing gold)
+  (
+    SELECT COUNT(*)
+    FROM public.saved_items si
+    WHERE si.customer_id = c.id AND si.purchased_at IS NULL
+  )                                     AS saves_without_purchase
+
+FROM public.customers c
+WHERE c.phone IS NOT NULL OR c.email IS NOT NULL;
+
+
+-- ── 2. Lapsed visitors — engaged but gone quiet ───────────────────────────────
+-- Definition: has contact info but last_active > 7 days ago.
+
+CREATE OR REPLACE VIEW public.lapsed_visitors AS
+SELECT
+  c.id                  AS customer_id,
+  c.store_id,
+  c.name,
+  c.email,
+  c.phone,
+  c.last_active,
+  EXTRACT(EPOCH FROM (now() - c.last_active)) / 86400  AS days_since_visit,
+  c.traits,
+  COALESCE(c.visit_count, 1)                           AS visit_count
+FROM public.customers c
+WHERE c.last_active IS NOT NULL
+  AND c.last_active < now() - INTERVAL '7 days'
+  AND (c.phone IS NOT NULL OR c.email IS NOT NULL);
+
+
+-- ── 3. Saves without purchase — hottest remarketing list ─────────────────────
+-- Every product a known customer saved but hasn't purchased yet.
+
+CREATE OR REPLACE VIEW public.saves_without_purchase AS
+SELECT
+  si.id           AS save_id,
+  si.store_id,
+  si.customer_id,
+  c.name          AS customer_name,
+  c.phone         AS customer_phone,
+  c.email         AS customer_email,
+  p.id            AS product_id,
+  p.name          AS product_name,
+  p.price,
+  p.image_url,
+  p.sku,
+  si.created_at   AS saved_at,
+  si.purchased_at,
+  -- How many days since they saved it
+  EXTRACT(EPOCH FROM (now() - si.created_at)) / 86400   AS days_since_saved
+FROM public.saved_items si
+JOIN public.products p  ON p.id  = si.product_id
+LEFT JOIN public.customers c ON c.id = si.customer_id
+WHERE si.customer_id IS NOT NULL
+  AND si.purchased_at IS NULL
+ORDER BY si.created_at DESC;
+
+
+-- ── 4. Cross-location visitor journeys — same person, multiple stores ─────────
+
+CREATE OR REPLACE VIEW public.cross_location_visitors AS
+SELECT
+  vlj.visitor_id,
+  vlj.customer_id,
+  c.name      AS customer_name,
+  c.phone,
+  c.email,
+  COUNT(DISTINCT vlj.store_id)   AS stores_visited,
+  json_agg(
+    json_build_object(
+      'store_id',   vlj.store_id,
+      'visited_at', vlj.visited_at,
+      'session_id', vlj.session_id
+    )
+    ORDER BY vlj.visited_at
+  )                              AS journey
+FROM public.visitor_location_journeys vlj
+LEFT JOIN public.customers c ON c.id = vlj.customer_id
+GROUP BY vlj.visitor_id, vlj.customer_id, c.name, c.phone, c.email
+HAVING COUNT(DISTINCT vlj.store_id) > 1;
+
+
+-- ── 5. Flow re-entries — same visitor returning to the same flow ──────────────
+
+CREATE OR REPLACE VIEW public.flow_reentries AS
+SELECT
+  fs.visitor_id,
+  fs.form_id,
+  f.name             AS flow_name,
+  f.store_id,
+  COUNT(*)           AS total_sessions,
+  COUNT(*) FILTER (WHERE status = 'completed')  AS completions,
+  COUNT(*) FILTER (WHERE status = 'abandoned')  AS abandonments,
+  MIN(fs.started_at)                             AS first_visit,
+  MAX(fs.started_at)                             AS last_visit
+FROM public.flow_sessions fs
+JOIN public.forms f ON f.id = fs.form_id
+GROUP BY fs.visitor_id, fs.form_id, f.name, f.store_id
+HAVING COUNT(*) > 1
+ORDER BY total_sessions DESC;
+
+
+
+===== 20260307000004_flow_sessions_device_location.sql =====
+
+-- ============================================================
+-- Device and Location Enrichment Migration
+-- Adds explicit fields to flow_sessions for easier querying
+-- ============================================================
+
+ALTER TABLE public.flow_sessions
+  ADD COLUMN IF NOT EXISTS browser TEXT,
+  ADD COLUMN IF NOT EXISTS os TEXT,
+  ADD COLUMN IF NOT EXISTS device_type TEXT,
+  ADD COLUMN IF NOT EXISTS city TEXT,
+  ADD COLUMN IF NOT EXISTS region TEXT,
+  ADD COLUMN IF NOT EXISTS country TEXT;
+
+
+
+===== 20260307000005_expire_stale_sessions.sql =====
+
+-- ============================================================
+-- Auto-expire stale in_progress sessions
+-- ============================================================
+-- Sessions that were never marked abandoned (browser crash, network cut, etc.)
+-- will stay in_progress forever without this function.
+--
+-- Usage (manual):
+--   SELECT expire_stale_sessions(30);   -- expire any session idle > 30 min
+--
+-- Usage (scheduled via pg_cron):
+--   Enable extension: Supabase Dashboard > Database > Extensions > pg_cron
+--   Then run once:
+--   SELECT cron.schedule(
+--     'expire-stale-sessions',
+--     '*/15 * * * *',
+--     'SELECT expire_stale_sessions(30)'
+--   );
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION public.expire_stale_sessions(stale_minutes INT DEFAULT 30)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  updated_count INT;
+BEGIN
+  UPDATE public.flow_sessions
+  SET
+    status           = 'abandoned',
+    last_activity_at = NOW()
+  WHERE
+    status           = 'in_progress'
+    AND last_activity_at < NOW() - (stale_minutes || ' minutes')::INTERVAL;
+
+  GET DIAGNOSTICS updated_count = ROW_COUNT;
+  RETURN updated_count;
+END;
+$$;
+
+-- Store owners can call this from their dashboard if desired
+GRANT EXECUTE ON FUNCTION public.expire_stale_sessions(INT) TO authenticated;
+
+
+
+===== 20260307000006_fix_saved_items_join.sql =====
+
+-- ============================================================
+-- Fix: unindexed join in get_touchpoint_metrics()
+-- ============================================================
+-- The analytics function joins saved_items to flow_sessions like this:
+--   JOIN public.flow_sessions fs ON fs.id::text = si.session_id
+--
+-- The ::text cast on fs.id (a UUID column) disables index use and forces
+-- a sequential scan on flow_sessions at every analytics call.
+--
+-- This migration adds a functional index so the cast is pre-computed,
+-- letting Postgres use an index scan for the join.
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_flow_sessions_id_text
+  ON public.flow_sessions ((id::text));
+
+
+
+===== 20260307000007_fix_profile_rules_type.sql =====
+
+-- ============================================================
+-- Fix: profile_rules.profile_id type mismatch with profiles.id
+-- ============================================================
+-- profiles.id      = VARCHAR
+-- profile_rules.profile_id = UUID (references profiles.id)
+--
+-- A UUID FK referencing a VARCHAR PK causes implicit casts on every join,
+-- has implicit cast overhead, and is semantically incorrect.
+--
+-- This migration aligns profile_rules.profile_id to VARCHAR.
+--
+-- Safe: the values are valid UUID strings in both columns;
+-- USING profile_id::text simply re-formats the storage without data loss.
+-- ============================================================
+
+-- Drop the FK constraint first (required before changing column type)
+ALTER TABLE public.profile_rules
+  DROP CONSTRAINT IF EXISTS profile_rules_profile_id_fkey;
+
+-- Change the column type from UUID → VARCHAR
+ALTER TABLE public.profile_rules
+  ALTER COLUMN profile_id TYPE VARCHAR USING profile_id::text;
+
+-- Re-add the FK constraint now that types match
+ALTER TABLE public.profile_rules
+  ADD CONSTRAINT profile_rules_profile_id_fkey
+  FOREIGN KEY (profile_id) REFERENCES public.profiles(id) ON DELETE CASCADE;
+
+
+
+===== 20260307201000_advanced_analytics_schema.sql =====
+
+-- 1. Create flow_session_nodes table
+CREATE TABLE IF NOT EXISTS public.flow_session_nodes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES public.flow_sessions(id) ON DELETE CASCADE,
+    form_id UUID NOT NULL REFERENCES public.forms(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    entered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    exited_at TIMESTAMPTZ,
+    time_spent_seconds INTEGER,
+    is_dropoff BOOLEAN DEFAULT true
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_flow_session_nodes_session ON public.flow_session_nodes(session_id);
+CREATE INDEX IF NOT EXISTS idx_flow_session_nodes_form ON public.flow_session_nodes(form_id);
+
+-- RLS
+ALTER TABLE public.flow_session_nodes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.flow_session_nodes FOR INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable update for anon/authenticated users" ON public.flow_session_nodes FOR UPDATE TO anon, authenticated USING (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.flow_session_nodes FOR SELECT TO anon, authenticated USING (true);
+
+-- 2. Create submission_answers table
+CREATE TABLE IF NOT EXISTS public.submission_answers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    response_id UUID NOT NULL REFERENCES public.responses(id) ON DELETE CASCADE,
+    customer_id UUID REFERENCES public.customers(id) ON DELETE CASCADE,
+    form_id UUID NOT NULL REFERENCES public.forms(id) ON DELETE CASCADE,
+    question_id TEXT NOT NULL,
+    question_label TEXT,
+    answer_value TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_submission_answers_form ON public.submission_answers(form_id);
+CREATE INDEX IF NOT EXISTS idx_submission_answers_customer ON public.submission_answers(customer_id);
+
+-- RLS
+ALTER TABLE public.submission_answers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Enable insert for anon/authenticated users" ON public.submission_answers FOR INSERT TO anon, authenticated WITH CHECK (true);
+CREATE POLICY "Enable select for anon/authenticated users" ON public.submission_answers FOR SELECT TO anon, authenticated USING (true);
+
+
+
+===== 20260307201100_advanced_analytics_views.sql =====
+
+-- 1. Create Touchpoint Analytics View
+CREATE OR REPLACE VIEW public.vw_touchpoint_analytics AS
+SELECT 
+    fs.form_id,
+    COUNT(fs.id) as total_scans,
+    COUNT(DISTINCT fs.visitor_id) as unique_scanners,
+    (COUNT(fs.id) - COUNT(DISTINCT fs.visitor_id)) as repeat_scanners,
+    
+    -- Completion Rate
+    SUM(CASE WHEN fs.status = 'completed' THEN 1 ELSE 0 END)::FLOAT / NULLIF(COUNT(fs.id), 0) as completion_rate,
+    
+    -- Average time in flow (ignoring extremely long abandoned sessions)
+    AVG(fs.total_time_seconds) FILTER (WHERE fs.status = 'completed' OR fs.total_time_seconds < 3600) as avg_time_in_flow_seconds
+
+FROM public.flow_sessions fs
+GROUP BY fs.form_id;
+
+-- Ensure standard RLS applies (views run as invoker normally, but we can grant select)
+GRANT SELECT ON public.vw_touchpoint_analytics TO anon, authenticated;
+
+
+-- 2. Create Customer 360 View
+CREATE OR REPLACE VIEW public.vw_customer_360 AS
+WITH customer_activity AS (
+    SELECT 
+        c.id as customer_id,
+        c.email,
+        c.phone,
+        c.name,
+        c.store_id,
+        s.owner_id as owner_profile_id,
+        
+        -- Aggregate Flow Sessions mapped to this customer
+        COUNT(fs.id) as total_scans,
+        MAX(fs.started_at) as last_scan,
+        MIN(fs.started_at) as first_scan,
+        SUM(fs.total_time_seconds) as total_time_in_flows,
+        
+        -- Distinct Stores Visited under the same owner Profile
+        (SELECT COUNT(DISTINCT c2.store_id) 
+         FROM public.customers c2 
+         JOIN public.stores s2 ON c2.store_id = s2.id 
+         WHERE c2.email = c.email AND s2.owner_id = s.owner_id AND c2.email IS NOT NULL) as stores_visited_count
+        
+    FROM public.customers c
+    JOIN public.stores s ON c.store_id = s.id
+    LEFT JOIN public.visitor_location_journeys vlj ON vlj.customer_id = c.id
+    LEFT JOIN public.flow_sessions fs ON fs.id::text = vlj.session_id
+    GROUP BY c.id, c.email, c.phone, c.name, c.store_id, s.owner_id
+)
+SELECT 
+    ca.customer_id,
+    ca.name,
+    ca.email,
+    ca.phone,
+    
+    -- Identity Metrics
+    (ca.total_scans = 1) as is_new_visitor,
+    ca.total_scans,
+    ca.last_scan,
+    ca.first_scan,
+    
+    -- Behavior & Cross-Session
+    ca.total_time_in_flows,
+    (ca.stores_visited_count > 1) as cross_location_visitor,
+    
+    -- Related Counts (Subqueries for quick summary)
+    (SELECT COUNT(*) FROM public.saved_items si WHERE si.customer_id = ca.customer_id) as items_saved,
+    (SELECT COUNT(*) FROM public.submission_answers sa WHERE sa.customer_id = ca.customer_id) as questions_answered
+FROM customer_activity ca;
+
+GRANT SELECT ON public.vw_customer_360 TO anon, authenticated;
+
+
+
+===== 20260307201200_realtime_setup.sql =====
+
+begin;
+  -- remove the supabase_realtime publication
+  drop publication if exists supabase_realtime;
+
+  -- re-create the supabase_realtime publication with no tables
+  create publication supabase_realtime;
+commit;
+
+-- add tables to the publication
+alter publication supabase_realtime add table public.flow_sessions;
+alter publication supabase_realtime add table public.responses;
+
+
+
+===== 20260308000000_customer_linking.sql =====
+
+-- Add customer_id to responses table
+ALTER TABLE public.responses 
+ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES public.customers(id) ON DELETE SET NULL;
+
+-- Add customer_id to flow_sessions table
+ALTER TABLE public.flow_sessions 
+ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES public.customers(id) ON DELETE SET NULL;
+
+-- Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_responses_customer_id ON public.responses(customer_id);
+CREATE INDEX IF NOT EXISTS idx_flow_sessions_customer_id ON public.flow_sessions(customer_id);
+
+
+
