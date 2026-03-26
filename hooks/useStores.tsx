@@ -9,6 +9,7 @@ import {
 } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
+import { queueProductDelete } from "@/lib/product-delete-sync";
 import {
   Store,
   Zone,
@@ -169,58 +170,67 @@ function useStoresInternal() {
     }
   }, [user]);
 
-const fetchTags = useCallback(
-  async (storeId?: string) => {
-    if (!user) return;
-    try {
-      let query = supabase
-        .from("tags" as any)
-        .select("*")
-        .eq("owner_id", user.id); // ✅ scoped to current user
+  const fetchTags = useCallback(
+    async (storeId?: string) => {
+      if (!user) return;
+      try {
+        let query = supabase
+          .from("tags" as any)
+          .select("*")
+          .eq("owner_id", user.id);
 
-      if (storeId) {
-        query = query.eq("store_id", storeId);
+        if (storeId) {
+          query = query.eq("store_id", storeId);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+        const fetched = (data as unknown as Tag[]) || [];
+
+        if (storeId) {
+          // Merge: replace only this store's tags, keep all others
+          setTags((prev) => [
+            ...prev.filter((t) => t.store_id !== storeId),
+            ...fetched,
+          ]);
+        } else {
+          setTags(fetched);
+        }
+      } catch (err: any) {
+        console.error("Error fetching tags:", err);
       }
+    },
+    [user],
+  );
 
-      const { data, error } = await query;
+  const createTag = async (
+    storeId: string,
+    name: string,
+    category?: string,
+    isHardConstraint?: boolean,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("tags" as any)
+        .insert([
+          {
+            store_id: storeId || null,
+            owner_id: user?.id, // ✅ set owner on create
+            name,
+            category,
+            is_hard_constraint: isHardConstraint || false,
+          },
+        ])
+        .select()
+        .single();
       if (error) throw error;
-      setTags((data as unknown as Tag[]) || []);
+      const newTag = data as unknown as Tag;
+      setTags((prev) => [...prev, newTag]);
+      return { data: newTag, error: null };
     } catch (err: any) {
-      console.error("Error fetching tags:", err);
+      return { error: err.message };
     }
-  },
-  [user],
-);
-
-const createTag = async (
-  storeId: string,
-  name: string,
-  category?: string,
-  isHardConstraint?: boolean,
-) => {
-  try {
-    const { data, error } = await supabase
-      .from("tags" as any)
-      .insert([
-        {
-          store_id: storeId || null,
-          owner_id: user?.id, // ✅ set owner on create
-          name,
-          category,
-          is_hard_constraint: isHardConstraint || false,
-        },
-      ])
-      .select()
-      .single();
-    if (error) throw error;
-    const newTag = data as unknown as Tag;
-    setTags((prev) => [...prev, newTag]);
-    return { data: newTag, error: null };
-  } catch (err: any) {
-    return { error: err.message };
-  }
-};
-
+  };
 
   // Initialize — depend only on user?.id (stable string) so that auth token
   // refreshes (which recreate the user object) don't trigger a full re-fetch.
@@ -435,18 +445,57 @@ const createTag = async (
   };
 
   const deleteProduct = async (id: string) => {
-    try {
-      const { error } = await supabase
-        .from("products" as any)
-        .delete()
-        .eq("id", id)
-        .eq("owner_id", user?.id); // scope to owner — prevents silent RLS failures
-      if (error) throw error;
-      setProducts((prev) => prev.filter((p) => p.id !== id));
-      return { error: null };
-    } catch (err: any) {
-      return { error: err.message };
+    if (!user?.id) return { error: "Not authenticated" };
+
+    // ── Optimistic UI update ──────────────────────────────────────────────
+    // Remove from local state immediately so the UI feels instant.
+    // The actual DB delete happens in the background service worker.
+    setProducts((prev) => prev.filter((p) => p.id !== id));
+
+    // ── Background Sync delete ────────────────────────────────────────────
+    // Gets the current session token to authenticate the REST call in the SW.
+    const { data: { session } } = await supabase.auth.getSession();
+    const authToken = session?.access_token ?? "";
+
+    const supabaseUrl =
+      process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co";
+    const supabaseAnonKey =
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+
+    const { error } = await queueProductDelete(
+      id,
+      supabaseUrl,
+      supabaseAnonKey,
+      authToken,
+      user.id,
+    );
+
+    if (error) {
+      // Rollback: restore the product from the server so UI stays consistent
+      console.error("[deleteProduct] Background queue failed:", error);
+      // Re-fetch just this product to restore it
+      try {
+        const { data } = await supabase
+          .from("products" as any)
+          .select("*, tags(*), zones(*), store_products(store_id)")
+          .eq("id", id)
+          .single();
+        if (data) {
+          const d = data as any;
+          const restored = {
+            ...d,
+            store_ids: d.store_products?.map((sp: any) => sp.store_id) ?? [],
+            store_id: d.store_products?.[0]?.store_id ?? d.store_id,
+          };
+          setProducts((prev) => [...prev, restored]);
+        }
+      } catch {
+        // ignore restore error
+      }
+      return { error };
     }
+
+    return { error: null };
   };
 
   const linkProductToStore = async (productId: string, storeId: string) => {
@@ -502,7 +551,6 @@ const createTag = async (
   };
 
   // Tags
-
 
   const updateTag = async (tagId: string, updates: Partial<Tag>) => {
     try {
@@ -757,11 +805,18 @@ const createTag = async (
   const importProductsFromFile = async (
     parsedData: any[],
     storeId?: string,
+    imageIndex: number = 0,
   ): Promise<{ imported: number; skipped: number; error: string | null }> => {
     try {
-      console.log("[import] ▶ START — storeId:", storeId, "| userId:", user?.id, "| rows:", parsedData?.length);
+      console.log(
+        "[import] ▶ START — storeId:",
+        storeId,
+        "| userId:",
+        user?.id,
+        "| rows:",
+        parsedData?.length,
+      );
 
-      // Guard: must be authenticated
       if (!user?.id) {
         console.log("[import] ✖ Not authenticated — aborting");
         return { imported: 0, skipped: 0, error: "Not authenticated." };
@@ -771,52 +826,53 @@ const createTag = async (
         return { imported: 0, skipped: 0, error: null };
       }
 
-      // 1. Fetch existing SKUs and Names to deduplicate.
-      //    When a storeId is given we must check BOTH the store_id column
-      //    AND the store_products junction table, because products can be
-      //    linked to a store either way.
+      // Helper function to dynamically find the tag column, regardless of case
+      const extractTagsFromRow = (row: any): string => {
+        if (!row || typeof row !== "object") return "";
+        const tagKey = Object.keys(row).find((key) => {
+          const lowerKey = key.toLowerCase().trim();
+          return lowerKey === "tag" || lowerKey === "tags";
+        });
+        return tagKey ? String(row[tagKey] || "") : "";
+      };
+
       let existingProductRows: { sku: string | null; name: string }[] = [];
 
       if (storeId) {
-        console.log("[import] 🔍 DEDUP MODE: by storeId:", storeId, "+ owner_id:", user.id);
+        console.log(
+          "[import] 🔍 DEDUP MODE: by storeId:",
+          storeId,
+          "+ owner_id:",
+          user.id,
+        );
 
-        // Fetch products linked via store_id column, scoped to this user
         const { data: byStoreId, error: e1 } = await supabase
           .from("products" as any)
           .select("sku, name")
           .eq("store_id", storeId)
           .eq("owner_id", user.id);
-        console.log("[import]   byStoreId query →", byStoreId?.length ?? 0, "rows | error:", e1);
 
-        // Fetch products linked via store_products junction table.
-        // We join through to products and filter by owner to avoid
-        // cross-account contamination.
         const { data: byJunction, error: e2 } = await supabase
           .from("store_products" as any)
           .select("products!inner(sku, name, owner_id)")
           .eq("store_id", storeId)
           .eq("products.owner_id", user.id);
-        console.log("[import]   byJunction query →", byJunction?.length ?? 0, "rows | error:", e2);
 
         const junctionRows = ((byJunction as any[]) || [])
           .map((r: any) => r.products)
           .filter(Boolean);
-        console.log("[import]   junctionRows extracted:", junctionRows.length);
 
-        // Merge, deduplicate on name
         const merged = new Map<string, { sku: string | null; name: string }>();
         [...((byStoreId as any[]) || []), ...junctionRows].forEach((p: any) => {
           if (p?.name) merged.set(p.name, p);
         });
         existingProductRows = Array.from(merged.values());
-        console.log("[import]   merged existingProductRows:", existingProductRows.length);
       } else {
         console.log("[import] 🔍 DEDUP MODE: global — owner_id:", user.id);
         const { data, error: e3 } = await supabase
           .from("products" as any)
           .select("sku, name")
           .eq("owner_id", user.id);
-        console.log("[import]   global query →", data?.length ?? 0, "rows | error:", e3);
         existingProductRows = (data as any[]) || [];
       }
 
@@ -826,15 +882,15 @@ const createTag = async (
       const existingNames = new Set(
         existingProductRows.map((p) => p.name).filter(Boolean),
       );
-      console.log("[import] 📋 existingSkus:", existingSkus.size, "| existingNames:", existingNames.size);
 
-      // Also fetch tags to deduplicate
-      let tagsQuery = supabase.from("tags" as any).select("*");
+      let tagsQuery = supabase
+        .from("tags" as any)
+        .select("*")
+        .eq("owner_id", user.id);
       if (storeId) {
         tagsQuery = tagsQuery.eq("store_id", storeId);
       }
       const { data: existingTagsData } = await tagsQuery;
-      console.log("[import] 🏷  existingTags fetched:", existingTagsData?.length ?? 0);
 
       const existingTagsMap = new Map(
         ((existingTagsData as unknown as Tag[]) || []).map((t) => [
@@ -844,16 +900,8 @@ const createTag = async (
       );
 
       const toInsert: any[] = [];
-
-      // ── Shopify CSV pre-processing ──────────────────────────────────────────
-      // Shopify exports one row per variant/image for the same product.
-      // Rows share the same `Handle`; only the first row has a `Title`.
-      // We collapse all rows with the same Handle into one normalised record
-      // before passing them through the standard insert logic below.
       const isShopifyFormat =
         parsedData.length > 0 && "Handle" in parsedData[0];
-      console.log("[import] 🛍  Shopify format detected:", isShopifyFormat);
-
       let normalizedRows: any[] = parsedData;
 
       if (isShopifyFormat) {
@@ -861,21 +909,19 @@ const createTag = async (
 
         for (const row of parsedData) {
           const handle = row["Handle"];
-          if (!handle) continue; // skip truly empty rows
+          if (!handle) continue;
 
           if (!handleMap.has(handle)) {
-            // First row for this handle — start the merged record
             handleMap.set(handle, {
               name: row["Title"] || "",
               sku: row["Variant SKU"] || "",
               price: row["Variant Price"] || "",
               description: row["Body (HTML)"] || "",
               image_url: row["Image Src"] || "",
-              tags: row["Tags"] || "",
+              tags: extractTagsFromRow(row), // Using dynamic extraction
               in_stock: (row["Status"] || "").toLowerCase() === "active",
             });
           } else {
-            // Subsequent rows — backfill any fields still empty on the merged record
             const merged = handleMap.get(handle)!;
             if (!merged.sku && row["Variant SKU"])
               merged.sku = row["Variant SKU"];
@@ -883,21 +929,15 @@ const createTag = async (
               merged.price = row["Variant Price"];
             if (!merged.description && row["Body (HTML)"])
               merged.description = row["Body (HTML)"];
-            if (!merged.tags && row["Tags"]) merged.tags = row["Tags"];
-            // Pick the image whose position = 1 (primary product image)
+
+            const currentTags = extractTagsFromRow(row); // Using dynamic extraction
+            if (!merged.tags && currentTags) merged.tags = currentTags;
+
             if (!merged.image_url || row["Image Position"] === "1")
               if (row["Image Src"]) merged.image_url = row["Image Src"];
           }
         }
-
         normalizedRows = Array.from(handleMap.values()).filter((r) => r.name);
-        console.log(
-          "[import]   Shopify grouped →",
-          parsedData.length,
-          "raw rows →",
-          normalizedRows.length,
-          "products",
-        );
       }
 
       for (const row of normalizedRows) {
@@ -911,25 +951,12 @@ const createTag = async (
           row.composite_name;
         const sku =
           row.sku || row.SKU || row["Variant SKU"] || row.composite_sku;
-        if (!name) {
-          console.log("[import]   ⚠ Row skipped — no name field:", row);
-          continue;
-        }
+        if (!name) continue;
 
-        // Deduplication:
-        // - If the row has a SKU → match only on SKU (precise, avoids
-        //   cross-store name collisions blocking re-uploads).
-        // - If no SKU → fall back to name match within the same scope.
         const isDuplicate = sku
           ? existingSkus.has(sku)
           : existingNames.has(name);
-        if (isDuplicate) {
-          console.log(
-            "[import]   ⏭ SKIP (duplicate) —",
-            sku ? `SKU="${sku}"` : `name="${name}"`,
-          );
-          continue; // Skip existing
-        }
+        if (isDuplicate) continue;
 
         const priceStr =
           row.price ||
@@ -941,11 +968,23 @@ const createTag = async (
         const rawDescription =
           row.description || row.Description || row["Body (HTML)"] || null;
         const description = stripHtml(rawDescription);
-        const imageUrl =
+        // Lightspeed (and some other POS systems) may store multiple comma-
+        // separated image URLs in a single quoted field. We pick the URL at
+        // imageIndex (0-based), falling back to the first if out of range.
+        const rawImageUrl =
           row.image_url || row["Image URL"] || row["Image Src"] || null;
+        const imageUrl = rawImageUrl
+          ? ((String(rawImageUrl).split(",").map((u: string) => u.trim()).filter(Boolean)[imageIndex]
+              ?? String(rawImageUrl).split(",")[0].trim()) || null)
+          : null;
 
-        let inStock =
-          row.in_stock !== undefined ? Boolean(row.in_stock) : true;
+        let inStock = true;
+        // Lightspeed: `active` column (1 = active/in-stock, 0 = inactive)
+        if (row.active !== undefined && row.active !== "") {
+          inStock = String(row.active).trim() === "1";
+        } else if (row.in_stock !== undefined) {
+          inStock = Boolean(row.in_stock);
+        }
         if (
           row.inventory_quantity !== undefined ||
           row.stock_quantity !== undefined
@@ -972,53 +1011,24 @@ const createTag = async (
         });
       }
 
-      // For skipped count, use distinct product count (after Shopify grouping)
-      // so the number shown to the user is meaningful.
       const totalDistinct = isShopifyFormat
         ? normalizedRows.length
         : parsedData.length;
       const skipped = totalDistinct - toInsert.length;
 
-      console.log(
-        "[import] ✅ toInsert:",
-        toInsert.length,
-        "| skipped:",
-        skipped,
-      );
-      if (toInsert.length > 0) {
-        console.log("[import]   sample dbRow[0]:", toInsert[0].dbRow);
-      }
-
       if (toInsert.length === 0) {
-        console.log(
-          "[import] ✖ Nothing to insert — returning skipped:",
-          skipped,
-        );
         return { imported: 0, skipped, error: null };
       }
 
-      // Bulk insert products
-      console.log(
-        "[import] 💾 Inserting",
-        toInsert.length,
-        "products into Supabase...",
-      );
       const { data: insertedProducts, error: insertError } = await supabase
         .from("products" as any)
         .insert(toInsert.map((t) => t.dbRow))
         .select();
 
-      console.log(
-        "[import]   insert result →",
-        insertedProducts?.length ?? 0,
-        "inserted | error:",
-        insertError,
-      );
       if (insertError) throw insertError;
 
       const newProducts = (insertedProducts as unknown as Product[]) || [];
 
-      // If storeId is provided, we must also insert store_products mappings
       if (storeId && newProducts.length > 0) {
         const storeProductsToInsert = newProducts.map((p) => ({
           store_id: storeId,
@@ -1026,14 +1036,13 @@ const createTag = async (
         }));
         const { error: spError } = await supabase
           .from("store_products" as any)
-          .insert(storeProductsToInsert);
-        console.log(
-          "[import]   store_products insert →",
-          storeProductsToInsert.length,
-          "rows | error:",
-          spError,
-        );
-        // Hydrate the visual store_ids array for the context
+          .upsert(storeProductsToInsert, {
+            onConflict: "store_id, product_id",
+            ignoreDuplicates: true,
+          });
+        if (spError) {
+          console.error("[import] ⚠️ store_products link failed:", spError);
+        }
         newProducts.forEach((p) => {
           p.store_ids = [storeId];
         });
@@ -1047,12 +1056,11 @@ const createTag = async (
 
       // Process Tags
       const productTagsToInsert: { product_id: string; tag_id: string }[] = [];
-      const newTagsToInsertMap = new Map<string, string>(); // name (lowercase) -> db tag name
+      const newTagsToInsertMap = new Map<string, string>();
 
       // Collect new tags
       toInsert.forEach((item) => {
-        const row = item.raw;
-        const tagsStr = row.tags || row.Tags || row.product_category || "";
+        const tagsStr = extractTagsFromRow(item.raw); // Using dynamic extraction
         if (tagsStr && typeof tagsStr === "string") {
           const rowTags = tagsStr
             .split(",")
@@ -1068,36 +1076,27 @@ const createTag = async (
       });
 
       // Create new tags
-      if (storeId && newTagsToInsertMap.size > 0) {
+      if (newTagsToInsertMap.size > 0) {
+        // ✅ removed storeId check
         const tagsToInsertDb = Array.from(newTagsToInsertMap.values()).map(
           (tagName) => ({
-            store_id: storeId,
+            store_id: storeId || null, // ✅ null if no store, that's fine
+            owner_id: user?.id,
             name: tagName,
             is_hard_constraint: false,
           }),
         );
-        console.log(
-          "[import] 🏷  Creating",
-          tagsToInsertDb.length,
-          "new tags...",
-        );
+        // ...
 
         const { data: insertedTags, error: tagsInsertError } = await supabase
           .from("tags" as any)
           .insert(tagsToInsertDb)
           .select();
-        console.log(
-          "[import]   tags insert →",
-          insertedTags?.length ?? 0,
-          "created | error:",
-          tagsInsertError,
-        );
 
         if (!tagsInsertError && insertedTags) {
           (insertedTags as unknown as Tag[]).forEach((t) => {
             existingTagsMap.set(t.name.toLowerCase(), t);
           });
-          // Update the localized tags cache
           setTags((prev) => {
             const existingIds = new Set(prev.map((t) => t.id));
             const newTs = (insertedTags as unknown as Tag[]).filter(
@@ -1108,15 +1107,30 @@ const createTag = async (
         }
       }
 
+      // Build a fast lookup: (name::sku) → raw CSV row so we can match
+      // inserted products back to their source rows regardless of return order.
+      const rawRowByKey = new Map<string, any>();
+      toInsert.forEach((item) => {
+        const key = `${item.dbRow.name}::${item.dbRow.sku ?? ""}`;
+        rawRowByKey.set(key, item.raw);
+      });
+
       // Create product-tag relationships
-      newProducts.forEach((product, index) => {
-        const row = toInsert[index].raw;
-        const tagsStr = row.tags || row.Tags || row.product_category || "";
+      newProducts.forEach((product) => {
+        const key = `${product.name}::${product.sku ?? ""}`;
+        const rawRow = rawRowByKey.get(key);
+        if (!rawRow) return;
+
+        const tagsStr = extractTagsFromRow(rawRow);
         if (tagsStr && typeof tagsStr === "string") {
-          const rowTags = tagsStr
-            .split(",")
-            .map((t: string) => t.trim())
-            .filter(Boolean);
+          const rowTags = Array.from(
+            new Set(
+              tagsStr
+                .split(",")
+                .map((t: string) => t.trim())
+                .filter(Boolean),
+            ),
+          );
           rowTags.forEach((tagStr: string) => {
             const tagObj = existingTagsMap.get(tagStr.toLowerCase());
             if (tagObj) {
@@ -1130,26 +1144,24 @@ const createTag = async (
       });
 
       if (productTagsToInsert.length > 0) {
-        console.log(
-          "[import] 🔗 Linking",
-          productTagsToInsert.length,
-          "product-tag relationships...",
-        );
-        await supabase
+        const { error: ptError } = await supabase
           .from("product_tags" as any)
-          .insert(productTagsToInsert);
+          .upsert(productTagsToInsert, {
+            onConflict: "product_id, tag_id",
+            ignoreDuplicates: true,
+          });
+        if (ptError) {
+          console.error("[import] ⚠️ product_tags insert failed:", ptError);
+        } else {
+          console.log(
+            `[import] ✅ linked ${productTagsToInsert.length} product-tag entries`,
+          );
+        }
       }
 
-      // Refresh to get the tags relationship properly mapped
       await fetchProducts();
 
-      const finalResult = {
-        imported: newProducts.length,
-        skipped,
-        error: null,
-      };
-      console.log("[import] 🏁 DONE —", finalResult);
-      return finalResult;
+      return { imported: newProducts.length, skipped, error: null };
     } catch (err: any) {
       console.error("[import] 💥 CAUGHT ERROR:", err);
       return {

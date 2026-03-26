@@ -137,28 +137,35 @@ function useFormsInternal() {
   };
 
   const updateForm = async (formId: string, updates: Partial<Form>) => {
+    // Save original state for possible rollback
+    const originalForms = [...forms];
+    
+    // Optimistic update
+    setForms((prev) =>
+      prev.map((f) => (f.id === formId ? { ...f, ...updates } : f)),
+    );
+
     const updateData: any = { ...updates };
     if (updates.questions) {
       updateData.questions = updates.questions as unknown as any;
     }
-
-    console.log("updateForm Payload:", updateData);
 
     const { error } = await supabase
       .from("forms")
       .update(updateData)
       .eq("id", formId);
 
-      console.log("updateForm Error:", error);
-
     if (error) {
       console.error("updateForm Error:", error);
+      // Rollback to original state
+      setForms(originalForms);
+      toast({
+        title: "Error",
+        description: "Failed to update form",
+        variant: "destructive",
+      });
       return { error: new Error(error.message) };
     }
-
-    setForms((prev) =>
-      prev.map((f) => (f.id === formId ? { ...f, ...updates } : f)),
-    );
 
     return { error: null };
   };
@@ -191,10 +198,49 @@ function useFormsInternal() {
     return updateForm(formId, { active: !form.active });
   };
 
+  const fetchForm = async (formId: string) => {
+    if (!user) return null;
+    const { data, error } = await supabase
+      .from("forms")
+      .select("*")
+      .eq("id", formId)
+      .single();
+
+    if (error || !data) {
+      console.error("Error fetching form:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load latest form data",
+        variant: "destructive",
+      });
+      return null;
+    }
+
+    const parsedForm = {
+      ...data,
+      store_id: data.store_id ?? undefined,
+      zone_id: data.zone_id ?? undefined,
+      flow_type: (data.flow_type as FlowType) ?? undefined,
+      internal_goal: data.internal_goal ?? undefined,
+      questions: (data.questions as unknown as FlowNode[]) || [],
+    };
+
+    setForms((prev) => {
+      const exists = prev.some((f) => f.id === formId);
+      if (exists) {
+        return prev.map((f) => (f.id === formId ? parsedForm : f));
+      }
+      return [parsedForm, ...prev];
+    });
+
+    return parsedForm;
+  };
+
   return {
     forms,
     loading,
     fetchForms,
+    fetchForm,
     createForm,
     updateForm,
     deleteForm,

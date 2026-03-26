@@ -26,16 +26,16 @@ export function QRCodeDisplay({
 
   // Clean URL with optional zone param
   let formUrl = formData
-    ? `${window.location.origin}/start?form=${value}`
+    ? `${window.location.origin}/f/${value}`
     : value;
 
-  if (zoneId) {
-    if (formUrl.includes("?")) {
-      formUrl += `&zone_id=${zoneId}`;
-    } else {
-      formUrl += `?zone_id=${zoneId}`;
-    }
-  }
+  // if (zoneId) {
+  //   if (formUrl.includes("?")) {
+  //     formUrl += `&zone_id=${zoneId}`;
+  //   } else {
+  //     formUrl += `?zone_id=${zoneId}`;
+  //   }
+  // }
 
   const handleDownload = () => {
     if (!qrRef.current) return;

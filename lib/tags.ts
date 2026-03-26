@@ -85,7 +85,6 @@ export const getSessionTags = async (
     const { data, error } = await supabase
       .from("customer_tags")
       .select("*")
-      .eq("store_id", storeId)
       .eq("session_id", sessionId);
 
     if (error) {
@@ -111,7 +110,6 @@ export const getCustomerTags = async (
     const { data, error } = await supabase
       .from("customer_tags")
       .select("*")
-      .eq("store_id", storeId)
       .eq("customer_id", customerId)
       .order("created_at", { ascending: false });
 

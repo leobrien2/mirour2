@@ -35,30 +35,30 @@ interface PlatformCard {
 }
 
 const PLATFORMS: PlatformCard[] = [
-  {
-    id: "squarespace",
-    name: "Squarespace",
-    description: "Import products from your Squarespace Commerce store.",
-    available: true,
-    logo: "Sq",
-    logoColor: "bg-black text-white",
-  },
-  {
-    id: "lightspeed",
-    name: "Lightspeed",
-    description: "Connect your Lightspeed POS to sync inventory.",
-    available: false,
-    logo: "Ls",
-    logoColor: "bg-red-500 text-white",
-  },
-  {
-    id: "shopify",
-    name: "Shopify",
-    description: "Import products from your Shopify store.",
-    available: false,
-    logo: "Sh",
-    logoColor: "bg-green-600 text-white",
-  },
+  // {
+  //   id: "squarespace",
+  //   name: "Squarespace",
+  //   description: "Import products from your Squarespace Commerce store.",
+  //   available: true,
+  //   logo: "Sq",
+  //   logoColor: "bg-black text-white",
+  // },
+  // {
+  //   id: "lightspeed",
+  //   name: "Lightspeed",
+  //   description: "Connect your Lightspeed POS to sync inventory.",
+  //   available: false,
+  //   logo: "Ls",
+  //   logoColor: "bg-red-500 text-white",
+  // },
+  // {
+  //   id: "shopify",
+  //   name: "Shopify",
+  //   description: "Import products from your Shopify store.",
+  //   available: false,
+  //   logo: "Sh",
+  //   logoColor: "bg-green-600 text-white",
+  // },
   {
     id: "csv_xlsx",
     name: "CSV / Excel Upload",
@@ -88,6 +88,7 @@ export function IntegrationsModal({
   const [isSaving, setIsSaving] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [imageIndex, setImageIndex] = useState(0); // 0 = first, 1 = second, 2 = third
   const [saveStatus, setSaveStatus] = useState<"idle" | "success" | "error">(
     "idle",
   );
@@ -369,7 +370,46 @@ export function IntegrationsModal({
                         className="w-full px-3 py-2 rounded-lg border border-input bg-background file:rounded-md file:border-0 file:bg-secondary file:text-secondary-foreground file:text-xs file:font-medium file:px-2 file:py-1 file:mr-3 hover:file:opacity-90 transition-all text-sm"
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        Supports .xlsx, .csv, or Shopify product exports
+                        Supports .xlsx, .csv, Shopify, and Lightspeed POS exports
+                      </p>
+                      <details className="mt-2">
+                        <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground transition-colors select-none">
+                          Supported column names
+                        </summary>
+                        <div className="mt-1.5 text-xs text-muted-foreground space-y-1 pl-1">
+                          <p><span className="font-mono bg-muted px-1 rounded">name</span> / <span className="font-mono bg-muted px-1 rounded">Title</span> — product name (required)</p>
+                          <p><span className="font-mono bg-muted px-1 rounded">sku</span> / <span className="font-mono bg-muted px-1 rounded">Variant SKU</span> — used for deduplication</p>
+                          <p><span className="font-mono bg-muted px-1 rounded">retail_price</span> / <span className="font-mono bg-muted px-1 rounded">price</span> / <span className="font-mono bg-muted px-1 rounded">Variant Price</span></p>
+                          <p><span className="font-mono bg-muted px-1 rounded">description</span> / <span className="font-mono bg-muted px-1 rounded">Body (HTML)</span></p>
+                          <p><span className="font-mono bg-muted px-1 rounded">image_url</span> / <span className="font-mono bg-muted px-1 rounded">Image Src</span> — first URL used if multiple</p>
+                          <p><span className="font-mono bg-muted px-1 rounded">tags</span> — comma-separated, auto-created</p>
+                        </div>
+                      </details>
+                    </div>
+
+                    {/* Image index picker */}
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-medium text-muted-foreground">
+                        Which image to import
+                      </label>
+                      <div className="flex gap-2">
+                        {["1st", "2nd", "3rd"].map((label, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => setImageIndex(i)}
+                            className={`px-3 py-1 rounded-md text-xs font-medium border transition-colors ${
+                              imageIndex === i
+                                ? "bg-primary text-primary-foreground border-primary"
+                                : "bg-muted text-muted-foreground border-border hover:bg-muted/80"
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        For exports with multiple images per product (e.g. Lightspeed POS)
                       </p>
                     </div>
 
@@ -409,6 +449,7 @@ export function IntegrationsModal({
                             const result = await importProductsFromFile(
                               parsedData,
                               storeId,
+                              imageIndex,
                             );
                             setImportResult(result);
                           } catch (err: any) {

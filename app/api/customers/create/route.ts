@@ -7,7 +7,7 @@ export const dynamic = "force-dynamic";
 function formatPhone(phone: string): string | null {
   if (!phone) return null;
   const cleaned = phone.replace(/(?!^\+)[^\d]/g, "");
-  return cleaned || null; // ← return null if result is still empty
+  return cleaned || null;
 }
 
 export async function POST(request: Request) {
@@ -20,110 +20,142 @@ export async function POST(request: Request) {
       { auth: { persistSession: false } },
     );
 
-    const formattedPhone = formatPhone(body.phone); // now null, not ''
+    const formattedPhone = formatPhone(body.phone);
+    const incomingEmail = body.email ? body.email.trim().toLowerCase() : null;
 
-    console.log("API CALL: create customer - formatted phone", formattedPhone);
+    console.log(
+      "API CALL: create customer - formatted phone:",
+      formattedPhone,
+      "email:",
+      incomingEmail,
+    );
 
-    // Check for duplicate by phone or email
-    let existing = null;
+    // ==========================================
+    // HELPER 1: Two-Pass Lookup Logic
+    // ==========================================
+    async function findCustomer() {
+      // Pass 1: Try Phone
+      if (formattedPhone) {
+        const { data } = await supabase
+          .from("customers")
+          .select("*")
+          .eq("phone", formattedPhone)
+          .limit(1); // Use limit(1) instead of single() to prevent crashes on edge-case duplicates
 
-    if (formattedPhone) {
-      const { data } = await supabase
-        .from("customers")
-        .select("*")
-        .eq("phone", formattedPhone)
-        .eq("store_id", body.store_id)
-        .single();
-      existing = data;
+        if (data && data.length > 0) return data[0];
+      }
+
+      // Pass 2: Try Email (check primary OR secondary array)
+      if (incomingEmail) {
+        const { data } = await supabase
+          .from("customers")
+          .select("*")
+          .or(
+            `email.eq.${incomingEmail},secondary_emails.cs.{"${incomingEmail}"}`,
+          )
+          .limit(1);
+
+        if (data && data.length > 0) return data[0];
+      }
+
+      return null;
     }
 
-    if (!existing && body.email) {
-      const { data } = await supabase
-        .from("customers")
-        .select("*")
-        .eq("email", body.email)
-        .eq("store_id", body.store_id)
-        .single();
-      existing = data;
-    }
+    // ==========================================
+    // HELPER 2: Safe Merge Logic
+    // ==========================================
+    async function mergeAndUpdate(existing: any) {
+      const currentEmail = existing.email
+        ? existing.email.trim().toLowerCase()
+        : null;
 
-    if (existing) {
-      // Update last_active and merge name if missing
+      const updatePayload: any = {
+        last_active: new Date().toISOString(),
+        name: existing.name || body.name || null,
+        // Keep their current email if they have one, otherwise set the incoming one
+        email: currentEmail || incomingEmail,
+        // Backfill phone if it was missing
+        phone: existing.phone || formattedPhone || null,
+      };
+
+      // Handle Secondary Emails Append
+      if (incomingEmail && currentEmail && incomingEmail !== currentEmail) {
+        // Use Set to prevent duplicates in the array
+        const pastEmails = new Set(existing.secondary_emails || []);
+        pastEmails.add(incomingEmail);
+        updatePayload.secondary_emails = Array.from(pastEmails);
+      }
+
+      // Handle Tags Append (Merge with existing traits.tags)
+      if (body.tags && Array.isArray(body.tags)) {
+        let updatedTraits = { ...(existing.traits || {}) };
+        const existingTags = new Set(updatedTraits.tags || []);
+        body.tags.forEach((tag: string) => existingTags.add(tag));
+        updatedTraits.tags = Array.from(existingTags);
+        updatePayload.traits = updatedTraits;
+      }
+
       const { data: updated } = await supabase
         .from("customers")
-        .update({
-          last_active: new Date().toISOString(),
-          name: existing.name || body.name || null,
-          // backfill email/phone if they were missing before
-          email: existing.email || body.email || null,
-          phone: existing.phone || formattedPhone || null,
-        })
+        .update(updatePayload)
         .eq("id", existing.id)
         .select()
         .single();
 
+      return updated ?? existing;
+    }
+
+    // ==========================================
+    // EXECUTION FLOW
+    // ==========================================
+
+    // 1. Initial Lookup
+    let existing = await findCustomer();
+
+    // 2. If Exists -> Merge & Return
+    if (existing) {
+      const updatedProfile = await mergeAndUpdate(existing);
       return NextResponse.json({
         success: true,
         token: existing.id,
-        profile: updated ?? existing,
+        profile: updatedProfile,
         isExisting: true,
       });
     }
 
-    const { tags, ...restBody } = body;
+    // 3. If Brand New -> Insert
+    const insertPayload = {
+      name: body.name || null,
+      first_name: body.first_name || body.firstName || null, // Handle both standard and camelCase
+      last_name: body.last_name || body.lastName || null,
+      phone: formattedPhone,
+      email: incomingEmail,
+      store_id: body.store_id || null,
+      traits: body.tags ? { tags: body.tags } : {},
+      last_active: new Date().toISOString(),
+    };
 
     const { data: result, error } = await supabase
       .from("customers")
-      .insert([
-        {
-          ...restBody,
-          traits: tags ? { tags } : {},
-          phone: formattedPhone, // ← null, not '' or body.phone
-          email: body.email || null, // ← null if empty
-          last_active: new Date().toISOString(),
-        },
-      ])
+      .insert([insertPayload])
       .select()
       .single();
 
+    // 4. Handle Insert Errors / Race Conditions
     if (error) {
       console.error("Customer save error:", error);
 
-      // Race condition fallback — concurrent insert won the race
+      // Race condition (23505): Another simultaneous request created the customer fractions of a second ago
       if (error.code === "23505") {
-        // Look up the winner and return it as success
-        let raceExisting = null;
-
-        if (formattedPhone) {
-          const { data } = await supabase
-            .from("customers")
-            .select("*")
-            .eq("phone", formattedPhone)
-            .eq("store_id", body.store_id)
-            .single();
-          raceExisting = data;
-        }
-
-        if (!raceExisting && body.email) {
-          const { data } = await supabase
-            .from("customers")
-            .select("*")
-            .eq("email", body.email)
-            .eq("store_id", body.store_id)
-            .single();
-          raceExisting = data;
-        }
+        const raceExisting = await findCustomer();
 
         if (raceExisting) {
-          await supabase
-            .from("customers")
-            .update({ last_active: new Date().toISOString() })
-            .eq("id", raceExisting.id);
-
+          // Gracefully merge data into the newly created profile
+          const updatedProfile = await mergeAndUpdate(raceExisting);
           return NextResponse.json({
             success: true,
             token: raceExisting.id,
-            profile: raceExisting,
+            profile: updatedProfile,
             isExisting: true,
           });
         }
@@ -135,6 +167,7 @@ export async function POST(request: Request) {
       );
     }
 
+    // 5. Success on Brand New Profile
     return NextResponse.json({
       success: true,
       token: result.id,

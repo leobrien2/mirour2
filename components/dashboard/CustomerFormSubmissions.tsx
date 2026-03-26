@@ -69,132 +69,207 @@ export function CustomerFormSubmissions({
       });
   }, [flowSessions]);
 
- const fetchSubmissions = useCallback(async () => {
-   const orConditions: string[] = [];
+const fetchSubmissions = useCallback(async () => {
+  // 1. Get the current authenticated user (the owner)
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    console.log("No authenticated user found");
+    setLoading(false);
+    return;
+  }
 
-   // ── Primary: customer_id UUID (most reliable) ──
-   if (customerRecord?.id && isUUID(customerRecord.id)) {
-     orConditions.push(`customer_id.eq.${customerRecord.id}`);
-   }
+  const orConditions: string[] = [];
 
-   // ── Fallback: userId string format detection ──
-   if (userId.includes("@")) {
-     orConditions.push(`customer_email.eq.${userId}`);
-   } else if (userId.match(/^\+?[0-9\s-]+$/)) {
-     orConditions.push(`customer_phone.eq.${userId}`);
-   } else if (userId.startsWith("anonymous-")) {
-     const responseId = userId.replace("anonymous-", "");
-     if (isUUID(responseId)) orConditions.push(`id.eq.${responseId}`);
-   }
-   // ❌ Removed: name-based userId fallback — name is not unique
+  // ── Primary: customer_id UUID (most reliable) ──
+  if (customerRecord?.id && isUUID(customerRecord.id)) {
+    orConditions.push(`customer_id.eq.${customerRecord.id}`);
+  }
 
-   // ── Safe fallbacks from customerRecord fields (email + phone only) ──
-   if (customerRecord?.email)
-     orConditions.push(`customer_email.eq.${customerRecord.email}`);
-   if (customerRecord?.phone)
-     orConditions.push(`customer_phone.eq.${customerRecord.phone}`);
-   // ❌ Removed: customer_name fallback — causes cross-customer contamination
+  // ── Fallback: userId string format detection ──
+  if (userId.includes("@")) {
+    orConditions.push(`customer_email.eq.${userId}`);
+  } else if (userId.match(/^\+?[0-9\s-]+$/)) {
+    orConditions.push(`customer_phone.eq.${userId}`);
+  } else if (userId.startsWith("anonymous-")) {
+    const responseId = userId.replace("anonymous-", "");
+    if (isUUID(responseId)) orConditions.push(`id.eq.${responseId}`);
+  }
 
-   // ── Link via flowSessions response_id ──
-   if (flowSessions?.length > 0) {
-     flowSessions.forEach((session) => {
-       if (session.response_id && isUUID(session.response_id)) {
-         orConditions.push(`id.eq.${session.response_id}`);
-       }
-     });
-   }
+  // ── Safe fallbacks from customerRecord fields (email + phone only) ──
+  if (customerRecord?.email)
+    orConditions.push(`customer_email.eq.${customerRecord.email}`);
+  if (customerRecord?.phone)
+    orConditions.push(`customer_phone.eq.${customerRecord.phone}`);
 
-   console.log("orConditions", orConditions);
+  // ── Link via flowSessions response_id ──
+  if (flowSessions?.length > 0) {
+    flowSessions.forEach((session) => {
+      if (session.response_id && isUUID(session.response_id)) {
+        orConditions.push(`id.eq.${session.response_id}`);
+      }
+    });
+  }
 
-   const uniqueConditions = Array.from(new Set(orConditions));
+  const uniqueConditions = Array.from(new Set(orConditions));
 
-   console.log("uniqueConditions", uniqueConditions);
-
-   if (uniqueConditions.length === 0) {
-
+  if (uniqueConditions.length === 0) {
     console.log("No unique conditions");
-     setSubmissions([]);
-     onSubmissionsLoaded([]);
-     setLoading(false);
-     return;
-   }
+    setSubmissions([]);
+    onSubmissionsLoaded([]);
+    setLoading(false);
+    return;
+  }
 
-   const { data, error } = await supabase
-     .from("responses")
-     .select(
-       `
-      id,
-      form_id,
-      submitted_at,
-      perk_redeemed,
-      redemption_code,
-      answers,
-      customer_name,
-      customer_email,
-      customer_phone,
-      customer_id,
-      forms (
+  // 2. Query responses with an inner join to forms and filter by owner_id
+  const { data, error } = await supabase
+    .from("responses")
+    .select(
+      `
         id,
-        name,
-        questions
-      )
-    `,
-     )
-     .or(uniqueConditions.join(","))
-     .order("submitted_at", { ascending: false });
+        form_id,
+        submitted_at,
+        perk_redeemed,
+        redemption_code,
+        answers,
+        customer_name,
+        customer_email,
+        customer_phone,
+        customer_id,
+        forms!inner (
+          id,
+          name,
+          questions,
+          owner_id
+        )
+      `,
+    )
+    .or(uniqueConditions.join(","))
+    .eq("forms.owner_id", user.id) // <-- SECURITY FILTER: Only forms owned by current user
+    .order("submitted_at", { ascending: false });
 
-     console.log("data", data);
+  if (error) {
+    console.error("Error fetching customer submissions:", error);
+    setLoading(false);
+    return;
+  }
 
-   if (error) {
-     console.error("Error fetching customer submissions:", error);
-     setLoading(false);
-     return;
-   }
+  const formattedParams = (data || []).map((r: any) => {
+    const formObj = Array.isArray(r.forms) ? r.forms[0] : r.forms;
+    let parsedQuestions = formObj?.questions;
+    if (typeof parsedQuestions === "string") {
+      try {
+        parsedQuestions = JSON.parse(parsedQuestions);
+      } catch {
+        parsedQuestions = null;
+      }
+    }
 
-   const formattedParams = (data || []).map((r: any) => {
-     const formObj = Array.isArray(r.forms) ? r.forms[0] : r.forms;
-     let parsedQuestions = formObj?.questions;
-     if (typeof parsedQuestions === "string") {
-       try {
-         parsedQuestions = JSON.parse(parsedQuestions);
-       } catch {
-         parsedQuestions = [];
-       }
-     }
+    // ── FLATTEN BLOCKS FOR SEARCHING ──
+    // Handle both legacy flat arrays and the new nested CanvasFlow (steps -> blocks) structure
+    let allBlocks: any[] = [];
+    if (parsedQuestions) {
+      if (Array.isArray(parsedQuestions)) {
+        parsedQuestions.forEach((item: any) => {
+          if (item.blocks)
+            allBlocks.push(...item.blocks); // CanvasStep format
+          else allBlocks.push(item); // Legacy FlowNode format
+        });
+      } else if (parsedQuestions.steps) {
+        // Full CanvasFlow object format
+        parsedQuestions.steps.forEach((step: any) => {
+          if (step.blocks) allBlocks.push(...step.blocks);
+        });
+      }
+    }
 
-     return {
-       responseId: r.id,
-       formId: r.form_id,
-       formName: formObj?.name,
-       submittedAt: new Date(r.submitted_at),
-       perkRedeemed: r.perk_redeemed,
-       redemptionCode: r.redemption_code,
-       answers:
-         typeof r.answers === "string" ? JSON.parse(r.answers) : r.answers,
-       schema: parsedQuestions,
-       customerName: r.customer_name,
-       customerEmail: r.customer_email,
-       customerPhone: r.customer_phone,
-       customerId: r.customer_id,
-     };
-   });
+    // Parse raw answers
+    const rawAnswers =
+      typeof r.answers === "string" ? JSON.parse(r.answers) : r.answers || {};
+    const processedAnswers: Record<string, any> = {};
 
+    // Transform answers
+    Object.entries(rawAnswers).forEach(([questionId, ans]: [string, any]) => {
+      let label = questionId;
+      let value = ans;
 
-   console.log("formattedParams", formattedParams);
-   // Deduplicate by responseId — safety net against any remaining RLS overlap
-   const seen = new Set<string>();
-   const deduplicated = formattedParams.filter((r) => {
-     if (seen.has(r.responseId)) return false;
-     seen.add(r.responseId);
-     return true;
-   });
-   console.log("deduplicated", deduplicated);
+      // Extract the structured answer format { label, value, answeredAt }
+      if (ans && typeof ans === "object" && !Array.isArray(ans)) {
+        label = ans.label || questionId;
+        value = ans.value !== undefined ? ans.value : ans;
+      }
 
-   setSubmissions(deduplicated);
-   onSubmissionsLoaded(deduplicated);
-   setLoading(false);
- }, [userId, customerRecord, flowSessions, onSubmissionsLoaded]);
+      // Find the block in our flattened array
+      const blockDef = allBlocks.find((b: any) => b.id === questionId);
 
+      if (blockDef) {
+        // Support both new `data.options` and legacy `.options`
+        const options = blockDef.data?.options || blockDef.options;
+
+        if (Array.isArray(options)) {
+          if (Array.isArray(value)) {
+            // Handle multiple choice arrays
+            value = value
+              .map((v) => {
+                const opt = options.find(
+                  (o: any) => o.id === v || o.value === v,
+                );
+                return opt ? opt.label || opt.text || opt.value : v;
+              })
+              .join(", ");
+          } else {
+            // Handle single choice
+            const opt = options.find(
+              (o: any) => o.id === value || o.value === value,
+            );
+            if (opt) {
+              value = opt.label || opt.text || opt.value;
+            }
+          }
+        }
+      }
+
+      // Failsafe stringification
+      if (value && typeof value === "object") {
+        try {
+          value = JSON.stringify(value);
+        } catch {
+          value = String(value);
+        }
+      }
+
+      processedAnswers[label] = value;
+    });
+
+    return {
+      responseId: r.id,
+      formId: r.form_id,
+      formName: formObj?.name,
+      submittedAt: new Date(r.submitted_at),
+      perkRedeemed: r.perk_redeemed,
+      redemptionCode: r.redemption_code,
+      answers: processedAnswers,
+      schema: parsedQuestions,
+      customerName: r.customer_name,
+      customerEmail: r.customer_email,
+      customerPhone: r.customer_phone,
+      customerId: r.customer_id,
+    };
+  });
+
+  // Deduplicate by responseId
+  const seen = new Set<string>();
+  const deduplicated = formattedParams.filter((r) => {
+    if (seen.has(r.responseId)) return false;
+    seen.add(r.responseId);
+    return true;
+  });
+
+  setSubmissions(deduplicated);
+  onSubmissionsLoaded(deduplicated);
+  setLoading(false);
+}, [userId, customerRecord, flowSessions, onSubmissionsLoaded]);
   useEffect(() => {
     fetchSubmissions();
   }, [fetchSubmissions]);
@@ -238,8 +313,7 @@ export function CustomerFormSubmissions({
           submissions.map((submission) => {
             const isExpanded = expandedSubmissionId === submission.responseId;
 
-            // Match session — prioritise customer_id UUID match (most accurate),
-            // fall back to response_id, then form_id
+            // Match session
             const session = flowSessions.find(
               (s) =>
                 (submission.customerId &&
@@ -248,7 +322,6 @@ export function CustomerFormSubmissions({
                 s.form_id === submission.formId,
             );
 
-            // Get per-node timing rows for this specific session
             const nodes = session?.id ? (sessionNodes[session.id] ?? []) : [];
 
             const formSchema = {

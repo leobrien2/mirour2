@@ -1,10 +1,17 @@
+// hooks/useFormAnalytics.ts
+"use client";
+
 import { useCallback, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { v4 as uuidv4 } from "uuid";
+import { flowLog } from "@/lib/flowLogger";
 
-const VISITOR_ID_KEY = "mirour_visitor_id";
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ── Visitor ID (device fingerprint persisted in localStorage) ─────────────────
+const VISITOR_ID_KEY = "mirour_visitor_id"; // permanent device ID — keep underscore
+const CUSTOMER_TOKEN_KEY = "mirour:customertoken"; // ✅ matches customerSession.ts
+
+// ─── Visitor ID ───────────────────────────────────────────────────────────────
 
 const generateVisitorId = (): string => "v_" + uuidv4();
 
@@ -18,13 +25,15 @@ export const getOrCreateVisitorId = (): string => {
   return visitorId;
 };
 
-// ── Device type detection ─────────────────────────────────────────────────────
+// ─── Device / browser helpers ─────────────────────────────────────────────────
 
 const getDeviceType = (): "mobile" | "tablet" | "desktop" => {
   if (typeof navigator === "undefined") return "desktop";
   const ua = navigator.userAgent;
   if (/tablet|ipad|playbook|silk/i.test(ua)) return "tablet";
-  if (/mobile|iphone|ipod|android|blackberry|opera mini|windows phone/i.test(ua))
+  if (
+    /mobile|iphone|ipod|android|blackberry|opera mini|windows phone/i.test(ua)
+  )
     return "mobile";
   return "desktop";
 };
@@ -43,7 +52,8 @@ const getOS = (): string => {
 const getBrowser = (): string => {
   if (typeof navigator === "undefined") return "Unknown";
   const ua = navigator.userAgent;
-  if (/chrome|crios/i.test(ua) && !/edge|edg|opr|brave/i.test(ua)) return "Chrome";
+  if (/chrome|crios/i.test(ua) && !/edge|edg|opr|brave/i.test(ua))
+    return "Chrome";
   if (/safari/i.test(ua) && !/chrome|crios|opr|edg/i.test(ua)) return "Safari";
   if (/firefox|fxios/i.test(ua)) return "Firefox";
   if (/edg/i.test(ua)) return "Edge";
@@ -51,26 +61,30 @@ const getBrowser = (): string => {
   return "Unknown";
 };
 
-// ── Main hook ─────────────────────────────────────────────────────────────────
+// ─── Main hook ────────────────────────────────────────────────────────────────
 
-export const useFormAnalytics = (formId: string | undefined) => {
-  const sessionIdRef      = useRef<string | null>(null);
-  const visitorIdRef      = useRef<string>(getOrCreateVisitorId());
-  const visitedNodesRef   = useRef<string[]>([]);
+export const useFormAnalytics = (
+  formId: string | undefined,
+  isPreview = false,
+) => {
+  const sessionIdRef = useRef<string | null>(null);
+  const visitorIdRef = useRef<string>(getOrCreateVisitorId());
+  const visitedNodesRef = useRef<string[]>([]);
   const partialAnswersRef = useRef<Record<string, unknown>>({});
-  const sessionStartRef   = useRef<number | null>(null); // Date.now() at session start
-  const nodeStartRef      = useRef<number | null>(null); // Date.now() at node entrance
+  const sessionStartRef = useRef<number | null>(null);
+  const nodeStartRef = useRef<number | null>(null);
 
-  // Queue for updates that arrive before the session INSERT completes
   const pendingUpdatesRef = useRef<
     Array<{ nodeId: string; answer?: { questionId: string; value: unknown } }>
   >([]);
   const sessionReadyRef = useRef(false);
 
-  // ── Generic analytics event (analytics_events table, anon_id based) ──────
+  // ── Generic analytics event ───────────────────────────────────────────────
 
   const trackEvent = useCallback(
     async (eventType: string, payload: any = {}) => {
+      if (isPreview) return;
+
       try {
         const anonId =
           typeof window !== "undefined"
@@ -88,12 +102,14 @@ export const useFormAnalytics = (formId: string | undefined) => {
         console.error("Failed to track event", e);
       }
     },
-    [],
+    [isPreview],
   );
 
-  // ── Flush queued node/answer updates after session is ready ──────────────
+  // ── Flush queued updates after session is ready ───────────────────────────
 
   const flushPendingUpdates = useCallback(async () => {
+    if (isPreview) return;
+
     const sessionId = sessionIdRef.current;
     if (!sessionId || pendingUpdatesRef.current.length === 0) return;
 
@@ -113,49 +129,63 @@ export const useFormAnalytics = (formId: string | undefined) => {
     }
     pendingUpdatesRef.current = [];
 
+    const flushPayload = {
+      current_node_id:
+        visitedNodesRef.current[visitedNodesRef.current.length - 1] || null,
+      visited_nodes: visitedNodesRef.current as unknown as null,
+      partial_answers: partialAnswersRef.current as unknown as null,
+      last_activity_at: new Date().toISOString(),
+    };
+    flowLog(
+      "DB_WRITE flow_sessions — flush pending updates",
+      { sessionId, ...flushPayload },
+      "db_write",
+      "flow_sessions",
+    );
     try {
       await supabase
         .from("flow_sessions")
-        .update({
-          current_node_id:
-            visitedNodesRef.current[visitedNodesRef.current.length - 1] || null,
-          visited_nodes:   visitedNodesRef.current as unknown as null,
-          partial_answers: partialAnswersRef.current as unknown as null,
-          last_activity_at: new Date().toISOString(),
-        })
+        .update(flushPayload)
         .eq("id", sessionId);
     } catch (error) {
+      flowLog("ANALYTICS_ERROR", { fn: "flushPendingUpdates", error }, "error");
       console.error("Error flushing pending updates:", error);
     }
-  }, []);
+  }, [isPreview]);
 
   // ── Track QR scan / page visit ────────────────────────────────────────────
-  // Detects return visitors by checking if visitor_id is already in localStorage
-  // (i.e., has scanned before — any form, not just this one).
 
   const trackVisit = useCallback(
     async (zoneId?: string) => {
+      if (isPreview) return;
       if (!formId) return;
 
-      // A visitor_id already stored = they've visited before (any flow).
-      // We set is_return_visitor based on this heuristic.
       const preExistingId = localStorage.getItem(VISITOR_ID_KEY);
       const isReturnVisitor = !!preExistingId;
 
+      const visitPayload = {
+        form_id: formId,
+        visitor_id: visitorIdRef.current,
+        referrer: document.referrer || null,
+        user_agent: navigator.userAgent || null,
+        zone_id: zoneId || null,
+        is_return_visitor: isReturnVisitor,
+      };
+      flowLog(
+        "DB_WRITE form_visits — insert",
+        visitPayload,
+        "db_write",
+        "form_visits",
+      );
+
       try {
-        await supabase.from("form_visits").insert({
-          form_id:           formId,
-          visitor_id:        visitorIdRef.current,
-          referrer:          document.referrer || null,
-          user_agent:        navigator.userAgent || null,
-          zone_id:           zoneId || null,
-          is_return_visitor: isReturnVisitor,
-        });
+        await supabase.from("form_visits").insert(visitPayload);
       } catch (error) {
+        flowLog("ANALYTICS_ERROR", { fn: "trackVisit", error }, "error");
         console.error("Error tracking visit:", error);
       }
     },
-    [formId],
+    [formId, isPreview],
   );
 
   // ── Start a new flow session ──────────────────────────────────────────────
@@ -163,15 +193,28 @@ export const useFormAnalytics = (formId: string | undefined) => {
   const startSession = useCallback(
     async (
       initialNodeId?: string,
-      opts?: { flowVersion?: string },
+      opts?: {
+        flowVersion?: string;
+        customerId?: string | null;
+      },
     ): Promise<string | null> => {
+      if (isPreview) {
+        const fakeId = "preview_" + uuidv4();
+        sessionIdRef.current = fakeId;
+        sessionReadyRef.current = true;
+        visitedNodesRef.current = initialNodeId ? [initialNodeId] : [];
+        partialAnswersRef.current = {};
+        sessionStartRef.current = Date.now();
+        nodeStartRef.current = Date.now();
+        return fakeId;
+      }
+
       if (!formId) return null;
 
       try {
         const sessionId = uuidv4();
-        sessionStartRef.current = Date.now(); // record wall-clock start time
+        sessionStartRef.current = Date.now();
 
-        // Persist start time so it survives hook re-renders or garbage collection
         if (typeof sessionStorage !== "undefined") {
           sessionStorage.setItem(
             `mirour_session_start_${sessionId}`,
@@ -179,45 +222,72 @@ export const useFormAnalytics = (formId: string | undefined) => {
           );
         }
 
-        const { error } = await supabase.from("flow_sessions").insert({
-          id:             sessionId,
-          form_id:        formId,
-          visitor_id:     visitorIdRef.current,
-          current_node_id: initialNodeId || null,
-          visited_nodes:  initialNodeId ? [initialNodeId] : [],
-          partial_answers: {},
-          status:         "in_progress",
-          flow_version:   opts?.flowVersion || "v1",
-          device_type:    getDeviceType(),
-          os:             getOS(),
-          browser:        getBrowser(),
-        });
+        // ✅ Reads "mirour:customertoken" — now consistent with customerSession.ts
+        const customerId =
+          opts?.customerId ??
+          (typeof window !== "undefined"
+            ? localStorage.getItem(CUSTOMER_TOKEN_KEY)
+            : null) ??
+          null;
 
-        // Trigger an async location fetch
+        const sessionPayload = {
+          id: sessionId,
+          form_id: formId,
+          visitor_id: visitorIdRef.current,
+          current_node_id: initialNodeId || null,
+          visited_nodes: initialNodeId ? [initialNodeId] : [],
+          partial_answers: {},
+          status: "in_progress",
+          flow_version: opts?.flowVersion || "v1",
+          device_type: getDeviceType(),
+          os: getOS(),
+          browser: getBrowser(),
+          customer_id: customerId,
+        };
+        flowLog(
+          "DB_WRITE flow_sessions — insert",
+          sessionPayload,
+          "db_write",
+          "flow_sessions",
+        );
+
+        const { error } = await supabase
+          .from("flow_sessions")
+          .insert(sessionPayload);
+
+        if (error) throw error;
+
+        // Async location fetch — fire and forget
+        flowLog("FETCH geo — ipapi.co", null, "db_read");
         fetch("https://ipapi.co/json/")
           .then((res) => res.json())
           .then((data) => {
-            if (data && data.city) {
+            if (data?.city) {
+              const locUpdate = {
+                city: data.city,
+                region: data.region,
+                country: data.country_name,
+              };
+              flowLog(
+                "DB_WRITE flow_sessions — update location",
+                { sessionId, ...locUpdate },
+                "db_write",
+                "flow_sessions",
+              );
               supabase
                 .from("flow_sessions")
-                .update({
-                  city: data.city,
-                  region: data.region,
-                  country: data.country_name,
-                })
+                .update(locUpdate)
                 .eq("id", sessionId)
                 .then();
             }
           })
-          .catch((err) => console.log("Location fetch skipped or failed", err));
+          .catch(() => {});
 
-        if (error) throw error;
-
-        visitedNodesRef.current   = initialNodeId ? [initialNodeId] : [];
+        visitedNodesRef.current = initialNodeId ? [initialNodeId] : [];
         partialAnswersRef.current = {};
-        sessionIdRef.current      = sessionId;
-        sessionReadyRef.current   = true;
-        nodeStartRef.current      = Date.now();
+        sessionIdRef.current = sessionId;
+        sessionReadyRef.current = true;
+        nodeStartRef.current = Date.now();
 
         await flushPendingUpdates();
         await trackEvent("quiz_start", { form_id: formId, initialNodeId });
@@ -228,14 +298,15 @@ export const useFormAnalytics = (formId: string | undefined) => {
         return null;
       }
     },
-    [formId, flushPendingUpdates, trackEvent],
+    [formId, isPreview, flushPendingUpdates, trackEvent],
   );
 
-  // ── Record a visitor journey row (cross-location tracking) ───────────────
-  // Call this once per session, right after startSession returns a sessionId.
+  // ── Record a visitor journey row ──────────────────────────────────────────
 
   const recordJourney = useCallback(
     async (sessionId: string, storeId: string, customerId?: string) => {
+      if (isPreview) return;
+
       try {
         const { data: existing } = await (supabase as any)
           .from("visitor_location_journeys")
@@ -245,62 +316,88 @@ export const useFormAnalytics = (formId: string | undefined) => {
           .maybeSingle();
 
         if (!existing) {
+          const journeyPayload = {
+            visitor_id: visitorIdRef.current,
+            customer_id: customerId || null,
+            store_id: storeId,
+            session_id: sessionId,
+          };
+          flowLog(
+            "DB_WRITE visitor_location_journeys — insert",
+            journeyPayload,
+            "db_write",
+            "visitor_location_journeys",
+          );
           await (supabase as any)
             .from("visitor_location_journeys")
-            .insert({
-              visitor_id:  visitorIdRef.current,
-              customer_id: customerId || null,
-              store_id:    storeId,
-              session_id:  sessionId,
-            });
+            .insert(journeyPayload);
+        } else {
+          flowLog(
+            "DB_READ visitor_location_journeys — already exists, skip",
+            { sessionId },
+            "db_read",
+          );
         }
       } catch (error) {
+        flowLog("ANALYTICS_ERROR", { fn: "recordJourney", error }, "error");
         console.error("Error recording journey:", error);
       }
     },
-    [],
+    [isPreview],
   );
 
-  // ── Update progress (node visit + optional answer) ────────────────────────
+  // ── Update progress ───────────────────────────────────────────────────────
 
   const updateProgress = useCallback(
-    async (
-      nodeId: string,
-      answer?: { questionId: string; value: unknown },
-    ) => {
+    async (nodeId: string, answer?: { questionId: string; value: unknown }) => {
+      if (isPreview) return;
+
       if (!sessionReadyRef.current || !sessionIdRef.current) {
         pendingUpdatesRef.current.push({ nodeId, answer });
         return;
       }
 
       const sessionId = sessionIdRef.current;
-      const prevNodeId = visitedNodesRef.current[visitedNodesRef.current.length - 1];
+      const prevNodeId =
+        visitedNodesRef.current[visitedNodesRef.current.length - 1];
 
       try {
         let timeInPrevNode = 0;
-        let enteredAtIso = undefined;
+        let enteredAtIso: string | undefined = undefined;
+
         if (nodeStartRef.current) {
-          timeInPrevNode = Math.round((Date.now() - nodeStartRef.current) / 1000);
+          timeInPrevNode = Math.round(
+            (Date.now() - nodeStartRef.current) / 1000,
+          );
           enteredAtIso = new Date(nodeStartRef.current).toISOString();
         }
 
         if (prevNodeId && prevNodeId !== nodeId) {
-          // Fire and forget insert for the previous node
-          (supabase as any).from("flow_session_nodes").insert({
-            session_id:         sessionId,
-            form_id:            formId,
-            node_id:            prevNodeId,
+          const nodePayload = {
+            session_id: sessionId,
+            form_id: formId,
+            node_id: prevNodeId,
             time_spent_seconds: timeInPrevNode,
-            entered_at:         enteredAtIso,
-            exited_at:          new Date().toISOString(),
-            is_dropoff:         false,
-          }).then();
+            entered_at: enteredAtIso,
+            exited_at: new Date().toISOString(),
+            is_dropoff: false,
+          };
+          flowLog(
+            "DB_WRITE flow_session_nodes — insert",
+            nodePayload,
+            "db_write",
+            "flow_session_nodes",
+          );
+          (supabase as any)
+            .from("flow_session_nodes")
+            .insert(nodePayload)
+            .then();
         }
 
-        // Only update start time if it's genuinely a new node
         if (prevNodeId !== nodeId) {
           nodeStartRef.current = Date.now();
         }
+
         if (
           visitedNodesRef.current[visitedNodesRef.current.length - 1] !== nodeId
         ) {
@@ -314,14 +411,21 @@ export const useFormAnalytics = (formId: string | undefined) => {
           };
         }
 
+        const progressUpdate = {
+          current_node_id: nodeId,
+          visited_nodes: visitedNodesRef.current as unknown as null,
+          partial_answers: partialAnswersRef.current as unknown as null,
+          last_activity_at: new Date().toISOString(),
+        };
+        flowLog(
+          "DB_WRITE flow_sessions — update progress",
+          { sessionId, nodeId, ...progressUpdate },
+          "db_write",
+          "flow_sessions",
+        );
         await supabase
           .from("flow_sessions")
-          .update({
-            current_node_id: nodeId,
-            visited_nodes:   visitedNodesRef.current as unknown as null,
-            partial_answers: partialAnswersRef.current as unknown as null,
-            last_activity_at: new Date().toISOString(),
-          })
+          .update(progressUpdate)
           .eq("id", sessionId);
 
         if (answer) {
@@ -333,24 +437,98 @@ export const useFormAnalytics = (formId: string | undefined) => {
         console.error("Error updating progress:", error);
       }
     },
-    [trackEvent],
+    [formId, isPreview, trackEvent],
   );
 
   // ── Complete session ──────────────────────────────────────────────────────
 
-const completeSession = useCallback(
-  async (responseId: string, customerId?: string) => {
+  const completeSession = useCallback(
+    async (responseId: string, customerId?: string) => {
+      if (isPreview) return;
+
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+
+      const lastNodeId =
+        visitedNodesRef.current[visitedNodesRef.current.length - 1];
+      const nodeTimeSec = nodeStartRef.current
+        ? Math.round((Date.now() - nodeStartRef.current) / 1000)
+        : null;
+      const enteredAt = nodeStartRef.current
+        ? new Date(nodeStartRef.current).toISOString()
+        : null;
+
+      const storedStart =
+        typeof sessionStorage !== "undefined"
+          ? sessionStorage.getItem(`mirour_session_start_${sessionId}`)
+          : null;
+      const startTime =
+        sessionStartRef.current ??
+        (storedStart ? parseInt(storedStart, 10) : null);
+      const totalTimeSec =
+        startTime != null ? Math.round((Date.now() - startTime) / 1000) : null;
+
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.removeItem(`mirour_session_start_${sessionId}`);
+      }
+
+      // ✅ Reads "mirour:customertoken" — now consistent with customerSession.ts
+      const resolvedCustomerId =
+        customerId ??
+        (typeof window !== "undefined"
+          ? localStorage.getItem(CUSTOMER_TOKEN_KEY)
+          : null) ??
+        null;
+
+      const completePayload = {
+        sessionId,
+        responseId,
+        customerId: resolvedCustomerId,
+        totalTimeSec,
+        lastNodeId: lastNodeId || null,
+        nodeTimeSec,
+        enteredAt,
+      };
+      flowLog("FETCH /api/sessions/complete", completePayload, "db_write");
+
+      try {
+        const res = await fetch("/api/sessions/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(completePayload),
+        });
+
+        const json = await res.json();
+        if (!json.ok) {
+          flowLog(
+            "ANALYTICS_ERROR",
+            { fn: "completeSession", error: json.error },
+            "error",
+          );
+          console.error("completeSession failed:", json.error);
+        }
+      } catch (err) {
+        flowLog(
+          "ANALYTICS_ERROR",
+          { fn: "completeSession", error: err },
+          "error",
+        );
+        console.error("completeSession fetch error:", err);
+      }
+    },
+    [isPreview],
+  );
+
+  // ── Abandon session ───────────────────────────────────────────────────────
+
+  const markAbandoned = useCallback(() => {
+    if (isPreview) return;
+
     const sessionId = sessionIdRef.current;
     if (!sessionId) return;
 
-    const lastNodeId =
-      visitedNodesRef.current[visitedNodesRef.current.length - 1];
-    const nodeTimeSec = nodeStartRef.current
-      ? Math.round((Date.now() - nodeStartRef.current) / 1000)
-      : null;
-    const enteredAt = nodeStartRef.current
-      ? new Date(nodeStartRef.current).toISOString()
-      : null;
+    const dropOffNode =
+      visitedNodesRef.current[visitedNodesRef.current.length - 1] || null;
 
     const storedStart =
       typeof sessionStorage !== "undefined"
@@ -362,128 +540,82 @@ const completeSession = useCallback(
     const totalTimeSec =
       startTime != null ? Math.round((Date.now() - startTime) / 1000) : null;
 
-    if (typeof sessionStorage !== "undefined") {
-      sessionStorage.removeItem(`mirour_session_start_${sessionId}`);
-    }
-
-    try {
-      const res = await fetch("/api/sessions/complete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sessionId,
-          responseId,
-          customerId: customerId ?? null,
-          totalTimeSec,
-          lastNodeId: lastNodeId || null,
-          nodeTimeSec,
-          enteredAt,
-        }),
-      });
-
-      const json = await res.json();
-      if (!json.ok) console.error("completeSession failed:", json.error);
-      else console.log("SESSION COMPLETED via API ✅");
-    } catch (err) {
-      console.error("completeSession fetch error:", err);
-    }
-  },
-  [formId],
-);
-
-
-  // ── Abandon session — records the drop-off node + time ──────────────────
-  // SYNC (no async) — called from beforeunload / visibilitychange.
-  // Uses sendBeacon so the request is guaranteed to complete even as the page
-  // is torn down. Async fetch is silently dropped by browsers on page close.
-
-  const markAbandoned = useCallback(() => {
-    const sessionId = sessionIdRef.current;
-    if (!sessionId) return;
-
-    const dropOffNode =
-      visitedNodesRef.current[visitedNodesRef.current.length - 1] || null;
-
-    // Compute total time with the same fallback logic as completeSession
-    const storedStart =
-      typeof sessionStorage !== "undefined"
-        ? sessionStorage.getItem(`mirour_session_start_${sessionId}`)
-        : null;
-    const startTime =
-      sessionStartRef.current ?? (storedStart ? parseInt(storedStart, 10) : null);
-    const totalTimeSec =
-      startTime != null
-        ? Math.round((Date.now() - startTime) / 1000)
-        : null;
-
     const payload = JSON.stringify({ sessionId, dropOffNode, totalTimeSec });
+    flowLog(
+      "BEACON /api/sessions/abandon",
+      { sessionId, dropOffNode, totalTimeSec },
+      "warn",
+    );
 
     if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      // sendBeacon: fire-and-forget, browser guarantees delivery on page close
       navigator.sendBeacon("/api/sessions/abandon", payload);
     } else {
-      // keepalive fetch as fallback (e.g. Node.js test environments)
       fetch("/api/sessions/abandon", {
-        method:   "POST",
-        body:     payload,
+        method: "POST",
+        body: payload,
         keepalive: true,
       }).catch(() => {});
     }
-  }, []);
-const trackQrScan = useCallback(
-  async (storeId: string, customerId?: string, zoneId?: string) => {
-    if (!formId || !storeId) return;
-    const sessionId = sessionIdRef.current;
+  }, [isPreview]);
 
-    try {
-      // 1. Insert qr_scan into interactions
-      await (supabase as any).from("interactions").insert({
-        store_id: storeId,
-        session_id: sessionId || null,
-        customer_id: customerId || null,
-        event_type: "qr_scan",
-        metadata: {
-          form_id: formId,
-          zone_id: zoneId || null,
-          scanned_at: new Date().toISOString(),
-        },
-      });
+  // ── Track QR scan interaction ─────────────────────────────────────────────
 
-      // 2. Increment visit_count on customers table
-      if (customerId) {
-        await (supabase as any).rpc("increment_customer_visit_count", {
-          p_customer_id: customerId,
+  const trackQrScan = useCallback(
+    async (storeId: string, customerId?: string, zoneId?: string) => {
+      if (isPreview) return;
+      if (!formId || !storeId) return;
+
+      const sessionId = sessionIdRef.current;
+
+      try {
+        await (supabase as any).from("interactions").insert({
+          store_id: storeId,
+          session_id: sessionId || null,
+          customer_id: customerId || null,
+          event_type: "qr_scan",
+          metadata: {
+            form_id: formId,
+            zone_id: zoneId || null,
+            scanned_at: new Date().toISOString(),
+          },
         });
-      }
-    } catch (error) {
-      console.error("Error tracking QR scan:", error);
-    }
-  },
-  [formId],
-);
 
-  // ── Track a link click ────────────────────────────────────────────────────
-  // event_type = 'link_clicked', metadata = { url, title, clicked_at }
+        if (customerId) {
+          await (supabase as any).rpc("increment_customer_visit_count", {
+            p_customer_id: customerId,
+          });
+        }
+      } catch (error) {
+        console.error("Error tracking QR scan:", error);
+      }
+    },
+    [formId, isPreview],
+  );
+
+  // ── Track link click interaction ──────────────────────────────────────────
 
   const trackLinkClick = useCallback(
     async (
-      storeId: string,
+      storeId: string | null | undefined,
       linkUrl: string,
       linkTitle: string,
       customerId?: string,
     ) => {
+      if (isPreview) return;
+      if (!storeId) return;
+
       const sessionId = sessionIdRef.current;
-      if (!sessionId || !storeId) return;
+      if (!sessionId) return;
 
       try {
         await (supabase as any).from("interactions").insert({
-          store_id:    storeId,
-          session_id:  sessionId,
+          store_id: storeId,
+          session_id: sessionId,
           customer_id: customerId || null,
-          event_type:  "link_clicked",
+          event_type: "link_clicked",
           metadata: {
-            url:        linkUrl,
-            title:      linkTitle,
+            url: linkUrl,
+            title: linkTitle,
             clicked_at: new Date().toISOString(),
           },
         });
@@ -491,8 +623,10 @@ const trackQrScan = useCallback(
         console.error("Error tracking link click:", error);
       }
     },
-    [],
+    [isPreview],
   );
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   return {
     visitorId: visitorIdRef.current,

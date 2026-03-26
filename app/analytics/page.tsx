@@ -6,7 +6,7 @@ import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { useForms } from "@/hooks/useForms";
 import { useResponses } from "@/hooks/useResponses";
 import { useEffect, useState } from "react";
-import { DashboardForm, toDashboardForm } from "@/types/dashboard";
+import { DashboardForm, toDashboardForm, RawDbResponse } from "@/types/dashboard";
 import { Loader2 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
@@ -24,7 +24,7 @@ export default function AnalyticsPage() {
         const enriched = await Promise.all(
           forms.map(async (form) => {
             const responses = await fetchResponses(form.id);
-            return toDashboardForm(form, responses);
+            return toDashboardForm(form, responses as unknown as RawDbResponse[]);
           }),
         );
         setDashboardForms(enriched);

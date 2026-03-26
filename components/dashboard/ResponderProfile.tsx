@@ -1,79 +1,30 @@
-// @ts-nocheck
 "use client";
 
-import { DashboardForm } from "@/types/dashboard";
 import {
   ArrowLeft,
   User,
   Mail,
   Phone,
   Calendar,
-  Gift,
-  TrendingUp,
+  MapPin,
+  ShoppingBag,
   Edit2,
   Check,
   X,
-  StickyNote,
   Tag,
-  MapPin,
-  ShoppingBag,
-  Clock,
-  Eye,
-  LayoutGrid,
-  Activity,
-  BarChart2,
-  List,
-  Flame,
-  KanbanSquare,
-  Zap,
-  AlertTriangle,
-  Timer,
-  Navigation,
-  Link2,
   RefreshCw,
-  Ban,
-  GitBranch,
-  ChevronDown,
-  Database,
-  Copy,
-  Search,
-  Layout,
-  Star,
-  Users,
-  Target,
-  Percent,
-  Smile,
-  Info,
+  Timer,
 } from "lucide-react";
-import { useState, useEffect, useMemo } from "react";
-import {
-  PieChart,
-  Pie,
-  Cell,
-  Tooltip as RechartsTooltip,
-  ResponsiveContainer,
-  Legend,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-} from "recharts";
+import { useState, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { formatInStoreTime } from "@/lib/utils";
 import { trackEvent } from "@/lib/mixpanel";
 import { CustomerFormSubmissions } from "./CustomerFormSubmissions";
 
-// SubmissionAccordion moved to CustomerFormSubmissions.tsx
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main Component: ResponderProfile
-// ─────────────────────────────────────────────────────────────────────────────
-
 type ResponderProfileProps = {
   userId: string;
-  forms: DashboardForm[];
+  // forms: DashboardForm[]; <-- REMOVED: No longer needed!
   onBack: () => void;
   onNavigateToResponse: (formId: string, searchQuery: string) => void;
   onUpdateCustomerInfo: (
@@ -88,7 +39,6 @@ type ResponderProfileProps = {
 
 export function ResponderProfile({
   userId,
-  forms,
   onBack,
   onNavigateToResponse,
   onUpdateCustomerInfo,
@@ -100,31 +50,21 @@ export function ResponderProfile({
     phone: "",
   });
   const [isSaving, setIsSaving] = useState(false);
-  const [notes, setNotes] = useState("");
-  const [isEditingNotes, setIsEditingNotes] = useState(false);
-  const [isSavingNotes, setIsSavingNotes] = useState(false);
   const [customerRecord, setCustomerRecord] = useState<any>(null);
   const [savedProducts, setSavedProducts] = useState<any[]>([]);
-  const [storeProducts, setStoreProducts] = useState<any[]>([]);
-  const [storeZones, setStoreZones] = useState<any[]>([]);
   const [interactions, setInteractions] = useState<any[]>([]);
   const [flowSessions, setFlowSessions] = useState<any[]>([]);
-  const [locationJourneys, setLocationJourneys] = useState<any[]>([]);
-  const [activityView, setActivityView] = useState<
-    "timeline" | "chart" | "heatmap" | "kanban"
-  >("chart");
 
-  const [expandedSubmissionId, setExpandedSubmissionId] = useState<
-    string | null
-  >(null);
+  // Submissions loaded asynchronously by CustomerFormSubmissions
+  const [userSubmissions, setUserSubmissions] = useState<any[]>([]);
 
   const { toast } = useToast();
 
   useEffect(() => {
     const fetchCustomer = async () => {
       const isUUID = /^[0-9a-f-]{36}$/i.test(userId);
-      let query = supabase
-        .from("customers" as any)
+      let query: any = supabase
+        .from("customers")
         .select("*")
         .limit(1);
 
@@ -137,23 +77,24 @@ export function ResponderProfile({
       }
 
       const { data } = await query.maybeSingle();
+
       if (data) {
         setCustomerRecord(data);
 
-        const { data: store } = await supabase
-          .from("stores" as any)
+        const { data: store } = (await supabase
+          .from("stores")
           .select("id")
-          .eq("owner_id", (await supabase.auth.getUser()).data.user?.id)
+          .eq("owner_id", (await supabase.auth.getUser()).data.user?.id || "")
           .order("created_at", { ascending: false })
           .limit(1)
-          .maybeSingle();
+          .maybeSingle()) as any;
 
         if (store) {
-          const { data: savedItemsData } = await supabase
-            .from("saved_items" as any)
+          const { data: savedItemsData } = (await supabase
+            .from("saved_items")
             .select(`product_id, products (id, name, price, image_url)`)
             .eq("customer_id", data.id)
-            .eq("store_id", store.id);
+            .eq("store_id", store.id)) as any;
 
           if (savedItemsData) {
             const products = savedItemsData
@@ -162,117 +103,34 @@ export function ResponderProfile({
             setSavedProducts(products);
           }
 
-          const { data: interactionsData } = await supabase
-            .from("interactions" as any)
+          const { data: interactionsData } = (await supabase
+            .from("interactions")
             .select("*")
             .eq("customer_id", data.id)
             .eq("store_id", store.id)
-            .order("created_at", { ascending: false });
-console.log("interactions:", interactionsData);
-console.log("unique event_types:", [
-  ...new Set(interactionsData?.map((i) => i.event_type)),
-]);
+            .order("created_at", { ascending: false })) as any;
+
           if (interactionsData) setInteractions(interactionsData);
 
-          const { data: sessionsData } = await supabase
-            .from("flow_sessions" as any)
+          const { data: sessionsData } = (await supabase
+            .from("flow_sessions")
             .select(
               "id, form_id, customer_id, response_id, status, flow_version, visited_nodes, drop_off_node_id, total_time_seconds, started_at, completed_at, last_activity_at",
             )
-            .eq("customer_id", data.id) // ✅ correct column + correct value
+            .eq("customer_id", data.id)
             .order("started_at", { ascending: false })
-            .limit(50);
-
+            .limit(50)) as any;
 
           if (sessionsData) setFlowSessions(sessionsData);
 
-          const { data: journeyData } = await supabase
-            .from("visitor_location_journeys" as any)
-            .select("id, store_id, session_id, visited_at")
-            .eq("visitor_id", data.id)
-            .order("visited_at", { ascending: false })
-            .limit(50);
-
-          if (journeyData) setLocationJourneys(journeyData);
-
-          const { data: storeProductsData } = await supabase
-            .from("products" as any)
-            .select("id, name, price, image_url")
-            .eq("store_id", store.id);
-
-          if (storeProductsData) setStoreProducts(storeProductsData);
-
-          const { data: zonesData } = await supabase
-            .from("zones" as any)
-            .select("id, name")
-            .eq("store_id", store.id);
-
-          if (zonesData) setStoreZones(zonesData);
+          // REMOVED: storeProducts, storeZones, locationJourneys (unused in UI)
         }
       }
     };
     fetchCustomer();
   }, [userId]);
 
-  // Submissions loaded asynchronously by CustomerFormSubmissions
-  const [loadedSubmissions, setLoadedSubmissions] = useState<any[]>([]);
-
-  const localSubmissions = useMemo(() => {
-    const submissions: Array<{
-      formId: string;
-      formName: string;
-      responseId: string;
-      submittedAt: Date;
-      perkRedeemed: boolean;
-      redemptionCode: string;
-      answers: Record<string, any>;
-      customerName?: string;
-      customerEmail?: string;
-      customerPhone?: string;
-    }> = [];
-
-    forms.forEach((form) => {
-      form.responses.forEach((response) => {
-        const isMatch =
-          response.customerId === userId ||
-          (customerRecord && response.customerId === customerRecord.id) ||
-          (response.customerEmail && response.customerEmail === userId) ||
-          (response.customerPhone && response.customerPhone === userId) ||
-          (response.customerName && response.customerName === userId) ||
-          `anonymous-${response.id}` === userId;
-
-        if (isMatch) {
-          submissions.push({
-            formId: form.id,
-            formName: form.name,
-            responseId: response.id,
-            submittedAt: response.submittedAt,
-            perkRedeemed: response.perkRedeemed,
-            redemptionCode: response.redemptionCode,
-            answers: response.answers,
-            customerName: response.customerName,
-            customerEmail: response.customerEmail,
-            customerPhone: response.customerPhone,
-          });
-        }
-      });
-    });
-
-    return submissions.sort(
-      (a, b) => b.submittedAt.getTime() - a.submittedAt.getTime(),
-    );
-  }, [forms, userId, customerRecord]);
-
-  // Prefer the async-loaded submissions once available, fall back to local
-  const userSubmissions = loadedSubmissions.length > 0 ? loadedSubmissions : localSubmissions;
-console.log(
-  "👤 userSubmissions:",
-  userSubmissions.length,
-  "loaded:",
-  loadedSubmissions.length,
-  "local:",
-  localSubmissions.length,
-);
+  // ── Calculate Display Names safely ──
   let userName = "";
   let userEmail = "";
   let userPhone = "";
@@ -291,20 +149,6 @@ console.log(
     if (!userEmail && customerRecord.email) userEmail = customerRecord.email;
     if (!userPhone && customerRecord.phone) userPhone = customerRecord.phone;
   }
-
-  useEffect(() => {
-    const loadNotes = async () => {
-      if (firstResponseId) {
-        const { data } = await supabase
-          .from("responses")
-          .select("notes")
-          .eq("id", firstResponseId)
-          .single();
-        if (data?.notes) setNotes(data.notes);
-      }
-    };
-    loadNotes();
-  }, [firstResponseId]);
 
   const totalSubmissions = userSubmissions.length;
   let status = "New";
@@ -352,43 +196,6 @@ console.log(
 
   const handleCancel = () => {
     setIsEditing(false);
-  };
-
-  const handleSaveNotes = async () => {
-    if (!firstResponseId) return;
-    setIsSavingNotes(true);
-
-    const updatePromises = userSubmissions.map((submission) =>
-      supabase
-        .from("responses")
-        .update({ notes })
-        .eq("id", submission.responseId),
-    );
-
-    await Promise.all(updatePromises);
-
-    trackEvent("Customer Notes Updated", { customerId: userId });
-
-    setIsSavingNotes(false);
-    setIsEditingNotes(false);
-    toast({
-      title: "Notes saved",
-      description: "Your notes have been saved successfully.",
-    });
-  };
-
-  const toggleSubmission = (responseId: string) => {
-    setExpandedSubmissionId((prev) =>
-      prev === responseId ? null : responseId,
-    );
-  };
-
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    toast({
-      title: "Copied",
-      description: "Response ID copied to clipboard.",
-    });
   };
 
   const qrScans = interactions.filter((i) => i.event_type === "qr_scan");
@@ -543,45 +350,6 @@ console.log(
               {totalSubmissions}
             </p>
           </div>
-
-          <div className="bg-card rounded-2xl shadow-lg border border-border p-6">
-            <div className="flex items-center gap-2 mb-2">
-              <MapPin className="w-5 h-5 text-green-500" />
-              <p className="text-sm text-muted-foreground">QR Scans</p>
-            </div>
-            <p className="text-3xl font-semibold text-green-500">
-              {qrScans.length}
-            </p>
-          </div>
-
-          {customerRecord && (
-            <div className="bg-card rounded-2xl shadow-lg border border-border p-6">
-              <div className="flex items-center gap-2 mb-2">
-                <ShoppingBag className="w-5 h-5 text-primary" />
-                <p className="text-sm text-muted-foreground">Store Visits</p>
-              </div>
-              <p className="text-3xl font-semibold text-primary">
-                {customerRecord.visit_count ?? 0}
-              </p>
-            </div>
-          )}
-
-          {customerRecord && (
-            <div className="bg-card rounded-2xl shadow-lg border border-border p-6">
-              <div className="flex items-center gap-2 mb-2">
-                <Calendar className="w-5 h-5 text-primary" />
-                <p className="text-sm text-muted-foreground">Customer Since</p>
-              </div>
-              <p className="text-sm font-medium text-foreground">
-                {customerRecord.created_at
-                  ? formatInStoreTime(new Date(customerRecord.created_at))
-                  : "—"}
-              </p>
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
           <div className="bg-card rounded-2xl shadow-lg border border-border p-6 flex flex-col justify-center">
             <div className="flex items-center gap-2 mb-2">
               <RefreshCw className="w-5 h-5 text-blue-500" />
@@ -602,9 +370,24 @@ console.log(
               {flowSessions.length}
             </p>
           </div>
-        </div>
-      </div>
 
+          {customerRecord && (
+            <div className="bg-card rounded-2xl shadow-lg border border-border p-6">
+              <div className="flex items-center gap-2 mb-2">
+                <Calendar className="w-5 h-5 text-primary" />
+                <p className="text-sm text-muted-foreground">Customer Since</p>
+              </div>
+              <p className="text-sm font-medium text-foreground">
+                {customerRecord.created_at
+                  ? formatInStoreTime(new Date(customerRecord.created_at))
+                  : "—"}
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-2 gap-4"></div>
+      </div>
 
       {/* Saved Items */}
       {savedProducts.length > 0 && (
@@ -646,15 +429,13 @@ console.log(
         </div>
       )}
 
-      {/* Form Submissions List (Accordion Style) */}
+      {/* Form Submissions List */}
       <CustomerFormSubmissions
         userId={userId}
         customerRecord={customerRecord}
         flowSessions={flowSessions}
-        onSubmissionsLoaded={setLoadedSubmissions}
+        onSubmissionsLoaded={setUserSubmissions}
       />
-
-   
     </div>
   );
 }

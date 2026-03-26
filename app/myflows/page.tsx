@@ -2,11 +2,10 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Loader2, ArrowLeft } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { DashboardLayout } from "@/components/dashboard/DashboardLayout";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { FormsList } from "@/components/dashboard/FormsList";
-import { FlowBuilder } from "@/components/dashboard/FlowBuilder";
 import { CreateFormSimple } from "@/components/dashboard/CreateFormSimple";
 import { ResponsesView } from "@/components/dashboard/ResponsesView";
 import { ResponderProfile } from "@/components/dashboard/ResponderProfile";
@@ -14,15 +13,50 @@ import { useForms } from "@/hooks/useForms";
 import { useResponses } from "@/hooks/useResponses";
 import { useAuth } from "@/hooks/useAuth";
 import { useStores } from "@/hooks/useStores";
-import { DashboardForm, toDashboardForm } from "@/types/dashboard";
-import { supabase } from "@/integrations/supabase/client";
+import { DashboardForm, toDashboardForm, RawDbResponse } from "@/types/dashboard";
+import type { CanvasFlow } from "@/types/canvas";
+import { PageBuilder } from "@/components/dashboard/FlowBuilder/canvas/PageBuilder";
+
+// ── View types ────────────────────────────────────────────────────────────────
 
 type SubView =
   | { type: "list" }
   | { type: "create" }
-  | { type: "edit"; formId: string }
+  | { type: "edit"; formId: string; freshForm?: any }
   | { type: "responses"; formId: string; search: string }
   | { type: "profile"; userId: string };
+
+// ── Adapter ───────────────────────────────────────────────────────────────────
+
+function formToCanvasFlow(form: any): CanvasFlow {
+  if (!form) {
+    return {
+      id: crypto.randomUUID(),
+      name: "Untitled Flow",
+      steps: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  const questions = form.questions || [];
+  const isCanvasFormat = questions.length > 0 && "blocks" in questions[0];
+  return {
+    id: form.id,
+    name: form.name || "Untitled Flow",
+    steps: isCanvasFormat
+      ? questions
+      : questions.map((node: any, i: number) => ({
+          id: node.id,
+          label: node.label || node.header || `Step ${i + 1}`,
+          blocks: [],
+          createdAt: new Date().toISOString(),
+        })),
+    createdAt: form.created_at ?? new Date().toISOString(),
+    updatedAt: form.updated_at ?? new Date().toISOString(),
+  };
+}
+
+// ── Entry ─────────────────────────────────────────────────────────────────────
 
 export default function MyFlowsPage() {
   return (
@@ -31,6 +65,8 @@ export default function MyFlowsPage() {
     </ProtectedRoute>
   );
 }
+
+// ── Content ───────────────────────────────────────────────────────────────────
 
 function MyFlowsContent() {
   const { profile } = useAuth();
@@ -42,101 +78,75 @@ function MyFlowsContent() {
     updateForm,
     deleteForm,
     toggleFormActive,
+    fetchForm,
   } = useForms();
   const { stores } = useStores();
   const { fetchResponses, updateResponseCustomerInfo } = useResponses();
-
   const router = useRouter();
   const searchParams = useSearchParams();
+
   const [dashboardForms, setDashboardForms] = useState<DashboardForm[]>([]);
   const [view, setView] = useState<SubView>({ type: "list" });
   const [pendingEditFormId, setPendingEditFormId] = useState<string | null>(
     null,
   );
   const [isDirty, setIsDirty] = useState(false);
+  const [isFetchingForm, setIsFetchingForm] = useState(false);
 
-  // Browser-level warning for closing/refreshing tab
+  // ── Unload warning ──────────────────────────────────────────────────────────
+
   useEffect(() => {
-    // resetStore("772a3a12-6f07-4c66-bd6b-137dd6dc2d85");
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+    const handler = (e: BeforeUnloadEvent) => {
       if (isDirty) {
         e.preventDefault();
         e.returnValue = "";
       }
     };
-    window.addEventListener("beforeunload", handleBeforeUnload);
-    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
   }, [isDirty]);
 
+  // ── Dirty guard ─────────────────────────────────────────────────────────────
+
   const confirmExit = useCallback(() => {
-    if (isDirty) {
-      return window.confirm("You made changes, exit without saving?");
-    }
+    if (isDirty)
+      return window.confirm("You have unsaved changes. Exit without saving?");
     return true;
   }, [isDirty]);
 
   const safeSetView = useCallback(
-    (newView: SubView) => {
+    (next: SubView) => {
       if (confirmExit()) {
-        setView(newView);
+        setView(next);
         setIsDirty(false);
       }
     },
     [confirmExit],
   );
 
-  async function resetStore(storeId: string) {
-    // Assuming you get the session token from Supabase client
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
+  // ── ?create=true URL param ──────────────────────────────────────────────────
 
-    if (!session?.access_token) {
-      console.error("Not authenticated");
-      return;
-    }
-    try {
-      const response = await fetch("/api/store/reset", {
-        method: "DELETE",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${session.access_token}`,
-        },
-        body: JSON.stringify({ storeId }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || "Failed to reset store");
-      }
-      console.log("Success:", data.message);
-      // Refresh your UI here
-    } catch (error) {
-      console.error("Error resetting store:", error);
-    }
-  }
-
-  // If the URL has ?create=true (from the DashboardLayout menu), open create view
   useEffect(() => {
     if (searchParams.get("create") === "true") {
       setView({ type: "create" });
-      // Clean the param from the URL without adding a history entry
       router.replace("/myflows");
     }
   }, []);
 
-  // Use a stable key so we only re-fetch when the set of form IDs changes,
-  // not every time the forms array gets a new reference.
+  // ── Load + enrich forms ─────────────────────────────────────────────────────
+
   const formsKey = forms.map((f) => f.id).join(",");
+
+  // Load responses when the list of form IDs changes
   useEffect(() => {
     const load = async () => {
       const enriched = await Promise.all(
         forms.map(async (form) => {
           const responses = await fetchResponses(form.id);
-          return toDashboardForm(form, responses);
+          return toDashboardForm(form, responses as unknown as RawDbResponse[]);
         }),
       );
       setDashboardForms(enriched);
-
       if (
         pendingEditFormId &&
         enriched.some((f) => f.id === pendingEditFormId)
@@ -150,9 +160,36 @@ function MyFlowsContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [formsKey, pendingEditFormId]);
 
+  // Sync property changes (active, name, etc.) instantly without re-fetching responses
+  useEffect(() => {
+    if (dashboardForms.length === 0 || forms.length === 0) return;
+    
+    setDashboardForms(prev => {
+      // If the lengths don't match, let the main load effect handle it to stay safe
+      if (prev.length !== forms.length) return prev;
+      
+      let changed = false;
+      const next = prev.map((df) => {
+        // Find corresponding form by ID (safer than index)
+        const f = forms.find(x => x.id === df.id);
+        if (!f) return df;
+
+        // Check for property changes that should be synced
+        if (df.active !== f.active || df.name !== f.name || df.perk !== f.perk) {
+          changed = true;
+          return { ...df, ...f };
+        }
+        return df;
+      });
+
+      return changed ? next : prev;
+    });
+  }, [forms, dashboardForms.length]);
+
+  // ── Handlers ────────────────────────────────────────────────────────────────
+
   const handleFormCreatedThenEdit = async (formId: string) => {
     await fetchForms();
-    setPendingEditFormId(formId);
     setPendingEditFormId(formId);
     setView({ type: "list" });
     setIsDirty(false);
@@ -162,12 +199,10 @@ function MyFlowsContent() {
     const enriched = await Promise.all(
       forms.map(async (form) => {
         const responses = await fetchResponses(form.id);
-        return toDashboardForm(form, responses);
+        return toDashboardForm(form, responses as unknown as RawDbResponse[]);
       }),
     );
     setDashboardForms(enriched);
-    setView({ type: "list" });
-    setIsDirty(false);
   };
 
   const handleSearchChange = useCallback((s: string) => {
@@ -176,16 +211,58 @@ function MyFlowsContent() {
     );
   }, []);
 
+  const handleEditForm = async (formId: string) => {
+    setIsFetchingForm(true);
+    const freshForm = await fetchForm(formId);
+    setIsFetchingForm(false);
+    safeSetView({ type: "edit", formId, freshForm: freshForm ?? undefined });
+  };
+
+  const handlePageBuilderSave = useCallback(
+    async (flow: CanvasFlow) => {
+      const { error } = await updateForm(flow.id, {
+        name: flow.name,
+        questions: flow.steps as any,
+      });
+      if (error) throw error;
+      setIsDirty(false);
+      await handleFormUpdateSuccess();
+    },
+    [updateForm],
+  );
+
+  // ── Edit view — full screen ─────────────────────────────────────────────────
+
+  if (view.type === "edit") {
+    const form =
+      view.freshForm ?? dashboardForms.find((f) => f.id === view.formId);
+    if (isFetchingForm || (!form && formsLoading)) {
+      return (
+        <div className="flex h-screen items-center justify-center bg-background">
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        </div>
+      );
+    }
+    return (
+      <PageBuilder
+        initialFlow={formToCanvasFlow(form)}
+        onBack={() => safeSetView({ type: "list" })}
+        onSave={handlePageBuilderSave}
+      />
+    );
+  }
+
+  // ── All other views ─────────────────────────────────────────────────────────
+
   return (
     <DashboardLayout>
-      {formsLoading ? (
+      {formsLoading || isFetchingForm ? (
         <div className="flex-1 flex items-center justify-center min-h-[400px]">
-          <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
         </div>
       ) : view.type === "profile" ? (
         <ResponderProfile
           userId={view.userId}
-          forms={dashboardForms}
           onBack={() => safeSetView({ type: "list" })}
           onNavigateToResponse={(formId, searchQuery) =>
             safeSetView({
@@ -203,7 +280,7 @@ function MyFlowsContent() {
               const enriched = await Promise.all(
                 forms.map(async (form) => {
                   const responses = await fetchResponses(form.id);
-                  return toDashboardForm(form, responses);
+                  return toDashboardForm(form, responses as unknown as RawDbResponse[]);
                 }),
               );
               setDashboardForms(enriched);
@@ -222,16 +299,13 @@ function MyFlowsContent() {
           }
         />
       ) : view.type === "create" ? (
-        <div className="max-w-md mx-auto w-full animate-fade-in">
-          <div className="mb-4">
-            <button
-              onClick={() => safeSetView({ type: "list" })}
-              className="flex items-center gap-2 text-muted-foreground hover:text-foreground transition-colors font-medium"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span>Back to flows</span>
-            </button>
-          </div>
+        <div className="max-w-md mx-auto w-full">
+          <button
+            onClick={() => safeSetView({ type: "list" })}
+            className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
+          >
+            ← Back to flows
+          </button>
           <CreateFormSimple
             stores={stores}
             onCreateForm={createForm}
@@ -240,39 +314,22 @@ function MyFlowsContent() {
             onDirtyChange={setIsDirty}
           />
         </div>
-      ) : view.type === "edit" ? (
-        <div className="max-w-7xl mx-auto w-full animate-fade-in">
-          <div className="mb-4">
-            <button
-              onClick={() => safeSetView({ type: "list" })}
-              className="flex items-center gap-2 text-muted-foreground hover:text-foreground transition-colors font-medium"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span>Back to flows</span>
-            </button>
-          </div>
-          <FlowBuilder
-            existingForm={dashboardForms.find((f) => f.id === view.formId)}
-            onUpdateForm={updateForm}
+      ) : (
+        <div>
+         
+          <FormsList
+            forms={dashboardForms}
+            onCreateForm={() => safeSetView({ type: "create" })}
+            onViewResponses={(formId, search) =>
+              safeSetView({ type: "responses", formId, search: search ?? "" })
+            }
+            onToggleFormActive={toggleFormActive}
             onDeleteForm={deleteForm}
-            onSuccess={handleFormUpdateSuccess}
+            onEditForm={handleEditForm}
+            businessName={profile?.business_name}
             businessLogo={profile?.business_logo}
-            onDirtyChange={setIsDirty}
           />
         </div>
-      ) : (
-        <FormsList
-          forms={dashboardForms}
-          onCreateForm={() => safeSetView({ type: "create" })}
-          onViewResponses={(formId, search) =>
-            safeSetView({ type: "responses", formId, search: search ?? "" })
-          }
-          onToggleFormActive={toggleFormActive}
-          onDeleteForm={deleteForm}
-          onEditForm={(formId) => safeSetView({ type: "edit", formId })}
-          businessName={profile?.business_name}
-          businessLogo={profile?.business_logo}
-        />
       )}
     </DashboardLayout>
   );

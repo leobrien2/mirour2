@@ -1,0 +1,6045 @@
+==================================================
+FILE: BlockInspector.tsx
+==================================================
+
+// components/canvas/BlockInspector.tsx
+"use client";
+
+import { useState, useMemo } from "react";
+import {
+  Trash2,
+  Plus,
+  GripVertical,
+  X,
+  Tag,
+  ChevronDown,
+  ChevronUp,
+  Link as LinkIcon,
+  ArrowRight,
+  ShoppingBag,
+  Star,
+  ThumbsUp,
+  ThumbsDown,
+  Search,
+  Check,
+  AlignLeft,
+  AlignCenter,
+  AlignRight,
+  Eye,
+  Asterisk,
+} from "lucide-react";
+import { v4 as uuidv4 } from "uuid";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import type {
+  CanvasBlock,
+  BlockData,
+  TextAlign,
+  ButtonVariant,
+  AspectRatio,
+  CarouselItem,
+  SelectOption,
+  PinnedProduct,
+} from "@/types/canvas";
+import { useStores } from "@/hooks/useStores";
+
+// ── Ultra-Compact UI Primitives (Optimized for 300px width) ───────────────────
+
+const labelCls =
+  "flex items-center gap-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5";
+
+const inputCls =
+  "w-full px-2 py-1.5 h-8 rounded border border-border/60 bg-background text-xs text-foreground shadow-sm placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary/30 focus:border-primary transition-all";
+
+const sectionCls =
+  "space-y-3 py-4 border-b border-border/40 last:border-0 last:pb-0";
+
+function Field({
+  label,
+  children,
+  action,
+  helperText,
+}: {
+  label: string;
+  children: React.ReactNode;
+  action?: React.ReactNode;
+  helperText?: string;
+}) {
+  return (
+    <div className="flex flex-col">
+      <div className="flex items-center justify-between">
+        <label className={labelCls}>{label}</label>
+        {action && <div className="mb-1.5">{action}</div>}
+      </div>
+      {children}
+      {helperText && (
+        <p className="mt-1 text-[9px] text-muted-foreground/60 leading-tight">
+          {helperText}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ── Segmented Control (Wraps if necessary, ultra-compact) ─────────────────────
+
+function SegmentedControl<T extends string | boolean>({
+  options,
+  value,
+  onChange,
+}: {
+  options: { label: React.ReactNode; value: T }[];
+  value: T;
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="flex flex-wrap p-0.5 bg-muted/40 rounded border border-border/40">
+      {options.map((opt) => {
+        const isActive = value === opt.value;
+        return (
+          <button
+            key={String(opt.value)}
+            onClick={() => onChange(opt.value)}
+            className={`flex-1 flex items-center justify-center gap-1 min-w-fit py-1 px-1.5 text-[11px] font-medium rounded transition-all duration-200 ${
+              isActive
+                ? "bg-background text-foreground shadow-sm border border-border/50"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/60 border border-transparent"
+            }`}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Toggle — Micro sizing ─────────────────────────────────────────────────────
+
+function Toggle({
+  value,
+  onChange,
+}: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={value}
+      onClick={() => onChange(!value)}
+      className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded border-2 border-transparent 
+        transition-colors duration-200 ease-in-out focus:outline-none focus-visible:ring-1 focus-visible:ring-primary/30
+        ${value ? "bg-primary" : "bg-muted-foreground/20"}`}
+    >
+      <span
+        className={`pointer-events-none inline-block h-3 w-3 transform rounded bg-white shadow-sm
+          ring-0 transition duration-200 ease-in-out
+          ${value ? "translate-x-3" : "translate-x-0"}`}
+      />
+    </button>
+  );
+}
+
+function ToggleRow({
+  label,
+  description,
+  value,
+  onChange,
+}: {
+  label: string;
+  description?: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between p-2 rounded border border-border/40 bg-muted/5 gap-2">
+      <div className="flex flex-col min-w-0">
+        <span className="text-xs font-medium text-foreground/80 truncate">
+          {label}
+        </span>
+        {description && (
+          <span className="text-[9px] text-muted-foreground/60 mt-0.5 truncate">
+            {description}
+          </span>
+        )}
+      </div>
+      <Toggle value={value} onChange={onChange} />
+    </div>
+  );
+}
+
+function AlignButtons({
+  value,
+  onChange,
+}: {
+  value: TextAlign;
+  onChange: (v: TextAlign) => void;
+}) {
+  return (
+    <SegmentedControl
+      value={value}
+      onChange={onChange}
+      options={[
+        { label: <AlignLeft className="w-3.5 h-3.5" />, value: "left" },
+        { label: <AlignCenter className="w-3.5 h-3.5" />, value: "center" },
+        { label: <AlignRight className="w-3.5 h-3.5" />, value: "right" },
+      ]}
+    />
+  );
+}
+
+function ColorField({
+  label,
+  value,
+  onChange,
+  defaultValue = "#6366f1",
+}: {
+  label: string;
+  value?: string;
+  onChange: (v: string) => void;
+  defaultValue?: string;
+}) {
+  const isAuto = !value;
+  return (
+    <Field label={label}>
+      {isAuto ? (
+        <div className="flex items-center justify-between p-1.5 rounded border border-border/60 bg-muted/10 h-8">
+          <div className="flex items-center gap-2">
+            <div className="w-5 h-5 rounded border border-dashed border-border bg-muted flex items-center justify-center shrink-0">
+              <span className="text-[7px] font-bold text-muted-foreground/50 uppercase">
+                Auto
+              </span>
+            </div>
+            <span className="text-[11px] text-foreground/80">
+              Theme Default
+            </span>
+          </div>
+          <button
+            onClick={() => onChange(defaultValue)}
+            className="text-[10px] font-medium text-primary hover:text-primary/80 bg-primary/5 hover:bg-primary/10 rounded px-2 py-1 transition-all"
+          >
+            Edit
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5">
+          <div className="relative shrink-0 w-8 h-8 rounded overflow-hidden border border-border/60 shadow-sm">
+            <input
+              type="color"
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              className="absolute -inset-2 w-12 h-12 cursor-pointer"
+            />
+          </div>
+          <input
+            type="text"
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className={inputCls + " font-mono uppercase text-[11px]"}
+            placeholder="#000000"
+            maxLength={7}
+          />
+          <button
+            onClick={() => onChange("")}
+            title="Reset to auto"
+            className="w-8 h-8 flex items-center justify-center rounded border border-border/60 text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-all shrink-0"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+    </Field>
+  );
+}
+
+function SliderField({
+  label,
+  value,
+  min,
+  max,
+  unit = "px",
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  unit?: string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center justify-between">
+        <label className={labelCls + " mb-0"}>{label}</label>
+        <span className="text-[10px] font-mono font-medium text-foreground/80 bg-muted/30 px-1.5 py-0.5 rounded border border-border/30">
+          {value}
+          {unit}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-primary h-1 bg-muted rounded appearance-none [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-primary [&::-webkit-slider-thumb]:rounded [&::-webkit-slider-thumb]:cursor-pointer"
+      />
+    </div>
+  );
+}
+
+function StepSelect({
+  value,
+  onChange,
+  steps,
+  placeholder = "Select step...",
+}: {
+  value?: string;
+  onChange: (v: string | undefined) => void;
+  steps: { id: string; label: string }[];
+  placeholder?: string;
+}) {
+  return (
+    <div className="relative">
+      <select
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value || undefined)}
+        className={inputCls + " appearance-none pr-7"}
+      >
+        <option value="">{placeholder}</option>
+        {steps.map((s) => (
+          <option key={s.id} value={s.id}>
+            {s.label}
+          </option>
+        ))}
+      </select>
+      <ChevronDown className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground/50 pointer-events-none" />
+    </div>
+  );
+}
+
+// ── DbTagSelector (Compact) ───────────────────────────────────────────────────
+
+function DbTagSelector({
+  storeId,
+  selectedTagIds,
+  onChange,
+}: {
+  storeId?: string;
+  selectedTagIds: string[];
+  onChange: (tagIds: string[]) => void;
+}) {
+  const { tags } = useStores();
+  const [search, setSearch] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const storeTags = useMemo(
+    () => (storeId ? tags.filter((t) => t.store_id === storeId) : tags),
+    [tags, storeId],
+  );
+
+  const filtered = useMemo(
+    () =>
+      storeTags.filter((t) =>
+        t.name.toLowerCase().includes(search.toLowerCase()),
+      ),
+    [storeTags, search],
+  );
+
+  const selectedTags = useMemo(
+    () => tags.filter((t) => selectedTagIds.includes(t.id)),
+    [tags, selectedTagIds],
+  );
+
+  const toggle = (tagId: string) => {
+    if (selectedTagIds.includes(tagId)) {
+      onChange(selectedTagIds.filter((id) => id !== tagId));
+    } else {
+      onChange([...selectedTagIds, tagId]);
+    }
+  };
+
+  return (
+    <div className="rounded border border-border/60 bg-muted/5 p-1.5 space-y-1.5 shadow-sm">
+      {selectedTags.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {selectedTags.map((t) => (
+            <span
+              key={t.id}
+              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-primary/10 border border-primary/20 text-[10px] font-medium text-primary"
+            >
+              {t.name}
+              <button
+                onClick={() => toggle(t.id)}
+                className="hover:bg-primary/20 rounded-sm p-0.5 transition-colors"
+              >
+                <X className="w-2.5 h-2.5" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="relative">
+        <div className="flex items-center gap-1.5 px-2 py-1 h-7 rounded border border-border bg-background shadow-sm focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary">
+          <Search className="w-3 h-3 text-muted-foreground/40 shrink-0" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setOpen(true);
+            }}
+            onFocus={() => setOpen(true)}
+            placeholder={
+              storeTags.length === 0 ? "No tags..." : "Search tags..."
+            }
+            className="flex-1 text-[11px] bg-transparent outline-none text-foreground placeholder:text-muted-foreground/40 min-w-0"
+          />
+        </div>
+
+        {open && filtered.length > 0 && (
+          <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-40 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
+            {filtered.map((t) => {
+              const isSelected = selectedTagIds.includes(t.id);
+              return (
+                <button
+                  key={t.id}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    toggle(t.id);
+                    setSearch("");
+                    setOpen(false);
+                  }}
+                  className={`w-full flex items-center justify-between px-2 py-1.5 text-[11px] hover:bg-muted text-left ${
+                    isSelected
+                      ? "text-primary font-medium bg-primary/5"
+                      : "text-foreground/80"
+                  }`}
+                >
+                  <span className="truncate pr-2">{t.name}</span>
+                  {isSelected && (
+                    <Check className="w-3 h-3 text-primary shrink-0" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {open && (
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── DbProductPicker (Compact) ─────────────────────────────────────────────────
+
+function DbProductPicker({
+  storeId,
+  pinnedProducts,
+  onAdd,
+  onRemove,
+}: {
+  storeId?: string;
+  pinnedProducts: PinnedProduct[];
+  onAdd: (p: PinnedProduct) => void;
+  onRemove: (id: string) => void;
+}) {
+  const { products } = useStores();
+  const [search, setSearch] = useState("");
+  const [open, setOpen] = useState(false);
+
+  const pinnedIds = new Set(pinnedProducts.map((p) => p.id));
+
+  const storeProducts = useMemo(() => {
+    if (!storeId) return products;
+    return products.filter(
+      (p) => (p.store_ids ?? []).includes(storeId) || p.store_id === storeId,
+    );
+  }, [products, storeId]);
+
+  const filtered = useMemo(
+    () =>
+      storeProducts.filter((p) =>
+        (p.name ?? p.tags ?? "").toLowerCase().includes(search.toLowerCase()),
+      ),
+    [storeProducts, search],
+  );
+
+  const handleSelect = (p: any) => {
+    if (pinnedIds.has(p.id)) return;
+    onAdd({
+      id: p.id,
+      title: p.name ?? p.title ?? p.id,
+      imageUrl: p.image_url ?? p.imageUrl ?? undefined,
+      price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
+    });
+    setSearch("");
+    setOpen(false);
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="relative">
+        <div
+          className="flex items-center gap-1.5 px-2 py-1.5 h-8 rounded border border-primary/30 bg-primary/5 cursor-text focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary"
+          onClick={() => setOpen(true)}
+        >
+          <Search className="w-3.5 h-3.5 text-primary/50 shrink-0" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setOpen(true);
+            }}
+            onFocus={() => setOpen(true)}
+            placeholder="Search products..."
+            className="flex-1 text-xs bg-transparent outline-none text-foreground placeholder:text-primary/50 min-w-0"
+          />
+        </div>
+
+        {open && filtered.length > 0 && (
+          <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
+            {filtered.slice(0, 30).map((p: any) => {
+              const isPinned = pinnedIds.has(p.id);
+              return (
+                <button
+                  key={p.id}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => handleSelect(p)}
+                  disabled={isPinned}
+                  className={`w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted ${
+                    isPinned ? "opacity-40 cursor-not-allowed bg-muted/50" : ""
+                  }`}
+                >
+                  <div className="w-6 h-6 rounded bg-muted shrink-0 overflow-hidden flex items-center justify-center border border-border/50">
+                    {p.image_url || p.imageUrl ? (
+                      <img
+                        src={p.image_url || p.imageUrl}
+                        alt=""
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <ShoppingBag className="w-3 h-3 text-muted-foreground/30" />
+                    )}
+                  </div>
+                  <span className="flex-1 text-[11px] font-medium truncate">
+                    {p.name ?? p.title ?? p.id}
+                  </span>
+                  {isPinned && (
+                    <Check className="w-3 h-3 text-primary shrink-0" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        {open && (
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+        )}
+      </div>
+
+      {pinnedProducts.length > 0 && (
+        <div className="space-y-1.5">
+          {pinnedProducts.map((p) => (
+            <div
+              key={p.id}
+              className="flex items-center gap-2 p-1.5 rounded border border-border bg-card shadow-sm group"
+            >
+              <button className="p-1 cursor-grab active:cursor-grabbing text-muted-foreground/40 shrink-0">
+                <GripVertical className="w-3.5 h-3.5" />
+              </button>
+              <div className="w-7 h-7 rounded overflow-hidden bg-muted shrink-0 border border-border/50 flex items-center justify-center">
+                {p.imageUrl ? (
+                  <img
+                    src={p.imageUrl}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <ShoppingBag className="w-3 h-3 text-muted-foreground/30" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-[11px] font-medium truncate leading-tight">
+                  {p.title || p.id}
+                </p>
+                {p.price && (
+                  <p className="text-[9px] text-muted-foreground/60">
+                    {p.price}
+                  </p>
+                )}
+              </div>
+              <button
+                onClick={() => onRemove(p.id)}
+                className="p-1 text-muted-foreground/40 hover:text-destructive shrink-0"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sortable Items (Select & Carousel) ────────────────────────────────────────
+
+function SortableCarouselItem({
+  item,
+  onUpdate,
+  onRemove,
+}: {
+  item: CarouselItem;
+  onUpdate: (patch: Partial<CarouselItem>) => void;
+  onRemove: () => void;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: item.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={`rounded border border-border bg-card shadow-sm overflow-hidden ${isDragging ? "opacity-50 ring-1 ring-primary/30" : ""}`}
+    >
+      <div className="flex items-center gap-1.5 p-1.5">
+        <button
+          {...attributes}
+          {...listeners}
+          className="p-1 cursor-grab active:cursor-grabbing text-muted-foreground/40 shrink-0"
+        >
+          <GripVertical className="w-3.5 h-3.5" />
+        </button>
+        <div className="w-8 h-8 rounded-sm bg-muted shrink-0 border border-border/50 flex items-center justify-center overflow-hidden">
+          {item.src ? (
+            <img src={item.src} className="w-full h-full object-cover" />
+          ) : (
+            <span className="text-[8px] text-muted-foreground/50">Img</span>
+          )}
+        </div>
+        <input
+          type="url"
+          value={item.src}
+          onChange={(e) => onUpdate({ src: e.target.value })}
+          placeholder="URL..."
+          className="flex-1 min-w-0 px-2 py-1 h-7 text-[11px] rounded border border-border/50 bg-background focus:outline-none focus:border-primary"
+        />
+        <button
+          onClick={onRemove}
+          className="p-1 text-muted-foreground/40 hover:text-destructive shrink-0"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SortableSelectOption({
+  option,
+  onUpdate,
+  onRemove,
+  steps,
+  storeId,
+}: {
+  option: SelectOption;
+  onUpdate: (patch: Partial<SelectOption>) => void;
+  onRemove: () => void;
+  steps: { id: string; label: string }[];
+  storeId?: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: option.id });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={`rounded border border-border bg-card shadow-sm ${isDragging ? "opacity-50 ring-1 ring-primary/30" : ""}`}
+    >
+      <div className="flex items-center gap-1 p-1.5">
+        <button
+          {...attributes}
+          {...listeners}
+          className="p-1 cursor-grab text-muted-foreground/40 shrink-0"
+        >
+          <GripVertical className="w-3.5 h-3.5" />
+        </button>
+        <input
+          type="text"
+          value={option.label}
+          onChange={(e) => onUpdate({ label: e.target.value })}
+          placeholder="Option text..."
+          className="flex-1 min-w-0 px-2 py-1 h-7 text-xs rounded border border-border/50 bg-background focus:outline-none focus:border-primary"
+        />
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className={`p-1 rounded ${expanded ? "bg-primary/10 text-primary" : "text-muted-foreground/60"}`}
+        >
+          {expanded ? (
+            <ChevronUp className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronDown className="w-3.5 h-3.5" />
+          )}
+        </button>
+        <button
+          onClick={onRemove}
+          className="p-1 text-muted-foreground/40 hover:text-destructive"
+        >
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Badges - Wrap gracefully below the input */}
+      {(option.tags.length > 0 || option.nextStepId) && !expanded && (
+        <div className="flex flex-wrap gap-1 pl-8 pb-1.5 pr-2">
+          {option.tags.length > 0 && (
+            <span className="px-1.5 py-0.5 rounded bg-primary/10 text-[9px] font-semibold text-primary border border-primary/20">
+              {option.tags.length} tag{option.tags.length > 1 ? "s" : ""}
+            </span>
+          )}
+          {option.nextStepId && (
+            <span className="px-1.5 py-0.5 rounded bg-amber-500/10 text-[9px] font-semibold text-amber-600 border border-amber-500/20">
+              Routed
+            </span>
+          )}
+        </div>
+      )}
+
+      {expanded && (
+        <div className="px-2 pb-2 pt-1 space-y-2 border-t border-border/40 bg-muted/10">
+          <Field label="Route To" helperText="Jump to step if picked.">
+            <StepSelect
+              value={option.nextStepId}
+              onChange={(v) => onUpdate({ nextStepId: v })}
+              steps={steps}
+              placeholder="Default (Next)"
+            />
+          </Field>
+          <Field label="Tags" helperText="Used by Product blocks.">
+            <DbTagSelector
+              storeId={storeId}
+              selectedTagIds={option.tags}
+              onChange={(tagIds) => onUpdate({ tags: tagIds })}
+            />
+          </Field>
+          {/* <Field label="Image URL (Opt)">
+            <input
+              type="url"
+              value={option.imageUrl || ""}
+              onChange={(e) =>
+                onUpdate({ imageUrl: e.target.value || undefined })
+              }
+              placeholder="https://..."
+              className={inputCls}
+            />
+          </Field> */}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Block Editors (Stacked Layouts to fit 300px) ──────────────────────────────
+
+function HeadingEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "h1" | "h2" | "h3" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <Field label="Text">
+        <textarea
+          value={data.text}
+          onChange={(e) => update({ text: e.target.value })}
+          rows={2}
+          className={inputCls + " h-auto resize-none py-2"}
+          placeholder="Heading text..."
+        />
+      </Field>
+      <Field label="Alignment">
+        <AlignButtons
+          value={data.align}
+          onChange={(v) => update({ align: v })}
+        />
+      </Field>
+      <ColorField
+        label="Color"
+        value={data.color}
+        onChange={(v) => update({ color: v || undefined })}
+        defaultValue="#1a1625"
+      />
+    </div>
+  );
+}
+
+function ParagraphEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "paragraph" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <Field label="Text">
+        <textarea
+          value={data.text}
+          onChange={(e) => update({ text: e.target.value })}
+          rows={4}
+          className={inputCls + " h-auto resize-none py-2"}
+          placeholder="Body text..."
+        />
+      </Field>
+      <Field label="Alignment">
+        <AlignButtons
+          value={data.align}
+          onChange={(v) => update({ align: v })}
+        />
+      </Field>
+      <ColorField
+        label="Color"
+        value={data.color}
+        onChange={(v) => update({ color: v || undefined })}
+        defaultValue="#7a7585"
+      />
+      <SliderField
+        label="Size"
+        value={data.fontSize ?? 14}
+        min={10}
+        max={32}
+        onChange={(v) => update({ fontSize: v })}
+      />
+    </div>
+  );
+}
+// ── CropPositionPicker ──────────────────────────────────────────────────────
+
+const CROP_POSITIONS = [
+  { label: "↖", value: "0% 0%" },
+  { label: "↑", value: "50% 0%" },
+  { label: "↗", value: "100% 0%" },
+  { label: "←", value: "0% 50%" },
+  { label: "·", value: "50% 50%" },
+  { label: "→", value: "100% 50%" },
+  { label: "↙", value: "0% 100%" },
+  { label: "↓", value: "50% 100%" },
+  { label: "↘", value: "100% 100%" },
+] as const;
+
+function CropPositionPicker({
+  value,
+  onChange,
+}: {
+  value: string | undefined;
+  onChange: (v: string) => void;
+}) {
+  const current = value ?? "50% 50%";
+  return (
+    <div className="space-y-1.5">
+      <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+        Crop Position
+      </label>
+      <div
+        className="grid grid-cols-3 gap-1 w-24"
+        title="Choose the focal point for cropping"
+      >
+        {CROP_POSITIONS.map(({ label, value: pos }) => (
+          <button
+            key={pos}
+            type="button"
+            title={pos}
+            onClick={() => onChange(pos)}
+            className={`h-7 w-full rounded text-sm font-semibold transition-colors ${
+              current === pos
+                ? "bg-foreground text-background"
+                : "bg-muted hover:bg-muted/80 text-foreground/70"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ImageEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "image" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+
+  const [imgTab, setImgTab] = useState<"url" | "upload">("url");
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      update({ src: reader.result as string });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  return (
+    <div className={sectionCls}>
+      {/* Tab toggle */}
+      <div className="flex items-center gap-0 mb-2 rounded border border-border/60 overflow-hidden bg-muted/30 p-0.5">
+        <button
+          type="button"
+          onClick={() => setImgTab("url")}
+          className={`flex-1 text-[11px] font-medium py-1 rounded transition-colors ${
+            imgTab === "url"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Add URL
+        </button>
+        <button
+          type="button"
+          onClick={() => setImgTab("upload")}
+          className={`flex-1 text-[11px] font-medium py-1 rounded transition-colors ${
+            imgTab === "upload"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          Upload Image
+        </button>
+      </div>
+
+      {imgTab === "url" ? (
+        <Field label="Image URL">
+          <input
+            type="url"
+            value={data.src?.startsWith("data:") ? "" : (data.src || "")}
+            onChange={(e) => update({ src: e.target.value })}
+            placeholder="https://..."
+            className={inputCls}
+          />
+        </Field>
+      ) : (
+        <Field label="Upload Image">
+          <div className="space-y-2">
+            {/* Preview */}
+            {data.src && (
+              <div className="relative w-full h-24 rounded border border-border/60 overflow-hidden bg-muted/30 flex items-center justify-center">
+                <img
+                  src={data.src}
+                  alt="preview"
+                  className="w-full h-full object-contain"
+                />
+                <button
+                  type="button"
+                  onClick={() => update({ src: "" })}
+                  className="absolute top-1 right-1 p-0.5 rounded-full bg-background/80 text-muted-foreground hover:text-destructive border border-border/50"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+            {/* Upload button */}
+            <label className="flex items-center justify-center gap-1.5 w-full h-8 rounded border border-dashed border-primary/40 bg-primary/5 hover:bg-primary/10 cursor-pointer transition-colors text-[11px] font-medium text-primary">
+              <input
+                type="file"
+                accept="image/*"
+                onChange={handleFileUpload}
+                className="sr-only"
+              />
+              {data.src ? "Replace image" : "Choose image"}
+            </label>
+          </div>
+        </Field>
+      )}
+      <Field label="Alt Text">
+        <input
+          type="text"
+          value={data.alt || ""}
+          onChange={(e) => update({ alt: e.target.value })}
+          placeholder="Description..."
+          className={inputCls}
+        />
+      </Field>
+      <Field label="Aspect Ratio">
+        <SegmentedControl
+          value={data.aspectRatio ?? "auto"}
+          onChange={(v) => update({ aspectRatio: v as AspectRatio })}
+          options={[
+            { label: "16:9", value: "16:9" },
+            { label: "4:3", value: "4:3" },
+            { label: "1:1", value: "1:1" },
+            { label: "Auto", value: "auto" },
+          ]}
+        />
+      </Field>
+      <Field label="Object Fit">
+        <SegmentedControl
+          value={data.fit ?? "cover"}
+          onChange={(v) => update({ fit: v as "cover" | "contain" })}
+          options={[
+            { label: "Cover", value: "cover" },
+            { label: "Contain", value: "contain" },
+          ]}
+        />
+      </Field>
+      <Field label="Alignment">
+        <AlignButtons
+          value={data.align ?? "center"}
+          onChange={(v) => update({ align: v })}
+        />
+      </Field>
+      <SliderField
+        label="Width (%)"
+        value={data.width ?? 100}
+        min={10}
+        max={100}
+        onChange={(v) => update({ width: v })}
+      />
+      <SliderField
+        label="Radius"
+        value={data.borderRadius ?? 8}
+        min={0}
+        max={48}
+        onChange={(v) => update({ borderRadius: v })}
+      />
+
+    </div>
+  );
+}
+
+function CarouselEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "carousel" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+  );
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIdx = data.items.findIndex((i) => i.id === active.id);
+    const newIdx = data.items.findIndex((i) => i.id === over.id);
+    if (oldIdx !== -1 && newIdx !== -1)
+      update({ items: arrayMove(data.items, oldIdx, newIdx) });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className={sectionCls}>
+        <div className="flex items-center justify-between mb-2">
+          <label className={labelCls + " mb-0"}>
+            Images ({data.items.length})
+          </label>
+          <button
+            onClick={() =>
+              update({
+                items: [
+                  ...data.items,
+                  { id: uuidv4(), src: "", alt: "", caption: "" },
+                ],
+              })
+            }
+            className="text-[10px] text-primary font-semibold"
+          >
+            + Add
+          </button>
+        </div>
+        {data.items.length === 0 ? (
+          <div className="text-center py-4 border border-dashed border-border/60 rounded text-[10px] text-muted-foreground">
+            Empty
+          </div>
+        ) : (
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={data.items.map((i) => i.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <div className="space-y-2">
+                {data.items.map((item) => (
+                  <SortableCarouselItem
+                    key={item.id}
+                    item={item}
+                    onUpdate={(patch) =>
+                      update({
+                        items: data.items.map((i) =>
+                          i.id === item.id ? { ...i, ...patch } : i,
+                        ),
+                      })
+                    }
+                    onRemove={() =>
+                      update({
+                        items: data.items.filter((i) => i.id !== item.id),
+                      })
+                    }
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
+        )}
+      </div>
+      <div className={sectionCls}>
+        <Field label="Alignment">
+          <AlignButtons
+            value={data.align ?? "center"}
+            onChange={(v) => update({ align: v })}
+          />
+        </Field>
+        <SliderField
+          label="Width (%)"
+          value={data.width ?? 100}
+          min={10}
+          max={100}
+          onChange={(v) => update({ width: v })}
+        />
+        <Field label="Aspect Ratio">
+          <SegmentedControl
+            value={data.aspectRatio ?? "auto"}
+            onChange={(v) => update({ aspectRatio: v as AspectRatio })}
+            options={[
+              { label: "16:9", value: "16:9" },
+              { label: "4:3", value: "4:3" },
+              { label: "1:1", value: "1:1" },
+              { label: "Auto", value: "auto" },
+            ]}
+          />
+        </Field>
+        <div className="space-y-1.5 pt-1">
+          <ToggleRow
+            label="Show Arrows"
+            value={!!data.showArrows}
+            onChange={(v) => update({ showArrows: v })}
+          />
+          <ToggleRow
+            label="Show Dots"
+            value={!!data.showDots}
+            onChange={(v) => update({ showDots: v })}
+          />
+          <ToggleRow
+            label="Auto Play"
+            value={!!data.autoPlay}
+            onChange={(v) => update({ autoPlay: v })}
+          />
+        </div>
+        {data.aspectRatio !== "auto" && (
+          <CropPositionPicker
+            value={data.objectPosition}
+            onChange={(v) => update({ objectPosition: v })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SelectEditor({
+  data,
+  onChange,
+  steps,
+  storeId,
+}: {
+  data: Extract<BlockData, { type: "select" }>;
+  onChange: (d: BlockData) => void;
+  steps: { id: string; label: string }[];
+  storeId?: string;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+  );
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIdx = data.options.findIndex((o) => o.id === active.id);
+    const newIdx = data.options.findIndex((o) => o.id === over.id);
+    if (oldIdx !== -1 && newIdx !== -1)
+      update({ options: arrayMove(data.options, oldIdx, newIdx) });
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className={sectionCls}>
+        <Field label="Prompt">
+          <input
+            type="text"
+            value={data.question}
+            onChange={(e) => update({ question: e.target.value })}
+            placeholder="Question..."
+            className={inputCls}
+          />
+        </Field>
+        <Field label="Selection">
+          <SegmentedControl
+            value={data.selectionMode}
+            onChange={(v) => update({ selectionMode: v as "single" | "multi" })}
+            options={[
+              { label: "Single", value: "single" },
+              { label: "Multi", value: "multi" },
+            ]}
+          />
+        </Field>
+        <Field label="Layout">
+          <SegmentedControl
+            value={data.layout}
+            onChange={(v) => update({ layout: v as "list" | "grid" })}
+            options={[
+              { label: "List", value: "list" },
+              { label: "Grid", value: "grid" },
+            ]}
+          />
+        </Field>
+      </div>
+
+      <div className={sectionCls}>
+        <div className="flex items-center justify-between mb-2">
+          <label className={labelCls + " mb-0"}>
+            Options ({data.options.length})
+          </label>
+          <button
+            onClick={() =>
+              update({
+                options: [
+                  ...data.options,
+                  { id: uuidv4(), label: "", tags: [] },
+                ],
+              })
+            }
+            className="text-[10px] text-primary font-semibold"
+          >
+            + Add Option
+          </button>
+        </div>
+        {data.options.length === 0 ? (
+          <div className="text-center py-4 border border-dashed border-border/60 rounded text-[10px] text-muted-foreground">
+            Empty
+          </div>
+        ) : (
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={data.options.map((o) => o.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <div className="space-y-2">
+                {data.options.map((opt) => (
+                  <SortableSelectOption
+                    key={opt.id}
+                    option={opt}
+                    steps={steps}
+                    storeId={storeId}
+                    onUpdate={(patch) =>
+                      update({
+                        options: data.options.map((o) =>
+                          o.id === opt.id ? { ...o, ...patch } : o,
+                        ),
+                      })
+                    }
+                    onRemove={() =>
+                      update({
+                        options: data.options.filter((o) => o.id !== opt.id),
+                      })
+                    }
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ContactEditor({
+  data,
+  onChange,
+  steps,
+}: {
+  data: Extract<BlockData, { type: "contact" }>;
+  onChange: (d: BlockData) => void;
+  steps?: { id: string; label: string }[];
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  const FIELDS = [
+    { key: "firstName", label: "First" },
+    { key: "lastName", label: "Last" },
+    { key: "email", label: "Email" },
+    { key: "phone", label: "Phone" },
+  ] as const;
+
+  return (
+    <div className="space-y-4">
+      <div className={sectionCls}>
+        <Field label="Heading (Opt)">
+          <input
+            type="text"
+            value={data.heading || ""}
+            onChange={(e) => update({ heading: e.target.value || undefined })}
+            placeholder="Heading..."
+            className={inputCls}
+          />
+        </Field>
+        <Field label="Fields">
+          <div className="rounded border border-border/60 bg-card overflow-hidden">
+            <div className="flex px-2 py-1.5 bg-muted/40 border-b border-border/60">
+              <span className="flex-1 text-[9px] font-bold text-muted-foreground uppercase">
+                Field
+              </span>
+              <span
+                className="w-10 text-center text-[9px] font-bold text-muted-foreground uppercase"
+                title="Show"
+              >
+                <Eye className="w-3 h-3 mx-auto" />
+              </span>
+              <span
+                className="w-10 text-center text-[9px] font-bold text-muted-foreground uppercase"
+                title="Require"
+              >
+                <Asterisk className="w-3 h-3 mx-auto" />
+              </span>
+            </div>
+            {FIELDS.map(({ key, label }) => {
+              const cfg = data.fields[key];
+              return (
+                <div
+                  key={key}
+                  className="flex items-center px-2 py-1.5 border-b border-border/30 last:border-0"
+                >
+                  <span className="flex-1 text-[11px] font-medium text-foreground/80">
+                    {label}
+                  </span>
+                  <div className="w-10 flex justify-center">
+                    <Toggle
+                      value={cfg.enabled}
+                      onChange={(v) =>
+                        update({
+                          fields: {
+                            ...data.fields,
+                            [key]: { ...cfg, enabled: v },
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                  <div className="w-10 flex justify-center">
+                    <Toggle
+                      value={cfg.required && cfg.enabled}
+                      onChange={(v) =>
+                        update({
+                          fields: {
+                            ...data.fields,
+                            [key]: {
+                              ...cfg,
+                              required: v,
+                              enabled: v ? true : cfg.enabled,
+                            },
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Field>
+      </div>
+      <div className={sectionCls}>
+        <Field label="Submit Label">
+          <input
+            type="text"
+            value={data.submitLabel}
+            onChange={(e) => update({ submitLabel: e.target.value })}
+            placeholder="Submit"
+            className={inputCls}
+          />
+        </Field>
+        <Field label="Submit Route">
+          <StepSelect
+            value={data.nextStepId}
+            onChange={(v) => update({ nextStepId: v })}
+            steps={steps ?? []}
+          />
+        </Field>
+      </div>
+      <div className={sectionCls}>
+        <ToggleRow
+          label="Enable Skip"
+          value={!!data.showSkip}
+          onChange={(v) => update({ showSkip: v })}
+        />
+        {data.showSkip && (
+          <div className="mt-2 space-y-2 p-2 bg-muted/10 rounded border border-border/40">
+            <Field label="Skip Label">
+              <input
+                type="text"
+                value={data.skipLabel ?? "Skip"}
+                onChange={(e) => update({ skipLabel: e.target.value })}
+                className={inputCls}
+              />
+            </Field>
+            <Field label="Skip Route">
+              <StepSelect
+                value={data.skipNextStepId}
+                onChange={(v) => update({ skipNextStepId: v })}
+                steps={steps ?? []}
+              />
+            </Field>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TextInputEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "text-input" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <Field label="Prompt">
+        <input
+          type="text"
+          value={data.question}
+          onChange={(e) => update({ question: e.target.value })}
+          placeholder="Question..."
+          className={inputCls}
+        />
+      </Field>
+      <Field label="Placeholder">
+        <input
+          type="text"
+          value={data.placeholder || ""}
+          onChange={(e) => update({ placeholder: e.target.value || undefined })}
+          placeholder="Type here..."
+          className={inputCls}
+        />
+      </Field>
+      <Field label="Input Type">
+        <SegmentedControl
+          value={data.multiline}
+          onChange={(v) => update({ multiline: v as boolean })}
+          options={[
+            { label: "Single Line", value: false },
+            { label: "Paragraph", value: true },
+          ]}
+        />
+      </Field>
+      
+    </div>
+  );
+}
+
+function RatingEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "rating" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <Field label="Prompt">
+        <input
+          type="text"
+          value={data.question}
+          onChange={(e) => update({ question: e.target.value })}
+          placeholder="Rate us..."
+          className={inputCls}
+        />
+      </Field>
+      <Field label="Type">
+        <SegmentedControl
+          value={data.ratingType}
+          onChange={(v) => update({ ratingType: v as "stars" | "thumbs" })}
+          options={[
+            { label: "Stars", value: "stars" },
+            { label: "Thumbs", value: "thumbs" },
+          ]}
+        />
+      </Field>
+      {data.ratingType === "stars" && (
+        <>
+          <SliderField
+            label="Max Stars"
+            value={data.maxStars ?? 5}
+            min={3}
+            max={10}
+            onChange={(v) => update({ maxStars: v })}
+          />
+          <Field label="Low Label">
+            <input
+              type="text"
+              value={data.minLabel || ""}
+              onChange={(e) => update({ minLabel: e.target.value })}
+              className={inputCls}
+            />
+          </Field>
+          <Field label="High Label">
+            <input
+              type="text"
+              value={data.maxLabel || ""}
+              onChange={(e) => update({ maxLabel: e.target.value })}
+              className={inputCls}
+            />
+          </Field>
+        </>
+      )}
+      <ToggleRow
+        label="Required"
+        value={data.required}
+        onChange={(v) => update({ required: v })}
+      />
+    </div>
+  );
+}
+
+function ButtonEditor({
+  data,
+  onChange,
+  steps,
+}: {
+  data: Extract<BlockData, { type: "button" }>;
+  onChange: (d: BlockData) => void;
+  steps: { id: string; label: string }[];
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <Field label="Label">
+        <input
+          type="text"
+          value={data.label}
+          onChange={(e) => update({ label: e.target.value })}
+          className={inputCls}
+        />
+      </Field>
+      <Field label="Action">
+        <SegmentedControl
+          value={data.action ?? "link"}
+          onChange={(v) => update({ action: v as "link" | "next-step" })}
+          options={[
+            { label: "URL", value: "link" },
+            { label: "Route", value: "next-step" },
+          ]}
+        />
+      </Field>
+      {(data.action ?? "link") === "link" ? (
+        <Field label="URL">
+          <input
+            type="url"
+            value={data.href || ""}
+            onChange={(e) => update({ href: e.target.value })}
+            className={inputCls}
+          />
+        </Field>
+      ) : (
+        <Field label="Route To">
+          <StepSelect
+            value={data.nextStepId}
+            onChange={(v) => update({ nextStepId: v })}
+            steps={steps}
+          />
+        </Field>
+      )}
+      <Field label="Variant">
+        <SegmentedControl
+          value={data.variant}
+          onChange={(v) => update({ variant: v as ButtonVariant })}
+          options={[
+            { label: "Fill", value: "filled" },
+            { label: "Outline", value: "outline" },
+            { label: "Ghost", value: "ghost" },
+          ]}
+        />
+      </Field>
+      <Field label="Align">
+        <AlignButtons
+          value={data.align}
+          onChange={(v) => update({ align: v })}
+        />
+      </Field>
+      <ColorField
+        label="Bg Color"
+        value={data.bgColor}
+        onChange={(v) => update({ bgColor: v || undefined })}
+        defaultValue="#6366f1"
+      />
+      <ColorField
+        label="Text Color"
+        value={data.textColor}
+        onChange={(v) => update({ textColor: v || undefined })}
+        defaultValue="#ffffff"
+      />
+      <SliderField
+        label="Radius"
+        value={data.borderRadius ?? 8}
+        min={0}
+        max={50}
+        onChange={(v) => update({ borderRadius: v })}
+      />
+      <ToggleRow
+        label="Full Width"
+        value={!!data.fullWidth}
+        onChange={(v) => update({ fullWidth: v })}
+      />
+    </div>
+  );
+}
+
+function ProductsEditor({
+  data,
+  onChange,
+  storeId,
+}: {
+  data: Extract<BlockData, { type: "products" }>;
+  onChange: (d: BlockData) => void;
+  storeId?: string;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className="space-y-4">
+      <div className={sectionCls}>
+        <Field label="Mode">
+          <SegmentedControl
+            value={data.mode}
+            onChange={(v) => update({ mode: v as "tagged" | "manual" })}
+            options={[
+              { label: "Dynamic", value: "tagged" },
+              { label: "Manual", value: "manual" },
+            ]}
+          />
+        </Field>
+      </div>
+      {data.mode === "tagged" && (
+        <div className={sectionCls}>
+          <Field label="Logic">
+            <SegmentedControl
+              value={data.matchStrategy ?? "any"}
+              onChange={(v) =>
+                update({ matchStrategy: v as "any" | "all" })
+              }
+              options={[
+                { label: "Any", value: "any" },
+                { label: "All", value: "all" },
+              ]}
+            />
+          </Field>
+          <SliderField
+            label="Limit"
+            value={data.resultLimit ?? 15}
+            min={1}
+            unit=""
+            max={30}
+            onChange={(v) => update({ resultLimit: v })}
+          />
+          <Field label="Empty Msg">
+            <input
+              type="text"
+              value={data.fallbackMessage || ""}
+              onChange={(e) => update({ fallbackMessage: e.target.value })}
+              className={inputCls}
+            />
+          </Field>
+        </div>
+      )}
+      {data.mode === "manual" && (
+        <div className={sectionCls}>
+          <label className={labelCls}>
+            Products ({(data.pinnedProducts ?? []).length})
+          </label>
+          <DndContext
+            sensors={useSensors(
+              useSensor(PointerSensor, {
+                activationConstraint: { distance: 8 },
+              }),
+            )}
+            collisionDetection={closestCenter}
+            onDragEnd={(e) => {
+              const { active, over } = e;
+              if (!over) return;
+              const p = data.pinnedProducts ?? [];
+              const o = p.findIndex((x) => x.id === active.id);
+              const n = p.findIndex((x) => x.id === over.id);
+              if (o !== -1 && n !== -1)
+                update({ pinnedProducts: arrayMove(p, o, n) });
+            }}
+          >
+            <SortableContext
+              items={(data.pinnedProducts ?? []).map((p) => p.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <DbProductPicker
+                storeId={storeId}
+                pinnedProducts={data.pinnedProducts ?? []}
+                onAdd={(p) =>
+                  update({
+                    pinnedProducts: [...(data.pinnedProducts ?? []), p],
+                  })
+                }
+                onRemove={(id) =>
+                  update({
+                    pinnedProducts: (data.pinnedProducts ?? []).filter(
+                      (p) => p.id !== id,
+                    ),
+                  })
+                }
+              />
+            </SortableContext>
+          </DndContext>
+        </div>
+      )}
+      <div className={sectionCls}>
+        <Field label="Heading">
+          <input
+            type="text"
+            value={data.heading || ""}
+            onChange={(e) => update({ heading: e.target.value || undefined })}
+            className={inputCls}
+          />
+        </Field>
+        <Field label="Layout">
+          <SegmentedControl
+            value={data.layout}
+            onChange={(v) => update({ layout: v as "grid" | "list" })}
+            options={[
+              { label: "Grid", value: "grid" },
+              { label: "List", value: "list" },
+            ]}
+          />
+        </Field>
+        <div className="space-y-1.5 pt-1">
+          {/* <ToggleRow
+            label="Show Cart Btn"
+            value={!!data.showAddToCart}
+            onChange={(v) => update({ showAddToCart: v })}
+          /> */}
+          <ToggleRow
+            label="Show Tags"
+            value={!!data.showProductTags}
+            onChange={(v) => update({ showProductTags: v })}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DividerEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "divider" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  const update = (patch: object) =>
+    onChange({ ...data, ...patch } as BlockData);
+  return (
+    <div className={sectionCls}>
+      <ColorField
+        label="Color"
+        value={data.color}
+        onChange={(v) => update({ color: v || undefined })}
+        defaultValue="#e2e8f0"
+      />
+      <SliderField
+        label="Thick"
+        value={data.thickness ?? 1}
+        min={1}
+        max={8}
+        onChange={(v) => update({ thickness: v })}
+      />
+      <Field label="Style">
+        <SegmentedControl
+          value={data.style ?? "solid"}
+          onChange={(v) =>
+            update({ style: v as "solid" | "dashed" | "dotted" })
+          }
+          options={[
+            { label: "Solid", value: "solid" },
+            { label: "Dash", value: "dashed" },
+            { label: "Dot", value: "dotted" },
+          ]}
+        />
+      </Field>
+    </div>
+  );
+}
+
+function SpacerEditor({
+  data,
+  onChange,
+}: {
+  data: Extract<BlockData, { type: "spacer" }>;
+  onChange: (d: BlockData) => void;
+}) {
+  return (
+    <div className={sectionCls}>
+      <SliderField
+        label="Height"
+        value={data.height}
+        min={8}
+        max={300}
+        onChange={(v) => onChange({ ...data, height: v })}
+      />
+    </div>
+  );
+}
+
+// ── Main Shell ────────────────────────────────────────────────────────────────
+
+const BLOCK_TYPE_LABELS: Record<string, string> = {
+  h1: "Heading 1",
+  h2: "Heading 2",
+  h3: "Heading 3",
+  paragraph: "Paragraph",
+  image: "Image",
+  carousel: "Carousel",
+  select: "Selection",
+  contact: "Lead Form",
+  "text-input": "Text Input",
+  rating: "Rating",
+  button: "Button",
+  products: "Products",
+  divider: "Divider",
+  spacer: "Spacer",
+};
+
+export type BlockInspectorProps = {
+  block: CanvasBlock;
+  onChange: (data: BlockData) => void;
+  onDelete: () => void;
+  steps?: { id: string; label: string }[];
+  storeId?: string;
+};
+
+export function BlockInspector({
+  block,
+  onChange,
+  onDelete,
+  steps = [],
+  storeId,
+}: BlockInspectorProps) {
+  const { data } = block;
+  const renderEditor = () => {
+    switch (data.type) {
+      case "h1":
+      case "h2":
+      case "h3":
+        return <HeadingEditor data={data} onChange={onChange} />;
+      case "paragraph":
+        return <ParagraphEditor data={data} onChange={onChange} />;
+      case "image":
+        return <ImageEditor data={data} onChange={onChange} />;
+      case "carousel":
+        return <CarouselEditor data={data} onChange={onChange} />;
+      case "select":
+        return (
+          <SelectEditor
+            data={data}
+            onChange={onChange}
+            steps={steps}
+            storeId={storeId}
+          />
+        );
+      case "contact":
+        return <ContactEditor data={data} onChange={onChange} steps={steps} />;
+      case "text-input":
+        return <TextInputEditor data={data} onChange={onChange} />;
+      case "rating":
+        return <RatingEditor data={data} onChange={onChange} />;
+      case "button":
+        return <ButtonEditor data={data} onChange={onChange} steps={steps} />;
+      case "products":
+        return (
+          <ProductsEditor data={data} onChange={onChange} storeId={storeId} />
+        );
+      case "divider":
+        return <DividerEditor data={data} onChange={onChange} />;
+      case "spacer":
+        return <SpacerEditor data={data} onChange={onChange} />;
+      default:
+        return (
+          <div className="text-center p-4 text-[10px] text-muted-foreground">
+            No properties
+          </div>
+        );
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-background w-[300px] border-l border-border/50">
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-border/60 bg-card shrink-0">
+        <div>
+          <h3 className="text-xs font-bold text-foreground">
+            {BLOCK_TYPE_LABELS[data.type] ?? data.type}
+          </h3>
+          <p className="text-[9px] text-muted-foreground">Properties</p>
+        </div>
+        <button
+          onClick={onDelete}
+          className="p-1.5 rounded bg-muted/50 text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+          title="Delete block"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto p-3 custom-scrollbar">
+        {renderEditor()}
+      </div>
+    </div>
+  );
+}
+
+
+==================================================
+FILE: BlockRenderer.tsx
+==================================================
+
+// components/canvas/BlockRenderer.tsx
+"use client";
+
+import {
+  Star,
+  ThumbsUp,
+  ThumbsDown,
+  ChevronLeft,
+  ChevronRight,
+  Check,
+  ShoppingBag,
+} from "lucide-react";
+import type { CanvasBlock, AspectRatio, SelectOption } from "@/types/canvas";
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const RATIO_CLASS: Record<string, string> = {
+  "1:1": "aspect-square",
+  "16:9": "aspect-video",
+  "4:3": "aspect-[4/3]",
+  "3:2": "aspect-[3/2]",
+  auto: "aspect-auto",
+};
+
+function aspectRatioPadding(ratio?: AspectRatio): string {
+  switch (ratio) {
+    case "1:1":
+      return "100%";
+    case "16:9":
+      return "56.25%";
+    case "4:3":
+      return "75%";
+    case "3:2":
+      return "66.66%";
+    default:
+      return "0";
+  }
+}
+
+function ImagePlaceholder({
+  borderRadius,
+  aspectRatio,
+}: {
+  borderRadius?: number;
+  aspectRatio?: AspectRatio;
+}) {
+  const useAspect = aspectRatio && aspectRatio !== "auto";
+
+  return (
+    <div
+      style={{
+        borderRadius: borderRadius ?? 16,
+        ...(useAspect
+          ? {
+              position: "relative",
+              paddingBottom: aspectRatioPadding(aspectRatio),
+            }
+          : { minHeight: 160 }),
+      }}
+      className="w-full bg-muted/60 border-2 border-dashed border-border
+        flex items-center justify-center overflow-hidden"
+    >
+      <div
+        style={useAspect ? { position: "absolute", inset: 0 } : {}}
+        className="flex flex-col items-center justify-center gap-1
+          text-muted-foreground/50 w-full h-full"
+      >
+        <svg
+          className="w-8 h-8"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <rect x="3" y="3" width="18" height="18" rx="2" strokeWidth="1.5" />
+          <circle cx="8.5" cy="8.5" r="1.5" strokeWidth="1.5" />
+          <path d="M21 15l-5-5L5 21" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+        <span className="text-xs">No image set</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Carousel block ────────────────────────────────────────────────────────────
+
+function CarouselBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "carousel" }>;
+}) {
+  const items = data.items ?? [];
+  const alignJustify =
+    data.align === "left"
+      ? "flex-start"
+      : data.align === "right"
+        ? "flex-end"
+        : "center";
+
+  if (items.length === 0) {
+    return (
+      <div
+        className="w-full flex pointer-events-none"
+        style={{ justifyContent: alignJustify }}
+      >
+        <div style={{ width: `${data.width ?? 100}%` }}>
+          <ImagePlaceholder
+            borderRadius={data.borderRadius}
+            aspectRatio={data.aspectRatio}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  const isAuto = data.aspectRatio === "auto";
+  const aspectClass = isAuto
+    ? ""
+    : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+
+  return (
+    <div
+      className="w-full flex pointer-events-none"
+      style={{ justifyContent: alignJustify }}
+    >
+      <div
+        className="relative group"
+        style={{ width: `${data.width ?? 100}%` }}
+      >
+        <div
+          className={`w-full overflow-hidden shadow-sm border border-border/20 relative bg-muted/20 ${aspectClass}`}
+          style={{ borderRadius: data.borderRadius ?? 16 }}
+        >
+          <img
+            src={items[0].src}
+            alt={items[0].alt || ""}
+            className={`transition-opacity duration-500 ease-in-out ${
+              isAuto
+                ? "w-full h-auto block"
+                : `w-full h-full object-${data.items?.[0] ? "cover" : "cover"}`
+            }`}
+            style={{ objectPosition: data.objectPosition ?? "50% 50%" }}
+          />
+
+          {data.showArrows && items.length > 1 && (
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/5" />
+          )}
+        </div>
+
+        {data.showArrows && items.length > 1 && (
+          <>
+            <div className="absolute left-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-background/80 backdrop-blur-md text-foreground shadow-sm flex items-center justify-center sm:flex hidden">
+              <ChevronLeft className="w-5 h-5" />
+            </div>
+            <div className="absolute right-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-background/80 backdrop-blur-md text-foreground shadow-sm flex items-center justify-center sm:flex hidden">
+              <ChevronRight className="w-5 h-5" />
+            </div>
+          </>
+        )}
+
+        {data.showDots && items.length > 1 && (
+          <div className="flex justify-center gap-2 mt-4">
+            {items.map((_, i) => (
+              <div
+                key={i}
+                className={`h-1.5 rounded-full transition-all duration-300 ${
+                  i === 0 ? "w-6 bg-foreground/80" : "w-1.5 bg-border"
+                }`}
+              />
+            ))}
+          </div>
+        )}
+
+        {items[0].caption && (
+          <p className="text-sm text-center font-medium text-muted-foreground/70 mt-3">
+            {items[0].caption}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Select block ──────────────────────────────────────────────────────────────
+
+function SelectBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "select" }>;
+}) {
+  const isGrid = data.layout === "grid";
+  const isMulti = data.selectionMode === "multi";
+
+  return (
+    <div className="w-full space-y-5 pointer-events-none">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug">
+          {data.question}
+        </p>
+      )}
+
+      {data.options.length === 0 ? (
+        <div className="border border-dashed border-border rounded-xl py-8 flex items-center justify-center">
+          <p className="text-xs text-muted-foreground/40">
+            No options added yet
+          </p>
+        </div>
+      ) : (
+        <div className={isGrid ? "grid grid-cols-2 gap-3" : "space-y-3"}>
+          {data.options.map((opt: SelectOption, idx: number) => {
+            const isSel = idx === 0; // Simulate first item as selected for preview
+
+            return (
+              <div
+                key={opt.id}
+                className={`w-full flex items-center gap-4 p-4 sm:p-5 rounded-2xl border transition-all duration-200 group
+                  ${isGrid ? "flex-col text-center justify-center min-h-[120px]" : "justify-between"}
+                  ${
+                    isSel
+                      ? "border-primary bg-primary/5 shadow-[0_4px_14px_rgba(0,0,0,0.03)]"
+                      : "border-border/60 bg-card"
+                  }`}
+              >
+                <div
+                  className={`flex items-center gap-4 ${isGrid ? "flex-col" : "w-full"}`}
+                >
+                  {!isGrid && (
+                    <div className="shrink-0">
+                      {isMulti ? (
+                        <div
+                          className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${
+                            isSel
+                              ? "bg-primary border-primary"
+                              : "border-muted-foreground/30 bg-background"
+                          }`}
+                        >
+                          {isSel && (
+                            <Check className="w-3.5 h-3.5 text-primary-foreground stroke-[3]" />
+                          )}
+                        </div>
+                      ) : (
+                        <div
+                          className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
+                            isSel
+                              ? "border-primary"
+                              : "border-muted-foreground/30"
+                          }`}
+                        >
+                          {isSel && (
+                            <div className="w-2.5 h-2.5 rounded-full bg-primary" />
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {opt.imageUrl && opt.imageUrl.trim() !== "" && (
+                    <img
+                      src={opt.imageUrl}
+                      alt=""
+                      className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${
+                        isGrid ? "w-14 h-14" : "w-10 h-10"
+                      }`}
+                    />
+                  )}
+
+                  <span
+                    className={`font-semibold text-foreground/90 ${
+                      isGrid
+                        ? "text-sm leading-tight"
+                        : "flex-1 text-left text-sm"
+                    }`}
+                  >
+                    {opt.label || `Option ${idx + 1}`}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {isMulti && (
+        <div className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base flex items-center justify-center opacity-40">
+          Continue
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Contact block ─────────────────────────────────────────────────────────────
+
+function ContactBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "contact" }>;
+}) {
+  const f = data.fields;
+  const enabledFields = Object.entries(f).filter(([, cfg]) => cfg.enabled);
+
+  return (
+    <div className="w-full space-y-6 pointer-events-none">
+      {data.heading && (
+        <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
+          {data.heading}
+        </p>
+      )}
+
+      <div className="space-y-4">
+        {f.firstName.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              First Name {f.firstName.required && "*"}
+            </label>
+            <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/30 shadow-sm flex items-center">
+              Jane
+            </div>
+          </div>
+        )}
+        {f.lastName.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Last Name {f.lastName.required && "*"}
+            </label>
+            <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/30 shadow-sm flex items-center">
+              Doe
+            </div>
+          </div>
+        )}
+        {f.email.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Email Address {f.email.required && "*"}
+            </label>
+            <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/30 shadow-sm flex items-center">
+              jane@example.com
+            </div>
+          </div>
+        )}
+        {f.phone.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Phone Number {f.phone.required && "*"}
+            </label>
+            <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/30 shadow-sm flex items-center">
+              (555) 000-0000
+            </div>
+          </div>
+        )}
+
+        {enabledFields.length === 0 && (
+          <div className="border border-dashed border-border rounded-xl py-6 flex items-center justify-center">
+            <p className="text-xs text-muted-foreground/40">
+              No fields enabled
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div className="pt-2 space-y-3">
+        <div className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base flex items-center justify-center gap-2 opacity-60">
+          {data.submitLabel || "Continue"}
+        </div>
+        {data.showSkip && (
+          <div className="w-full py-3 text-center text-sm font-medium text-muted-foreground">
+            {data.skipLabel ?? "Skip this step"}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Text input block ──────────────────────────────────────────────────────────
+
+function TextInputBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "text-input" }>;
+}) {
+  return (
+    <div className="w-full space-y-5 pointer-events-none">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug">
+          {data.question}
+        </p>
+      )}
+
+      {data.multiline ? (
+        <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/40 min-h-[140px] shadow-sm">
+          {data.placeholder || "Type your answer here..."}
+        </div>
+      ) : (
+        <div className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-muted-foreground/40 shadow-sm">
+          {data.placeholder || "Type your answer here..."}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Rating block ──────────────────────────────────────────────────────────────
+
+function RatingBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "rating" }>;
+}) {
+  const max = data.maxStars ?? 5;
+  const previewFilled = 3;
+
+  if (data.ratingType === "thumbs") {
+    return (
+      <div className="w-full space-y-5 pointer-events-none">
+        {data.question && (
+          <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug text-center">
+            {data.question}
+          </p>
+        )}
+        <div className="flex gap-4 justify-center">
+          <div className="flex flex-col items-center justify-center gap-3 w-32 h-32 rounded-3xl border-2 font-semibold text-base transition-all duration-200 border-emerald-500 bg-emerald-50 text-emerald-700 shadow-sm scale-110">
+            <ThumbsUp className="w-8 h-8 scale-110" />
+            Yes
+          </div>
+          <div className="flex flex-col items-center justify-center gap-3 w-32 h-32 rounded-3xl border-2 font-semibold text-base transition-all duration-200 border-border/60 bg-card text-foreground/70">
+            <ThumbsDown className="w-8 h-8" />
+            No
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full space-y-6 pointer-events-none">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug text-center">
+          {data.question}
+        </p>
+      )}
+      <div className="flex items-center justify-center gap-2 sm:gap-3">
+        {Array.from({ length: max }).map((_, i) => (
+          <div key={i} className="p-1">
+            <Star
+              className={`w-10 h-10 sm:w-12 sm:h-12 transition-all duration-200 ${
+                i < previewFilled
+                  ? "fill-amber-400 text-amber-400 drop-shadow-sm scale-110"
+                  : "fill-none text-muted-foreground/30"
+              }`}
+            />
+          </div>
+        ))}
+      </div>
+      {(data.minLabel || data.maxLabel) && (
+        <div className="flex justify-between px-2 text-sm font-medium text-muted-foreground/60">
+          <span>{data.minLabel}</span>
+          <span>{data.maxLabel}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Products block ────────────────────────────────────────────────────────────
+
+function ProductCardStatic({
+  product,
+  compact,
+  showTags,
+}: {
+  product: any;
+  compact: boolean;
+  showTags?: boolean;
+}) {
+  const title = product.name ?? product.title ?? "Product";
+  const imageUrl = product.imageurl ?? product.imageUrl ?? null;
+  const price = product.price ?? null;
+  const tags = product.tags ?? [];
+
+  if (compact) {
+    return (
+      <div className="group rounded-2xl border border-border/50 bg-card overflow-hidden flex flex-col h-full">
+        <div className="aspect-square w-full overflow-hidden bg-muted/30 relative">
+          {imageUrl ? (
+            <img
+              src={imageUrl}
+              alt={title}
+              className="w-full h-full object-cover mix-blend-multiply"
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center">
+              <ShoppingBag className="w-8 h-8 text-muted-foreground/20" />
+            </div>
+          )}
+        </div>
+
+        <div className="p-3 flex flex-col gap-2 flex-1">
+          <p className="text-xs font-semibold text-foreground leading-tight line-clamp-2">
+            {title}
+          </p>
+          <p className="text-[10px] text-muted-foreground line-clamp-2">
+            {product.description}
+          </p>
+          <div className="mt-auto flex items-center justify-between">
+            {price && (
+              <p className="text-sm font-bold text-foreground/80">
+                ${Number(price).toFixed(2)}
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group flex gap-4 rounded-2xl border border-border/50 bg-card p-4 items-center">
+      <div className="w-20 h-20 shrink-0 rounded-xl overflow-hidden bg-muted/30 relative">
+        {imageUrl ? (
+          <img
+            src={imageUrl}
+            alt={title}
+            className="w-full h-full object-cover mix-blend-multiply"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <ShoppingBag className="w-6 h-6 text-muted-foreground/20" />
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 min-w-0 space-y-1">
+        <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
+          {title}
+        </p>
+        {price && (
+          <p className="text-sm font-bold text-foreground/80">
+            ${Number(price).toFixed(2)}
+          </p>
+        )}
+        {showTags && tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {tags.slice(0, 3).map((t: any) => (
+              <span
+                key={t.id ?? t}
+                className="text-[10px] uppercase font-semibold tracking-wider px-2 py-1 rounded-md bg-muted text-muted-foreground"
+              >
+                {t.name ?? t}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProductsBlock({
+  data,
+}: {
+  data: Extract<CanvasBlock["data"], { type: "products" }>;
+}) {
+  const isGrid = data.layout === "grid";
+  const isTagged = data.mode === "tagged";
+  const pins = data.pinnedProducts ?? [];
+  const limit = data.resultLimit ?? 12;
+  const skeletonCount = isTagged ? Math.min(limit, 4) : 0;
+
+  return (
+    <div className="w-full space-y-5 pointer-events-none">
+      {data.heading && (
+        <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
+          {data.heading}
+        </p>
+      )}
+
+      {isTagged || pins.length === 0 ? (
+        <div
+          className={
+            isGrid
+              ? "grid grid-cols-2 gap-3 sm:gap-5"
+              : "space-y-3 sm:space-y-4"
+          }
+        >
+          {Array.from({ length: skeletonCount > 0 ? skeletonCount : 2 }).map(
+            (_, i) => (
+              <div
+                key={i}
+                className={`rounded-2xl border border-border/40 bg-card overflow-hidden
+                ${isGrid ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
+              >
+                <div
+                  className={`bg-muted/40 ${
+                    isGrid ? "h-2/3 w-full" : "w-20 h-20 rounded-xl shrink-0"
+                  }`}
+                />
+                <div
+                  className={`flex-1 space-y-2.5 ${isGrid ? "p-4" : "py-2"}`}
+                >
+                  <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
+                  <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
+                  <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
+                </div>
+              </div>
+            ),
+          )}
+        </div>
+      ) : (
+        <div
+          className={
+            isGrid
+              ? "grid grid-cols-2 gap-3 sm:gap-5"
+              : "space-y-3 sm:space-y-4"
+          }
+        >
+          {pins.slice(0, 4).map((p) => (
+            <ProductCardStatic
+              key={p.id}
+              product={p}
+              compact={isGrid}
+              showTags={data.showProductTags}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main BlockRenderer ────────────────────────────────────────────────────────
+
+export function BlockRenderer({ block }: { block: CanvasBlock }) {
+  const { data } = block;
+
+  switch (data.type) {
+    // ── Headings ─────────────────────────────────────────────────────────────
+    case "h1":
+      return (
+        <h1
+          style={{ textAlign: data.align, color: data.color ?? undefined }}
+          className="text-2xl sm:text-3xl font-extrabold tracking-tight leading-tight w-full text-foreground/90 pointer-events-none"
+        >
+          {data.text || (
+            <span className="text-muted-foreground/40 italic">
+              Empty heading
+            </span>
+          )}
+        </h1>
+      );
+
+    case "h2":
+      return (
+        <h2
+          style={{ textAlign: data.align, color: data.color ?? undefined }}
+          className="text-xl sm:text-2xl font-bold tracking-tight leading-snug w-full text-foreground/90 pointer-events-none"
+        >
+          {data.text || (
+            <span className="text-muted-foreground/40 italic">
+              Empty subheading
+            </span>
+          )}
+        </h2>
+      );
+
+    case "h3":
+      return (
+        <h3
+          style={{ textAlign: data.align, color: data.color ?? undefined }}
+          className="text-lg sm:text-xl font-semibold tracking-tight leading-snug w-full text-foreground/90 pointer-events-none"
+        >
+          {data.text || (
+            <span className="text-muted-foreground/40 italic">Empty title</span>
+          )}
+        </h3>
+      );
+
+    // ── Paragraph ─────────────────────────────────────────────────────────────
+    case "paragraph":
+      return (
+        <p
+          style={{
+            textAlign: data.align,
+            color: data.color ?? undefined,
+            fontSize: data.fontSize ? `${data.fontSize}px` : undefined,
+          }}
+          className="w-full leading-relaxed text-foreground/70 sm:text-base text-sm font-medium pointer-events-none"
+        >
+          {data.text || (
+            <span className="text-muted-foreground/40 italic">
+              Empty paragraph
+            </span>
+          )}
+        </p>
+      );
+
+    // ── Image ──────────────────────────────────────────────────────────────────
+    case "image": {
+      const imgAlign = data.align ?? "center";
+      const alignJustify =
+        imgAlign === "left"
+          ? "flex-start"
+          : imgAlign === "right"
+            ? "flex-end"
+            : "center";
+      const isAuto = data.aspectRatio === "auto";
+      const aspectClass = isAuto
+        ? ""
+        : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+
+      if (!data.src) {
+        return (
+          <div
+            className="w-full flex pointer-events-none"
+            style={{ justifyContent: alignJustify }}
+          >
+            <div style={{ width: `${data.width ?? 100}%` }}>
+              <ImagePlaceholder
+                borderRadius={data.borderRadius ?? 16}
+                aspectRatio={data.aspectRatio}
+              />
+            </div>
+          </div>
+        );
+      }
+
+      return (
+        <div
+          className="w-full flex pointer-events-none"
+          style={{ justifyContent: alignJustify }}
+        >
+          <div
+            style={{
+              width: `${data.width ?? 100}%`,
+              borderRadius: `${data.borderRadius ?? 16}px`,
+              overflow: "hidden",
+            }}
+            className={isAuto ? "" : aspectClass}
+          >
+            <img
+              src={data.src}
+              alt={data.alt || ""}
+              className={
+                isAuto
+                  ? "w-full h-auto block"
+                  : `w-full h-full object-${data.fit ?? "cover"}`
+              }
+              style={{ objectPosition: data.objectPosition ?? "50% 50%" }}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // ── Carousel ───────────────────────────────────────────────────────────────
+    case "carousel":
+      return <CarouselBlock data={data} />;
+
+    // ── Select ─────────────────────────────────────────────────────────────────
+    case "select":
+      return <SelectBlock data={data} />;
+
+    // ── Contact ────────────────────────────────────────────────────────────────
+    case "contact":
+      return <ContactBlock data={data} />;
+
+    // ── Text Input ─────────────────────────────────────────────────────────────
+    case "text-input":
+      return <TextInputBlock data={data} />;
+
+    // ── Rating ─────────────────────────────────────────────────────────────────
+    case "rating":
+      return <RatingBlock data={data} />;
+
+    // ── Button ─────────────────────────────────────────────────────────────────
+    case "button": {
+      const variantCls = {
+        filled: "bg-foreground text-background",
+        outline: "border-2 border-border text-foreground",
+        ghost: "text-foreground",
+      }[data.variant ?? "filled"];
+
+      const alignCls = {
+        left: "justify-start",
+        center: "justify-center",
+        right: "justify-end",
+      }[data.align ?? "center"];
+
+      return (
+        <div className={`w-full flex ${alignCls} pointer-events-none`}>
+          <div
+            style={{
+              backgroundColor:
+                data.variant === "filled" && data.bgColor
+                  ? data.bgColor
+                  : undefined,
+              color: data.textColor ?? undefined,
+              borderRadius: `${data.borderRadius ?? 16}px`,
+            }}
+            className={`flex items-center gap-2.5 px-8 py-4 font-bold text-base transition-all duration-200
+              ${variantCls} ${data.fullWidth ? "w-full justify-center" : ""}`}
+          >
+            {data.label || "Button"}
+          </div>
+        </div>
+      );
+    }
+
+    // ── Products ────────────────────────────────────────────────────────────────
+    case "products":
+      return <ProductsBlock data={data} />;
+
+    // ── Divider ────────────────────────────────────────────────────────────────
+    case "divider":
+      return (
+        <div className="w-full flex items-center justify-center py-4 pointer-events-none">
+          <hr
+            className="w-full opacity-60"
+            style={{
+              borderColor: data.color ?? "hsl(var(--border))",
+              borderTopWidth: data.thickness ?? 1,
+              borderStyle: data.style ?? "solid",
+            }}
+          />
+        </div>
+      );
+
+    // ── Spacer ─────────────────────────────────────────────────────────────────
+    case "spacer":
+      return (
+        <div
+          style={{ height: data.height }}
+          className="w-full flex items-center justify-center pointer-events-none select-none"
+        >
+          <div className="border border-dashed border-border/20 w-full h-full flex items-center justify-center bg-muted/10 rounded">
+            <span className="text-[10px] text-muted-foreground/30">
+              {data.height}px spacer
+            </span>
+          </div>
+        </div>
+      );
+
+    default:
+      return null;
+  }
+}
+
+
+==================================================
+FILE: CanvasEditor.tsx
+==================================================
+
+// components/canvas/CanvasEditor.tsx
+"use client";
+
+import { useState, useCallback, useRef } from "react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+  DragOverlay,
+  DragStartEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { v4 as uuidv4 } from "uuid";
+import { AIChatPanel } from "@/components/dashboard/FlowBuilder/flow/AIChatPanel";
+import { Wand2 } from "lucide-react";
+import {
+  Smartphone,
+  Tablet,
+  Monitor,
+  GripVertical,
+  Trash2,
+  Plus,
+  AlignLeft,
+  Image,
+  MousePointer2,
+  Minus,
+  ArrowUpDown,
+  GalleryHorizontal,
+  Heading1,
+  Heading2,
+  Heading3,
+  Eye,
+  Layers,
+  ListChecks,
+  UserRound,
+  MessageSquare,
+  Star,
+  ShoppingBag,
+} from "lucide-react";
+import type {
+  CanvasBlock,
+  CanvasStep,
+  CanvasFlow, // ← ADD THIS IMPORT
+  BlockData,
+  BlockType,
+  DeviceView,
+} from "@/types/canvas";
+import {
+  DEVICE_WIDTHS,
+  BLOCK_PALETTE,
+  createDefaultBlock,
+} from "@/types/canvas";
+import { BlockRenderer } from "./BlockRenderer";
+import { BlockInspector } from "./BlockInspector";
+import { FlowPlayer } from "./FlowPlayer";
+import { useStores } from "@/hooks/useStores";
+
+// ── Icon map ──────────────────────────────────────────────────────────────────
+
+const ICON_MAP: Record<string, React.ElementType> = {
+  Heading1,
+  Heading2,
+  Heading3,
+  AlignLeft,
+  Image,
+  GalleryHorizontal,
+  ListChecks,
+  UserRound,
+  MessageSquare,
+  Star,
+  MousePointer2,
+  ShoppingBag,
+  Minus,
+  ArrowUpDown,
+};
+
+// ── Device config ─────────────────────────────────────────────────────────────
+
+const DEVICE_CONFIG: Record<
+  DeviceView,
+  { Icon: React.ElementType; label: string; shortLabel: string }
+> = {
+  mobile: { Icon: Smartphone, label: "Mobile", shortLabel: "390px" },
+  tablet: { Icon: Tablet, label: "Tablet", shortLabel: "768px" },
+  desktop: { Icon: Monitor, label: "Desktop", shortLabel: "1280px" },
+};
+
+// ── Sortable block row ────────────────────────────────────────────────────────
+
+type SortableBlockRowProps = {
+  block: CanvasBlock;
+  isSelected: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+};
+
+function SortableBlockRow({
+  block,
+  isSelected,
+  onSelect,
+  onDelete,
+}: SortableBlockRowProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: block.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0 : 1,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} className="relative group/block">
+      {/* Floating toolbar */}
+      <div
+        className={`absolute -top-8 left-0 z-20 flex items-center gap-0.5
+          bg-popover border border-border/80 rounded-lg shadow-lg px-1.5 py-1
+          backdrop-blur-sm transition-opacity duration-150
+          ${isSelected ? "opacity-100" : "opacity-0 group-hover/block:opacity-100"}`}
+      >
+        <button
+          {...attributes}
+          {...listeners}
+          className="p-1 cursor-grab active:cursor-grabbing text-muted-foreground/50
+            hover:text-foreground transition-colors rounded"
+          onClick={(e) => e.stopPropagation()}
+          title="Drag to reorder"
+        >
+          <GripVertical className="w-3.5 h-3.5" />
+        </button>
+
+        <div className="w-px h-3.5 bg-border mx-0.5" />
+
+        <span className="text-[10px] font-medium text-muted-foreground/60 px-1 select-none">
+          {block.data.type}
+        </span>
+
+        <div className="w-px h-3.5 bg-border mx-0.5" />
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete();
+          }}
+          className="p-1 text-muted-foreground/50 hover:text-destructive transition-colors rounded"
+          title="Delete block"
+        >
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Block wrapper */}
+      <div
+        onClick={onSelect}
+        className={`relative rounded-lg transition-all duration-150 cursor-pointer
+          ${
+            isSelected
+              ? "ring-2 ring-primary shadow-[0_0_0_4px_hsl(var(--primary)/0.1)]"
+              : "ring-1 ring-transparent hover:ring-border/60"
+          }`}
+      >
+        {isSelected && (
+          <div
+            className="absolute -left-2 top-1/2 -translate-y-1/2 w-1 h-6
+            bg-primary rounded-full z-10"
+          />
+        )}
+        <BlockRenderer block={block} />
+      </div>
+    </div>
+  );
+}
+
+// ── Drag overlay ghost ────────────────────────────────────────────────────────
+
+function DragGhost({ block }: { block: CanvasBlock }) {
+  return (
+    <div
+      className="bg-background border-2 border-primary/40 rounded-lg shadow-2xl
+      opacity-90 px-4 py-2 pointer-events-none max-w-[320px]"
+    >
+      <div className="flex items-center gap-2">
+        <GripVertical className="w-4 h-4 text-primary/60" />
+        <span className="text-xs font-medium text-foreground/70">
+          {block.data.type}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ── Empty canvas state ────────────────────────────────────────────────────────
+
+function EmptyCanvas({
+  onAddBlock,
+}: {
+  onAddBlock: (type: BlockType) => void;
+}) {
+  const quickAdd: {
+    type: BlockType;
+    label: string;
+    icon: React.ElementType;
+  }[] = [
+    { type: "h1", label: "Heading", icon: Heading1 },
+    { type: "paragraph", label: "Text", icon: AlignLeft },
+    { type: "image", label: "Image", icon: Image },
+    { type: "select", label: "Select", icon: ListChecks },
+    { type: "button", label: "Button", icon: MousePointer2 },
+    { type: "products", label: "Products", icon: ShoppingBag },
+  ];
+
+  return (
+    <div
+      className="flex flex-col items-center justify-center min-h-[500px]
+      gap-6 select-none px-6"
+    >
+      <div
+        className="w-16 h-16 rounded-2xl border-2 border-dashed border-border
+        flex items-center justify-center bg-muted/30"
+      >
+        <Layers className="w-7 h-7 text-muted-foreground/40" />
+      </div>
+
+      <div className="text-center">
+        <p className="text-sm font-semibold text-foreground/70">
+          Canvas is empty
+        </p>
+        <p className="text-xs text-muted-foreground/50 mt-1">
+          Add a block from the left panel or quick-add below
+        </p>
+      </div>
+
+      <div className="flex flex-wrap justify-center gap-2">
+        {quickAdd.map(({ type, label, icon: Icon }) => (
+          <button
+            key={type}
+            onClick={() => onAddBlock(type)}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border
+              bg-background hover:border-primary/40 hover:bg-primary/5
+              text-xs font-medium text-foreground/60 hover:text-primary transition-all"
+          >
+            <Icon className="w-3.5 h-3.5" />
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Bottom quick-add bar config ───────────────────────────────────────────────
+
+const BOTTOM_QUICK_ADD: { type: BlockType; icon: React.ElementType }[] = [
+  { type: "h1", icon: Heading1 },
+  { type: "paragraph", icon: AlignLeft },
+  { type: "image", icon: Image },
+  { type: "select", icon: ListChecks },
+  { type: "button", icon: MousePointer2 },
+  { type: "products", icon: ShoppingBag },
+];
+
+// ── Main CanvasEditor ─────────────────────────────────────────────────────────
+
+type CanvasEditorProps = {
+  flow?: CanvasFlow; // ← ADD: full flow object (needed by FlowPlayer in preview)
+  step: CanvasStep;
+  allSteps: CanvasStep[];
+  storeId?: string; // ← ADD: active store ID (needed for tag/product pickers + preview)
+  onChange: (updated: CanvasStep) => void;
+};
+
+export function CanvasEditor({
+  flow, // ← destructure
+  step,
+  allSteps,
+  storeId, // ← destructure
+  onChange,
+}: CanvasEditorProps) {
+  const [device, setDevice] = useState<DeviceView>("mobile");
+  const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
+  const [activeBlock, setActiveBlock] = useState<CanvasBlock | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isFirstMount = useRef(true);
+
+  const { products } = useStores();
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const selectedBlock =
+    step.blocks.find((b) => b.id === selectedBlockId) ?? null;
+  const canvasWidth = DEVICE_WIDTHS[device];
+
+  const routingSteps = allSteps
+    .filter((s) => s.id !== step.id)
+    .map((s) => ({ id: s.id, label: s.label }));
+
+  // ── Block mutations ─────────────────────────────────────────────────────────
+
+  const addBlock = useCallback(
+    (type: BlockType) => {
+      const newBlock: CanvasBlock = {
+        id: uuidv4(),
+        data: createDefaultBlock(type),
+      };
+      onChange({ ...step, blocks: [...step.blocks, newBlock] });
+      setSelectedBlockId(newBlock.id);
+      setTimeout(() => {
+        canvasRef.current?.scrollTo({
+          top: canvasRef.current.scrollHeight,
+          behavior: "smooth",
+        });
+      }, 50);
+    },
+    [step, onChange],
+  );
+
+  const updateBlock = useCallback(
+    (blockId: string, data: BlockData) => {
+      onChange({
+        ...step,
+        blocks: step.blocks.map((b) => (b.id === blockId ? { ...b, data } : b)),
+      });
+    },
+    [step, onChange],
+  );
+
+  const deleteBlock = useCallback(
+    (blockId: string) => {
+      onChange({
+        ...step,
+        blocks: step.blocks.filter((b) => b.id !== blockId),
+      });
+      if (selectedBlockId === blockId) setSelectedBlockId(null);
+    },
+    [step, onChange, selectedBlockId],
+  );
+
+  // ── Drag handlers ───────────────────────────────────────────────────────────
+
+  const handleDragStart = (event: DragStartEvent) => {
+    const block = step.blocks.find((b) => b.id === event.active.id);
+    setActiveBlock(block ?? null);
+  };
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      setActiveBlock(null);
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+      const oldIdx = step.blocks.findIndex((b) => b.id === active.id);
+      const newIdx = step.blocks.findIndex((b) => b.id === over.id);
+      if (oldIdx === -1 || newIdx === -1) return;
+      onChange({ ...step, blocks: arrayMove(step.blocks, oldIdx, newIdx) });
+    },
+    [step, onChange],
+  );
+
+  const handleCanvasClick = () => setSelectedBlockId(null);
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  return (
+    <div className="flex flex-col h-full bg-muted/10 overflow-hidden w-full">
+      {/* ── TOP BAR ── */}
+      <div
+        className="flex items-center justify-between px-4 py-2.5
+        bg-background border-b border-border shrink-0 gap-4"
+      >
+        {/* Step label */}
+        <div className="flex items-center gap-2 min-w-0">
+          <Layers className="w-4 h-4 text-muted-foreground/50 shrink-0" />
+          <p className="text-sm font-semibold text-foreground/80 truncate">
+            {step.label}
+          </p>
+          <span className="text-xs text-muted-foreground/40 shrink-0">
+            {step.blocks.length} block{step.blocks.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+
+        {/* Device toggle */}
+        <div className="flex items-center gap-1 bg-muted/60 rounded-xl p-1 shrink-0">
+          {(
+            Object.entries(DEVICE_CONFIG) as [
+              DeviceView,
+              (typeof DEVICE_CONFIG)[DeviceView],
+            ][]
+          ).map(([key, { Icon, label, shortLabel }]) => (
+            <button
+              key={key}
+              onClick={() => setDevice(key)}
+              title={`${label} (${shortLabel})`}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs
+                font-medium transition-all duration-200
+                ${
+                  device === key
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground/50 hover:text-foreground"
+                }`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{label}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Preview toggle */}
+        <button
+          onClick={() => setShowPreview((v) => !v)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs
+            font-medium border transition-all shrink-0
+            ${
+              showPreview
+                ? "bg-primary text-primary-foreground border-primary"
+                : "border-border text-muted-foreground hover:text-foreground hover:border-primary/40"
+            }`}
+        >
+          <Eye className="w-3.5 h-3.5" />
+          Preview
+        </button>
+      </div>
+
+      {/* ── BODY ── */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* ── LEFT: Block palette ── */}
+        {!showPreview && (
+          <div
+            className="w-[188px] shrink-0 border-r border-border bg-background
+            overflow-y-auto flex flex-col"
+          >
+            <div className="p-3 space-y-5">
+              {BLOCK_PALETTE.map(({ group, items }) => (
+                <div key={group}>
+                  <p
+                    className="text-[9px] font-bold text-muted-foreground/50
+                    uppercase tracking-widest mb-2 px-1"
+                  >
+                    {group}
+                  </p>
+                  <div className="space-y-0.5">
+                    {items.map(({ type, label, description, iconName }) => {
+                      const Icon = ICON_MAP[iconName] ?? AlignLeft;
+                      return (
+                        <button
+                          key={type}
+                          onClick={() => addBlock(type)}
+                          className="w-full flex items-center gap-2.5 px-2.5 py-2
+                            rounded-lg text-left group transition-all
+                            hover:bg-primary/5 hover:border-primary/20
+                            border border-transparent"
+                        >
+                          <div
+                            className="w-7 h-7 rounded-md bg-muted/60
+                            border border-border flex items-center justify-center
+                            shrink-0 group-hover:bg-primary/10
+                            group-hover:border-primary/30 transition-all"
+                          >
+                            <Icon
+                              className="w-3.5 h-3.5 text-muted-foreground/60
+                              group-hover:text-primary transition-colors"
+                            />
+                          </div>
+                          <div className="min-w-0">
+                            <p
+                              className="text-xs font-semibold text-foreground/70
+                              group-hover:text-foreground leading-tight transition-colors"
+                            >
+                              {label}
+                            </p>
+                            <p
+                              className="text-[10px] text-muted-foreground/40
+                              leading-tight mt-0.5 truncate"
+                            >
+                              {description}
+                            </p>
+                          </div>
+                          <Plus
+                            className="w-3 h-3 ml-auto text-muted-foreground/20
+                            group-hover:text-primary shrink-0 transition-colors"
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Bottom tip */}
+            <div className="mt-auto p-3 border-t border-border/50">
+              <p className="text-[10px] text-muted-foreground/40 text-center leading-relaxed">
+                Click any block to add it to the canvas
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ── CENTER: Canvas ── */}
+        <div
+          ref={canvasRef}
+          className={`flex-1 overflow-auto transition-colors ${
+            showPreview ? "bg-muted/20" : "bg-muted/30"
+          }`}
+        >
+          <div
+            className={`flex py-10 min-h-full
+            ${device === "mobile" ? "justify-center px-4" : "justify-center px-6"}`}
+          >
+            <div
+              style={{
+                width: device === "mobile" ? "100%" : canvasWidth,
+                maxWidth: device === "mobile" ? 390 : "100%",
+                margin: "0 auto",
+                transition: "width 0.3s cubic-bezier(0.4,0,0.2,1)",
+              }}
+            >
+              {/* Width label — hidden in preview */}
+              {!showPreview && (
+                <div className="flex items-center justify-center mb-3 gap-2">
+                  <div className="flex-1 h-px bg-border/40" />
+                  <span className="text-[10px] text-muted-foreground/40 font-mono shrink-0">
+                    {DEVICE_CONFIG[device].label} — {canvasWidth}px
+                  </span>
+                  <div className="flex-1 h-px bg-border/40" />
+                </div>
+              )}
+
+              {/* The white page canvas */}
+              <div
+                onClick={handleCanvasClick}
+                className={`bg-card min-h-[600px] transition-all duration-300 ${
+                  showPreview
+                    ? "rounded-none shadow-none"
+                    : "rounded-2xl shadow-[0_8px_40px_rgba(0,0,0,0.06)] border border-border/40"
+                }`}
+              >
+                {step.blocks.length === 0 && !showPreview ? (
+                  <EmptyCanvas onAddBlock={addBlock} />
+                ) : (
+                  <div
+                    className={showPreview ? "" : "p-5 sm:p-7"}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    {showPreview ? (
+                      flow ? (
+                        <FlowPlayer
+                          key={`preview-${flow.id}`} // showPreview in key not needed — component only mounts when showPreview=true
+                          flow={flow}
+                          formId={flow.id}
+                          storeId={storeId}
+                          allProducts={products}
+                          showBanner={false}
+                          allowReset={true}
+                          isPreview={true}
+                        />
+                      ) : (
+                        // flow not ready yet — shouldn't normally be visible but safe fallback
+                        <div className="flex flex-col items-center justify-center min-h-[400px] gap-3">
+                          <div className="w-8 h-8 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
+                          <p className="text-sm text-muted-foreground/50">
+                            Loading preview...
+                          </p>
+                        </div>
+                      )
+                    ) : (
+                      // ── Edit mode ──────────────────────────────────────────
+                      <div className="p-5 sm:p-7">
+                        <DndContext
+                          sensors={sensors}
+                          collisionDetection={closestCenter}
+                          onDragStart={handleDragStart}
+                          onDragEnd={handleDragEnd}
+                        >
+                          <SortableContext
+                            items={step.blocks.map((b) => b.id)}
+                            strategy={verticalListSortingStrategy}
+                          >
+                            <div className="space-y-5 pt-3">
+                              {step.blocks.map((block) => (
+                                <SortableBlockRow
+                                  key={block.id}
+                                  block={block}
+                                  isSelected={selectedBlockId === block.id}
+                                  onSelect={() => setSelectedBlockId(block.id)}
+                                  onDelete={() => deleteBlock(block.id)}
+                                />
+                              ))}
+                            </div>
+                          </SortableContext>
+
+                          <DragOverlay dropAnimation={null}>
+                            {activeBlock && <DragGhost block={activeBlock} />}
+                          </DragOverlay>
+                        </DndContext>
+
+                        {/* Bottom quick-add bar */}
+                        {step.blocks.length > 0 && (
+                          <div className="mt-6 pt-4 border-t border-dashed border-border/40">
+                            <div className="flex flex-wrap gap-2 justify-center">
+                              {BOTTOM_QUICK_ADD.map(({ type, icon: Icon }) => (
+                                <button
+                                  key={type}
+                                  onClick={() => addBlock(type)}
+                                  className="flex items-center gap-1.5 px-3 py-1.5
+                                    rounded-full border border-dashed border-border/60
+                                    text-[11px] text-muted-foreground/50
+                                    hover:border-primary/40 hover:text-primary
+                                    hover:bg-primary/5 transition-all"
+                                >
+                                  <Icon className="w-3 h-3" />
+                                  {type}
+                                </button>
+                              ))}
+                              <button
+                                onClick={() => setSelectedBlockId(null)}
+                                className="flex items-center gap-1.5 px-3 py-1.5
+                                  rounded-full border border-dashed border-primary/40
+                                  text-[11px] text-primary/60 hover:text-primary
+                                  hover:bg-primary/5 transition-all"
+                              >
+                                <Plus className="w-3 h-3" />
+                                More blocks
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Bottom scroll hint — hidden in preview */}
+              {!showPreview && (
+                <div className="flex items-center justify-center mt-3 gap-2">
+                  <div className="flex-1 h-px bg-border/40" />
+                  <span className="text-[10px] text-muted-foreground/30 font-mono shrink-0">
+                    ↕ scroll to see more
+                  </span>
+                  <div className="flex-1 h-px bg-border/40" />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* ── RIGHT: Block inspector ── */}
+        <div
+          className={`shrink-0 border-l border-border bg-background overflow-hidden
+            flex flex-col transition-all duration-300 ease-in-out
+            ${selectedBlock && !showPreview ? "w-[300px]" : "w-0 border-0"}`}
+        >
+          {selectedBlock && !showPreview && (
+            <BlockInspector
+              block={selectedBlock}
+              onChange={(data) => updateBlock(selectedBlock.id, data)}
+              onDelete={() => deleteBlock(selectedBlock.id)}
+              steps={routingSteps}
+              storeId={storeId} // ← pass storeId so tag/product pickers work in inspector too
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+==================================================
+FILE: FlowPlayer.tsx
+==================================================
+
+// components/canvas/FlowPlayer.tsx
+"use client";
+
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import dynamic from "next/dynamic";
+import { flowLog } from "@/lib/flowLogger";
+import { Bookmark, CheckCircle2, Loader2Icon, User } from "lucide-react";
+import { useSavedItems } from "@/hooks/useSavedItems";
+
+const DevConsole =
+  process.env.NODE_ENV === "development"
+    ? dynamic(
+        () =>
+          import("@/components/dev/DevConsole").then((m) => ({
+            default: m.DevConsole,
+          })),
+        { ssr: false },
+      )
+    : null;
+
+import {
+  Star,
+  ThumbsUp,
+  ThumbsDown,
+  ChevronLeft,
+  ChevronRight,
+  Check,
+  ShoppingBag,
+  Loader2,
+  ArrowRight,
+  ExternalLink,
+  Eye,
+} from "lucide-react";
+
+import type {
+  HeadingBlockData,
+  ParagraphBlockData,
+  ImageBlockData,
+  CarouselBlockData,
+  SelectBlockData,
+  SelectOption,
+  ContactBlockData,
+  TextInputBlockData,
+  RatingBlockData,
+  ButtonBlockData,
+  ProductsBlockData,
+  DividerBlockData,
+  SpacerBlockData,
+  CanvasFlow,
+  CanvasStep,
+} from "@/types/canvas";
+import {
+  useFlowSession,
+  type ContactData,
+  type FlowSessionActions,
+  type FlowSessionState,
+} from "@/hooks/useFlowSessions";
+import type { Product } from "@/types/mirour";
+import { BookmarkButton } from "../flow/BookmarkButton";
+import {
+  getLocalCustomer,
+  LocalCustomerProfile,
+  saveCustomerLocally,
+} from "@/lib/customerSession";
+import { FloatingProfileBar } from "../flow/FloatingProfileBar";
+import { CustomerProfileDrawer } from "../flow/CustomerLoginModal";
+
+// ── Props ─────────────────────────────────────────────────────────────────────
+
+export interface FlowPlayerProps {
+  flow: CanvasFlow;
+  formId: string;
+  storeId?: string;
+  allProducts?: Product[];
+  redemptionCode?: string;
+  onComplete?: (responseId: string) => void;
+  showBanner?: boolean;
+  allowReset?: boolean;
+  isPreview?: boolean;
+}
+
+type Session = FlowSessionState & FlowSessionActions;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// READ-ONLY BLOCK RENDERERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function HeadingPlayer({ data }: { data: HeadingBlockData }) {
+  const Tag = data.type as "h1" | "h2" | "h3";
+  const cls =
+    data.type === "h1"
+      ? "text-2xl sm:text-3xl font-extrabold tracking-tight leading-tight"
+      : data.type === "h2"
+        ? "text-xl sm:text-2xl font-bold tracking-tight leading-snug"
+        : "text-lg sm:text-xl font-semibold tracking-tight leading-snug";
+
+  return (
+    <Tag
+      className={`${cls} text-foreground/90`}
+      style={{ textAlign: data.align, color: data.color ?? undefined }}
+    >
+      {data.text}
+    </Tag>
+  );
+}
+
+function ParagraphPlayer({ data }: { data: ParagraphBlockData }) {
+  return (
+    <p
+      className="leading-relaxed text-foreground/70 sm:text-base text-sm font-medium"
+      style={{
+        textAlign: data.align,
+        color: data.color ?? undefined,
+        fontSize: data.fontSize ? `${data.fontSize}px` : undefined,
+      }}
+    >
+      {data.text}
+    </p>
+  );
+}
+
+const RATIO_CLASS: Record<string, string> = {
+  "1:1": "aspect-square",
+  "16:9": "aspect-video",
+  "4:3": "aspect-[4/3]",
+  "3:2": "aspect-[3/2]",
+  auto: "aspect-auto",
+};
+
+function ImagePlayer({ data }: { data: ImageBlockData }) {
+  if (!data.src) return null;
+
+  const alignJustify =
+    data.align === "left"
+      ? "flex-start"
+      : data.align === "right"
+        ? "flex-end"
+        : "center";
+  const isAuto = data.aspectRatio === "auto";
+  const aspect = isAuto
+    ? ""
+    : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
+
+  return (
+    <div className="w-full flex" style={{ justifyContent: alignJustify }}>
+      <div
+        style={{
+          width: `${data.width ?? 100}%`,
+          borderRadius: `${data.borderRadius ?? 16}px`,
+          overflow: "hidden",
+        }}
+        className={isAuto ? "" : aspect}
+      >
+        <img
+          src={data.src}
+          alt={data.alt ?? ""}
+          className={
+            isAuto
+              ? "w-full h-auto block"
+              : `w-full h-full object-${data.fit ?? "cover"}`
+          }
+          style={{ objectPosition: data.objectPosition ?? "50% 50%" }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function DividerPlayer({ data }: { data: DividerBlockData }) {
+  return (
+    <div className="w-full flex items-center justify-center py-4">
+      <hr
+        className="w-full opacity-60"
+        style={{
+          borderColor: data.color ?? "hsl(var(--border))",
+          borderTopWidth: data.thickness ?? 1,
+          borderStyle: data.style ?? "solid",
+        }}
+      />
+    </div>
+  );
+}
+
+function SpacerPlayer({ data }: { data: SpacerBlockData }) {
+  return <div style={{ height: data.height }} aria-hidden="true" />;
+}
+
+// ── CarouselPlayer ────────────────────────────────────────────────────────────
+
+function CarouselPlayer({ data }: { data: CarouselBlockData }) {
+  const [idx, setIdx] = useState(0);
+  const items = data.items ?? [];
+  if (items.length === 0) return null;
+
+  const alignJustify =
+    data.align === "left"
+      ? "flex-start"
+      : data.align === "right"
+        ? "flex-end"
+        : "center";
+  const isAuto = data.aspectRatio === "auto";
+  const aspect = isAuto
+    ? ""
+    : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
+  const prev = () => setIdx((i) => (i - 1 + items.length) % items.length);
+  const next = () => setIdx((i) => (i + 1) % items.length);
+
+  return (
+    <div className="w-full flex" style={{ justifyContent: alignJustify }}>
+      <div
+        className="relative group"
+        style={{ width: `${data.width ?? 100}%` }}
+      >
+        <div
+          className={`w-full overflow-hidden shadow-sm border border-border/20 relative bg-muted/20 ${aspect}`}
+          style={{ borderRadius: `${data.borderRadius ?? 16}px` }}
+        >
+          <img
+            key={items[idx].src}
+            src={items[idx].src}
+            alt={items[idx].alt ?? ""}
+            className={
+              isAuto
+                ? "w-full h-auto block transition-opacity duration-500 ease-in-out"
+                : "w-full h-full object-cover transition-opacity duration-500 ease-in-out"
+            }
+            style={{ objectPosition: data.objectPosition ?? "50% 50%" }}
+          />
+
+          {/* Subtle gradient overlay for better arrow visibility */}
+          {data.showArrows && items.length > 1 && (
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent to-black/5 pointer-events-none" />
+          )}
+        </div>
+
+        {data.showArrows && items.length > 1 && (
+          <>
+            <button
+              onClick={prev}
+              className="absolute left-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full
+                bg-background/80 backdrop-blur-md text-foreground shadow-sm flex items-center justify-center hover:bg-background transition-all opacity-0 group-hover:opacity-100 sm:flex hidden active:scale-95"
+              aria-label="Previous image"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
+            <button
+              onClick={next}
+              className="absolute right-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full
+                bg-background/80 backdrop-blur-md text-foreground shadow-sm flex items-center justify-center hover:bg-background transition-all opacity-0 group-hover:opacity-100 sm:flex hidden active:scale-95"
+              aria-label="Next image"
+            >
+              <ChevronRight className="w-5 h-5" />
+            </button>
+          </>
+        )}
+
+        {data.showDots && items.length > 1 && (
+          <div className="flex justify-center gap-2 mt-4">
+            {items.map((_, i) => (
+              <button
+                key={i}
+                onClick={() => setIdx(i)}
+                aria-label={`Go to slide ${i + 1}`}
+                className={`h-1.5 rounded-full transition-all duration-300 ${
+                  i === idx
+                    ? "w-6 bg-foreground/80"
+                    : "w-1.5 bg-border hover:bg-border/80"
+                }`}
+              />
+            ))}
+          </div>
+        )}
+
+        {items[idx].caption && (
+          <p className="text-sm text-center font-medium text-muted-foreground/70 mt-3">
+            {items[idx].caption}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── SelectPlayer ──────────────────────────────────────────────────────────────
+
+interface SelectPlayerProps {
+  data: SelectBlockData;
+  blockId: string;
+  onSingleSelect: (opt: SelectOption) => void;
+  onMultiSubmit: (optionIds: string[], tags: string[]) => void;
+}
+
+function SelectPlayer({
+  data,
+  onSingleSelect,
+  onMultiSubmit,
+}: SelectPlayerProps) {
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const isMulti = data.selectionMode === "multi";
+  const isGrid = data.layout === "grid";
+
+  const handleMultiToggle = (optId: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(optId) ? next.delete(optId) : next.add(optId);
+      return next;
+    });
+  };
+
+  const handleMultiSubmit = () => {
+    if (selected.size === 0) return;
+    const selectedOpts = data.options.filter((o) => selected.has(o.id));
+    const allTags = [...new Set(selectedOpts.flatMap((o) => o.tags))];
+    onMultiSubmit([...selected], allTags);
+  };
+
+  return (
+    <div className="w-full space-y-5">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug">
+          {data.question}
+        </p>
+      )}
+      <div className={isGrid ? "grid grid-cols-2 gap-3" : "space-y-3"}>
+        {data.options.map((opt) => {
+          const isSel = selected.has(opt.id);
+          return (
+            <button
+              key={opt.id}
+              onClick={() =>
+                isMulti ? handleMultiToggle(opt.id) : onSingleSelect(opt)
+              }
+              className={`w-full flex items-center gap-4 p-4 sm:p-5 rounded-2xl border transition-all duration-200 active:scale-[0.98] group
+                ${isGrid ? "flex-col text-center justify-center min-h-[120px]" : "justify-between"}
+                ${
+                  isSel
+                    ? "border-primary bg-primary/5 shadow-[0_4px_14px_rgba(0,0,0,0.03)]"
+                    : "border-border/60 bg-card hover:border-primary/30 hover:shadow-sm"
+                }`}
+            >
+              <div
+                className={`flex items-center gap-4 ${isGrid ? "flex-col" : "w-full"}`}
+              >
+                {!isGrid && (
+                  <div className="shrink-0">
+                    {isMulti ? (
+                      <div
+                        className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${isSel ? "bg-primary border-primary" : "border-muted-foreground/30 bg-background group-hover:border-primary/50"}`}
+                      >
+                        {isSel && (
+                          <Check className="w-3.5 h-3.5 text-primary-foreground stroke-[3]" />
+                        )}
+                      </div>
+                    ) : (
+                      <div
+                        className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors
+                          ${isSel ? "border-primary" : "border-muted-foreground/30 group-hover:border-primary/50"}`}
+                      >
+                        {isSel && (
+                          <div className="w-2.5 h-2.5 rounded-full bg-primary animate-in zoom-in-50 duration-200" />
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {opt.imageUrl && (
+                  <img
+                    src={opt.imageUrl}
+                    alt=""
+                    className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${isGrid ? "w-14 h-14" : "w-10 h-10"}`}
+                  />
+                )}
+
+                <span
+                  className={`font-semibold text-foreground/90 ${
+                    isGrid
+                      ? "text-sm leading-tight"
+                      : "flex-1 text-left text-sm"
+                  }`}
+                >
+                  {opt.label}
+                </span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      {isMulti && (
+        <button
+          onClick={handleMultiSubmit}
+          disabled={selected.size === 0}
+          className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 hover:shadow-lg transition-all duration-200 active:scale-95 disabled:opacity-40 disabled:pointer-events-none disabled:hover:shadow-none"
+        >
+          Continue
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ── TextInputPlayer ───────────────────────────────────────────────────────────
+
+function TextInputPlayer({
+  data,
+  onSubmit,
+  onChange,
+}: {
+  data: TextInputBlockData;
+  onSubmit: (value: string) => void;
+  onChange: (value: string) => void;
+}) {
+  const [value, setValue] = useState("");
+  const canSubmit = !data.required || value.trim().length > 0;
+
+  return (
+    <div className="w-full space-y-5 animate-in fade-in slide-in-from-bottom-2 duration-300">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug">
+          {data.question}
+        </p>
+      )}
+      {data.multiline ? (
+        <textarea
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            onChange(e.target.value); // Sync with session immediately
+          }}
+          placeholder={data.placeholder}
+          rows={5}
+          className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 resize-none focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm"
+        />
+      ) : (
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            onChange(e.target.value); // Sync with session immediately
+          }}
+          placeholder={data.placeholder}
+          onKeyDown={(e) =>
+            e.key === "Enter" && canSubmit && onSubmit(value.trim())
+          }
+          className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm"
+        />
+      )}
+    </div>
+  );
+}
+
+// ── RatingPlayer ──────────────────────────────────────────────────────────────
+
+function RatingPlayer({
+  data,
+  onSubmit,
+}: {
+  data: RatingBlockData;
+  onSubmit: (value: number) => void;
+}) {
+  const [hovered, setHovered] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number | null>(null);
+
+  const handleSelect = (value: number) => {
+    setSelected(value);
+    // Slight delay to let the user see their selection before auto-advancing
+    setTimeout(() => onSubmit(value), 300);
+  };
+
+  if (data.ratingType === "thumbs") {
+    return (
+      <div className="w-full space-y-5">
+        {data.question && (
+          <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug text-center">
+            {data.question}
+          </p>
+        )}
+        <div className="flex gap-4 justify-center">
+          {[
+            {
+              value: 1,
+              Icon: ThumbsUp,
+              label: "Yes",
+              active:
+                "border-emerald-500 bg-emerald-50 text-emerald-700 shadow-sm",
+            },
+            {
+              value: 0,
+              Icon: ThumbsDown,
+              label: "No",
+              active: "border-red-500 bg-red-50 text-red-700 shadow-sm",
+            },
+          ].map(({ value, Icon, label, active }) => (
+            <button
+              key={value}
+              onClick={() => handleSelect(value)}
+              className={`flex flex-col items-center justify-center gap-3 w-32 h-32 rounded-3xl border-2
+                font-semibold text-base transition-all duration-200 active:scale-95 group
+                ${selected === value ? active : "border-border/60 bg-card hover:border-border text-foreground/70"}`}
+            >
+              <Icon
+                className={`w-8 h-8 transition-transform ${selected === value ? "scale-110" : "group-hover:scale-110"}`}
+              />
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  const max = data.maxStars ?? 5;
+  const active = hovered ?? selected ?? 0;
+
+  return (
+    <div className="w-full space-y-6">
+      {data.question && (
+        <p className="text-lg sm:text-xl font-bold text-foreground tracking-tight leading-snug text-center">
+          {data.question}
+        </p>
+      )}
+      <div className="flex items-center justify-center gap-2 sm:gap-3">
+        {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+          <button
+            key={n}
+            onMouseEnter={() => setHovered(n)}
+            onMouseLeave={() => setHovered(null)}
+            onClick={() => handleSelect(n)}
+            className="transition-transform hover:scale-110 active:scale-90 p-1"
+          >
+            <Star
+              className={`w-10 h-10 sm:w-12 sm:h-12 transition-all duration-200 ${
+                n <= active
+                  ? "fill-amber-400 text-amber-400 drop-shadow-sm scale-110"
+                  : "fill-none text-muted-foreground/30 hover:text-muted-foreground/50"
+              }`}
+            />
+          </button>
+        ))}
+      </div>
+      {(data.minLabel || data.maxLabel) && (
+        <div className="flex justify-between px-2 text-sm font-medium text-muted-foreground/60">
+          <span>{data.minLabel}</span>
+          <span>{data.maxLabel}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ButtonPlayer ──────────────────────────────────────────────────────────────
+
+function ButtonPlayer({
+  data,
+  onAdvance,
+}: {
+  data: ButtonBlockData;
+  onAdvance: (nextStepId?: string) => void;
+}) {
+  const variantCls = {
+    filled:
+      "bg-foreground text-background hover:bg-foreground/90 hover:shadow-lg",
+    outline: "border-2 border-border text-foreground hover:bg-muted/50",
+    ghost: "text-foreground hover:bg-muted/50",
+  }[data.variant];
+
+  const alignCls = {
+    left: "justify-start",
+    center: "justify-center",
+    right: "justify-end",
+  }[data.align];
+
+  return (
+    <div className={`w-full flex ${alignCls}`}>
+      <button
+        onClick={() => {
+          if (data.action === "link" && data.href) {
+            window.open(data.href, "_blank", "noopener,noreferrer");
+          } else {
+            onAdvance(data.nextStepId);
+          }
+        }}
+        style={{
+          backgroundColor:
+            data.variant === "filled" && data.bgColor
+              ? data.bgColor
+              : undefined,
+          color: data.textColor ?? undefined,
+          borderRadius: `${data.borderRadius ?? 16}px`,
+        }}
+        className={`flex items-center gap-2.5 px-8 py-4 font-bold text-base
+          transition-all duration-200 active:scale-95 ${variantCls}
+          ${data.fullWidth ? "w-full justify-center" : ""}`}
+      >
+        {data.label}
+
+        {/* <ArrowRight className="w-4 h-4" /> */}
+      </button>
+    </div>
+  );
+}
+
+// ── ContactBlockPlayer ────────────────────────────────────────────────────────
+
+function ContactBlockPlayer({
+  data,
+  onSubmit,
+  onSkip,
+  onAdvance,
+  customerId,
+  isSubmitting,
+  isPreview,
+}: {
+  data: ContactBlockData;
+  onSubmit: (d: ContactData) => Promise<{ error: string | null }>;
+  onSkip?: () => void;
+  onAdvance?: () => void;
+  customerId?: string | null;
+  isSubmitting: boolean;
+  isPreview?: boolean;
+}) {
+  const [fields, setFields] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    phone: "",
+  });
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [commitStatus, setCommitStatus] = useState<"idle" | "saving" | "done">(
+    "idle",
+  );
+  const autoSubmittedRef = useRef(false);
+
+  const localCustomer = useMemo(() => getLocalCustomer(), [customerId]);
+  const isKnownCustomer = !!customerId && !!localCustomer;
+
+  // ── Known customer — silent commit + auto-advance ─────────────────────────
+  useEffect(() => {
+    if (!isKnownCustomer) return;
+    if (autoSubmittedRef.current) return;
+    autoSubmittedRef.current = true;
+
+    const silentCommit = async () => {
+      setCommitStatus("saving");
+
+      const result = await onSubmit({
+        firstName: localCustomer!.firstname ?? undefined,
+        lastName:
+          localCustomer!.name?.split(" ").slice(1).join(" ") || undefined,
+        email: localCustomer!.email ?? undefined,
+        phone: localCustomer!.phone ?? undefined,
+      });
+
+      if (result.error) {
+        console.error(
+          "[ContactBlockPlayer] silent commit failed:",
+          result.error,
+        );
+      }
+
+      setCommitStatus("done");
+
+      // Small delay so user sees the ✅ before navigating
+      await new Promise((r) => setTimeout(r, 600));
+      onAdvance?.();
+    };
+
+    silentCommit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isKnownCustomer]);
+
+  // ── Known customer — loading screen ──────────────────────────────────────
+  if (isKnownCustomer) {
+    const displayName =
+      localCustomer!.firstname ??
+      localCustomer!.name?.split(" ")[0] ??
+      localCustomer!.email?.split("@")[0] ??
+      "there";
+
+    return (
+      <div className="w-full flex flex-col items-center justify-center gap-4 py-12 animate-in fade-in duration-300">
+        {/* show loading */}
+        <Loader2Icon className="w-8 h-8 animate-spin text-muted-foreground/40 shrink-0" />
+        <p className="text-sm text-muted-foreground">Saving your results…</p>
+      </div>
+    );
+  }
+
+  // ── Unknown customer — form UI ────────────────────────────────────────────
+  const f = data.fields;
+  const set =
+    (key: keyof typeof fields) => (e: React.ChangeEvent<HTMLInputElement>) =>
+      setFields((p) => ({ ...p, [key]: e.target.value }));
+
+  const handleSubmit = async () => {
+    setSubmitError(null);
+
+    if (f.firstName.enabled && f.firstName.required && !fields.firstName.trim())
+      return setSubmitError("Please enter your first name.");
+    if (f.lastName.enabled && f.lastName.required && !fields.lastName.trim())
+      return setSubmitError("Please enter your last name.");
+    if (f.email.enabled && f.email.required && !fields.email.trim())
+      return setSubmitError("Please enter your email address.");
+    if (f.phone.enabled && f.phone.required && !fields.phone.trim())
+      return setSubmitError("Please enter your phone number.");
+
+    const { error } = await onSubmit({
+      firstName: fields.firstName || undefined,
+      lastName: fields.lastName || undefined,
+      email: fields.email || undefined,
+      phone: fields.phone || undefined,
+    });
+
+    if (error) {
+      setSubmitError(error);
+      return;
+    }
+
+    onAdvance?.();
+  };
+
+  return (
+    <div className="w-full space-y-6 animate-in fade-in duration-300">
+      {data.heading && (
+        <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
+          {data.heading}
+        </p>
+      )}
+
+      {isPreview && (
+        <div className="flex items-center gap-2.5 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 shadow-sm">
+          <Eye className="w-4 h-4 shrink-0" />
+          <p className="text-sm font-medium">
+            Preview mode — your data will not be saved.
+          </p>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {f.firstName.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              First Name {f.firstName.required && "*"}
+            </label>
+            <input
+              type="text"
+              placeholder="Jane"
+              value={fields.firstName}
+              onChange={set("firstName")}
+              className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
+        {f.lastName.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Last Name {f.lastName.required && "*"}
+            </label>
+            <input
+              type="text"
+              placeholder="Doe"
+              value={fields.lastName}
+              onChange={set("lastName")}
+              className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
+        {f.email.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Email Address {f.email.required && "*"}
+            </label>
+            <input
+              type="email"
+              placeholder="jane@example.com"
+              value={fields.email}
+              onChange={set("email")}
+              className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
+        {f.phone.enabled && (
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
+              Phone Number {f.phone.required && "*"}
+            </label>
+            <input
+              type="tel"
+              placeholder="(555) 000-0000"
+              value={fields.phone}
+              onChange={set("phone")}
+              className="w-full px-5 py-4 rounded-2xl border border-border/60 bg-card text-base focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
+            />
+          </div>
+        )}
+      </div>
+
+      {submitError && (
+        <div className="p-3 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive text-sm font-medium animate-in shake">
+          {submitError}
+        </div>
+      )}
+
+      <div className="pt-2 space-y-3">
+        <button
+          onClick={handleSubmit}
+          disabled={isSubmitting}
+          className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 hover:shadow-lg transition-all duration-200 active:scale-95 disabled:opacity-60 flex items-center justify-center gap-2"
+        >
+          {isSubmitting && <Loader2 className="w-5 h-5 animate-spin" />}
+          {data.submitLabel || "Continue"}
+        </button>
+
+        {onSkip && (
+          <button
+            type="button"
+            onClick={onSkip}
+            className="w-full py-3 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+          >
+            {data.skipLabel ?? "Skip this step"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── ProductCard ───────────────────────────────────────────────────────────────
+interface ProductCardProps {
+  product: any;
+  compact: boolean;
+  showAddToCart?: boolean;
+  showTags?: boolean;
+  isSaved?: boolean; // NEW
+  onToggleSave?: (productId: string) => Promise<void>; // NEW
+}
+
+function ProductCard({
+  product,
+  compact,
+  showAddToCart,
+  showTags,
+  isSaved = false,
+  onToggleSave,
+}: ProductCardProps) {
+  const title = product.name ?? product.title ?? "Product";
+  const imageUrl = product.image_url ?? product.image_Url ?? null;
+  console.log(imageUrl);
+  const price = product.price ?? null;
+  const tags = product.tags ?? [];
+
+  console.log(product);
+
+  // ─── COMPACT card ────────────────────────────────────────────────────────
+  if (compact) {
+    return (
+      <div className="group rounded-2xl border border-border/50 bg-card overflow-hidden hover:shadow-md hover:border-border transition-all duration-300 flex flex-col h-full cursor-pointer">
+        {/* Image with bookmark overlay */}
+        <div className="aspect-square w-full overflow-hidden bg-muted/30 relative">
+          {imageUrl ? (
+            <img
+              src={imageUrl}
+              alt={title}
+              className="w-full h-full object-cover mix-blend-multiply group-hover:scale-105 transition-transform duration-500"
+            />
+          ) : (
+            <div className="w-full h-full flex items-center justify-center">
+              <ShoppingBag className="w-8 h-8 text-muted-foreground/20" />
+            </div>
+          )}
+          {/* Bookmark button top-right overlay */}
+          {/* {onToggleSave && (
+            <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+              <BookmarkButton
+                productId={product.id}
+                isSaved={isSaved}
+                onToggle={onToggleSave}
+                compact
+              />
+            </div>
+          )} */}
+          {/* Always show when saved */}
+          {/* {isSaved && onToggleSave && (
+            <div className="absolute top-2 right-2">
+              <BookmarkButton
+                productId={product.id}
+                isSaved={isSaved}
+                onToggle={onToggleSave}
+                compact
+              />
+            </div>
+          )} */}
+        </div>
+
+        <div className="p-3 flex flex-col gap-2 flex-1">
+          <p className="text-xs font-semibold text-foreground leading-tight line-clamp-2">
+            {title}
+          </p>
+          <p className="text-[10px] text-muted-foreground line-clamp-2">
+            {product.description}
+          </p>
+          <div className="mt-auto flex items-center justify-between">
+            {price && (
+              <p className="text-sm font-bold text-foreground/80">
+                ${Number(price).toFixed(2)}
+              </p>
+            )}
+          </div>
+          {/* {showAddToCart && (
+            <button className="mt-2 w-full py-2.5 rounded-xl bg-primary/5 text-primary text-sm font-bold hover:bg-primary/10 transition-colors active:scale-95">
+              Add to Bag
+            </button>
+          )} */}
+        </div>
+      </div>
+    );
+  }
+
+  // ─── LIST card ────────────────────────────────────────────────────────────
+  return (
+    <div className="group flex gap-4 rounded-2xl border border-border/50 bg-card p-4 hover:shadow-md hover:border-border transition-all duration-300 items-center cursor-pointer">
+      <div className="w-20 h-20 shrink-0 rounded-xl overflow-hidden bg-muted/30 relative">
+        {imageUrl ? (
+          <img
+            src={imageUrl}
+            alt={title}
+            className="w-full h-full object-cover mix-blend-multiply group-hover:scale-105 transition-transform duration-500"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <ShoppingBag className="w-6 h-6 text-muted-foreground/20" />
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 min-w-0 space-y-1">
+        <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
+          {title}
+        </p>
+        {price && (
+          <p className="text-sm font-bold text-foreground/80">
+            ${Number(price).toFixed(2)}
+          </p>
+        )}
+        {showTags && tags.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {tags.slice(0, 3).map((t: any) => (
+              <span
+                key={t.id ?? t}
+                className="text-[10px] uppercase font-semibold tracking-wider px-2 py-1 rounded-md bg-muted text-muted-foreground"
+              >
+                {t.name ?? t}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Bookmark on right side of list card */}
+      {/* {onToggleSave && (
+        <BookmarkButton
+          productId={product.id}
+          isSaved={isSaved}
+          onToggle={onToggleSave}
+        />
+      )} */}
+
+      {/* {showAddToCart && (
+        <button className="shrink-0 px-5 py-2.5 rounded-xl bg-primary/5 text-primary text-sm font-bold hover:bg-primary/10 transition-colors active:scale-95">
+          Add
+        </button>
+      )} */}
+    </div>
+  );
+}
+
+// ── ProductsPlayer ────────────────────────────────────────────────────────────
+interface ProductsPlayerProps {
+  data: ProductsBlockData;
+  accumulatedTags: string[];
+  formId: string;
+  // NEW
+  savedProductIds?: Set<string>;
+  onToggleSave?: (productId: string) => Promise<void>;
+}
+function ProductsPlayer({
+  data,
+  accumulatedTags,
+  formId,
+  savedProductIds, // NEW
+  onToggleSave, // NEW
+}: ProductsPlayerProps) {
+  const limit = data.resultLimit ?? 12;
+  const [products, setProducts] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const tagKey = accumulatedTags.slice().sort().join(",");
+
+  useEffect(() => {
+    if (data.mode === "manual") {
+      setProducts((data.pinnedProducts ?? []).slice(0, limit));
+      setLoading(false);
+      return;
+    }
+
+    if (accumulatedTags.length === 0) {
+      setProducts([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+
+    fetch("/api/products/by-tags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        formId,
+        tagIds: accumulatedTags,
+        strategy: data.matchStrategy === "all" ? "all" : "any",
+        limit,
+      }),
+    })
+      .then((res) => res.json())
+      .then(({ products: fetched }) => setProducts(fetched ?? []))
+      .catch(() => setProducts([]))
+      .finally(() => setLoading(false));
+  }, [tagKey, formId, data.mode, data.matchStrategy, limit]);
+
+  if (loading) {
+    return (
+      <div className="w-full space-y-5 animate-in fade-in">
+        {data.heading && (
+          <p className="text-xl font-bold text-foreground tracking-tight">
+            {data.heading}
+          </p>
+        )}
+        <div
+          className={
+            data.layout === "grid" ? "grid grid-cols-2 gap-4" : "space-y-4"
+          }
+        >
+          {Array.from({ length: Math.min(limit, 4) }).map((_, i) => (
+            <div
+              key={i}
+              className={`rounded-2xl border border-border/40 bg-card overflow-hidden animate-pulse
+                ${data.layout === "grid" ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
+            >
+              <div
+                className={`bg-muted/40 ${
+                  data.layout === "grid"
+                    ? "h-2/3 w-full"
+                    : "w-20 h-20 rounded-xl shrink-0"
+                }`}
+              />
+              <div
+                className={`flex-1 space-y-2.5 ${data.layout === "grid" ? "p-4" : "py-2"}`}
+              >
+                <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
+                <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
+                <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  if (products.length === 0) {
+    return (
+      <div className="w-full py-16 flex flex-col items-center gap-4 text-center bg-card rounded-3xl border border-border/40 border-dashed">
+        <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mb-2">
+          <ShoppingBag className="w-8 h-8 text-muted-foreground/40" />
+        </div>
+        <p className="text-base font-medium text-muted-foreground/80 max-w-xs">
+          {data.fallbackMessage ??
+            "We couldn't find exact matches for your selections."}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full space-y-5 animate-in fade-in duration-500">
+      {data.heading && (
+        <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
+          {data.heading}
+        </p>
+      )}
+      {data.layout === "grid" ? (
+        <div className="grid grid-cols-2 gap-3 sm:gap-5">
+          {products.map((p: any) => (
+            <ProductCard
+              key={p.id}
+              product={p}
+              compact
+              showAddToCart={data.showAddToCart}
+              showTags={data.showProductTags}
+              isSaved={savedProductIds?.has(p.id) ?? false} // NEW
+              onToggleSave={onToggleSave} // NEW
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3 sm:space-y-4">
+          {products.map((p: any) => (
+            <ProductCard
+              key={p.id}
+              product={p}
+              compact={false}
+              showAddToCart={data.showAddToCart}
+              showTags={data.showProductTags}
+              isSaved={savedProductIds?.has(p.id) ?? false} // NEW
+              onToggleSave={onToggleSave} // NEW
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── StepRenderer ─────────────────────────────────────────────────────────────
+
+function StepRenderer({
+  step,
+  session,
+  isPreview,
+  formId,
+  savedProductIds,
+  onToggleSave,
+  effectiveCustomerId, // ← ADD
+}: {
+  step: CanvasStep;
+  session: Session;
+  isPreview?: boolean;
+  formId: string;
+  savedProductIds?: Set<string>;
+  onToggleSave?: (id: string) => Promise<void>;
+  effectiveCustomerId?: string | null; // ← ADD
+}) {
+  const {
+    selectOption,
+    submitText,
+    submitRating,
+    advance,
+    submitContact,
+    accumulatedTags,
+    isSubmitting,
+  } = session;
+
+  return (
+    <div className="space-y-8 sm:space-y-10">
+      {step.blocks?.map((block) => {
+        const { data } = block;
+
+        switch (data.type) {
+          case "h1":
+          case "h2":
+          case "h3":
+            return <HeadingPlayer key={block.id} data={data} />;
+
+          case "paragraph":
+            return <ParagraphPlayer key={block.id} data={data} />;
+
+          case "image":
+            return <ImagePlayer key={block.id} data={data} />;
+
+          case "carousel":
+            return <CarouselPlayer key={block.id} data={data} />;
+
+          case "divider":
+            return <DividerPlayer key={block.id} data={data} />;
+
+          case "spacer":
+            return <SpacerPlayer key={block.id} data={data} />;
+
+          case "select":
+            return (
+              <SelectPlayer
+                key={block.id}
+                data={data}
+                blockId={block.id}
+                onSingleSelect={(opt) =>
+                  selectOption(block.id, opt.id, {
+                    tags: opt.tags,
+                    nextStepId: opt.nextStepId ?? step.nextStepId,
+                    autoAdvance: true,
+                  })
+                }
+                onMultiSubmit={(ids, tags) => {
+                  selectOption(block.id, ids, { tags });
+                  advance(step.nextStepId);
+                }}
+              />
+            );
+
+          case "text-input":
+            return (
+              <TextInputPlayer
+                key={block.id}
+                data={data}
+                onSubmit={(value) => {
+                  submitText(block.id, value);
+                  advance(step.nextStepId);
+                }}
+                onChange={(value) => {
+                  submitText(block.id, value); // This saves it to session state in real-time
+                }}
+              />
+            );
+
+          case "rating":
+            return (
+              <RatingPlayer
+                key={block.id}
+                data={data}
+                onSubmit={(value) => {
+                  submitRating(block.id, value);
+                  advance(step.nextStepId);
+                }}
+              />
+            );
+
+          case "button":
+            return (
+              <ButtonPlayer
+                key={block.id}
+                data={data}
+                onAdvance={(nextStepId) => advance(nextStepId)}
+              />
+            );
+
+          case "contact":
+            return (
+              <ContactBlockPlayer
+                key={block.id}
+                data={data}
+                isPreview={isPreview}
+                customerId={effectiveCustomerId ?? null}
+                onSubmit={async (contactData) => {
+                  // ✅ ONLY commits data — never advances
+                  const result = await submitContact(contactData);
+                  return result;
+                }}
+                onAdvance={() => advance(data.nextStepId ?? step.nextStepId)} // ← user triggers this
+                onSkip={
+                  data.showSkip
+                    ? () => advance(data.skipNextStepId ?? step.nextStepId)
+                    : undefined
+                }
+                isSubmitting={isSubmitting}
+              />
+            );
+
+          case "products":
+            return (
+              <ProductsPlayer
+                key={block.id}
+                data={data}
+                accumulatedTags={accumulatedTags}
+                formId={formId}
+                savedProductIds={savedProductIds} // NEW
+                onToggleSave={onToggleSave} // NEW
+              />
+            );
+
+          default:
+            return null;
+        }
+      })}
+    </div>
+  );
+}
+
+// ── Loading state ─────────────────────────────────────────────────────────────
+
+function LoadingState() {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-[400px] gap-4">
+      <Loader2 className="w-10 h-10 text-muted-foreground/30 animate-spin" />
+      <p className="text-sm font-medium text-muted-foreground/60 tracking-wide">
+        Preparing your experience...
+      </p>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN FlowPlayer
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Main Component ─────────────────────────────────────────────────────────────
+
+export function FlowPlayer({
+  flow,
+  formId,
+  storeId,
+  allProducts = [],
+  redemptionCode,
+  onComplete,
+  showBanner = false,
+  allowReset = true,
+  isPreview = false,
+}: FlowPlayerProps) {
+  // ── Session ────────────────────────────────────────────────────────────────
+
+  const session = useFlowSession({
+    flow,
+    formId,
+    storeId,
+    allProducts,
+    redemptionCode,
+    onComplete,
+    isPreview,
+  });
+
+  const {
+    phase,
+    currentStep,
+    stepIndex,
+    totalSteps,
+    canGoBack,
+    init,
+    goBack,
+    reset,
+  } = session;
+
+  // ── State ─────────────────────────────────────────────────────────────────
+
+  const [profileDrawerOpen, setProfileDrawerOpen] = useState(false);
+  const [loginCustomerId, setLoginCustomerId] = useState<string | null>(null);
+
+  // Hydrate local customer from localStorage on mount
+  const [localCustomer, setLocalCustomer] =
+    useState<LocalCustomerProfile | null>(null);
+
+  // Sync customer from localStorage on mount (SSR safe)
+  useEffect(() => {
+    const saved = getLocalCustomer();
+    if (saved) setLocalCustomer(saved);
+  }, []);
+
+  // ── Stable customerId across phase changes ────────────────────────────────
+  // useFlowSession may clear session.customerId on "done" phase,
+  // but we want to keep showing the customer's saved items after submit.
+  const lastKnownCustomerIdRef = useRef<string | null>(null);
+  const rawCustomerId = session.customerId ?? loginCustomerId;
+  if (rawCustomerId) lastKnownCustomerIdRef.current = rawCustomerId;
+  const effectiveCustomerId = rawCustomerId ?? lastKnownCustomerIdRef.current;
+
+  // ── Saved Items ────────────────────────────────────────────────────────────
+
+  const savedItemsHook = useSavedItems(
+    session.sessionId,
+    storeId ?? null,
+    effectiveCustomerId,
+  );
+
+  // ── Sync localCustomer when contact form creates a customer ───────────────
+  // e.g. user filled the form without using the login drawer —
+  // session.customerId is now set but localCustomer is still null.
+  useEffect(() => {
+    if (!session.customerId) return;
+    const existing = getLocalCustomer();
+    if (existing?.id === session.customerId) {
+      setLocalCustomer(existing);
+    }
+  }, [session.customerId]);
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
+
+  const handleLogin = useCallback((customer: LocalCustomerProfile) => {
+    saveCustomerLocally(customer);
+    setLocalCustomer(customer);
+    setLoginCustomerId(customer.id);
+    // Drawer stays open — CustomerProfileDrawer switches to profile phase internally
+  }, []);
+
+  const handleReset = useCallback(async () => {
+    reset();
+    await init();
+  }, [reset, init]);
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    init();
+    flowLog("FLOW_PLAYER_MOUNT", {
+      formId,
+      isPreview,
+      totalSteps: flow.steps.length,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    setLocalCustomer(null);
+    setLoginCustomerId(null);
+    // Don't call session.reset() — flow progress stays intact
+    // Just the identity is cleared, next contact step will show the form again
+  }, []);
+
+  // ── Render ────────────────────────────────────────────────────────────────
+
+  return (
+    <div className="w-full min-h-[100dvh] bg-muted/10 sm:bg-muted/20 flex flex-col items-center justify-start sm:py-12 py-0">
+      {/* Container */}
+      <div className="w-full max-w-xl flex flex-col sm:px-4 px-0 flex-1 sm:flex-initial">
+        {/* Preview banner */}
+
+        {/* Flow name banner */}
+        {showBanner && (
+          <div className="w-full mb-6">
+            <h1 className="text-sm font-bold text-muted-foreground/50 uppercase tracking-[0.2em] text-center">
+              {flow.name}
+            </h1>
+          </div>
+        )}
+
+        {/* ── Main Card ─────────────────────────────────────────────────── */}
+        <div className="w-full bg-card sm:rounded-[2rem] sm:shadow-[0_8px_30px_rgb(0,0,0,0.04)] sm:border border-border/40 overflow-hidden flex-1 flex flex-col">
+          {/* Progress & Back header */}
+          {phase === "quiz" && totalSteps > 1 && (
+            <div className="px-6 sm:px-10 my-4 sticky top-0 bg-card/80 backdrop-blur-xl z-20 border-b border-border/10 sm:border-none">
+              <div className="flex items-center gap-4">
+                {canGoBack ? (
+                  <button
+                    onClick={goBack}
+                    aria-label="Go back"
+                    className="flex items-center gap-2 pr-3 rounded-full text-muted-foreground/60 hover:text-foreground hover:bg-muted transition-all active:scale-90"
+                  >
+                    <ChevronLeft className="w-6 h-6 stroke-[2.5]" />
+                    <p className="text-sm font-bold text-muted-foreground/60 tracking-wide">
+                      Back
+                    </p>
+                  </button>
+                ) : (
+                  <div className="w-10 h-10 -ml-2 shrink-0" />
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Content Area */}
+          <div className="px-6 sm:px-10 pb-24 sm:pb-16 flex-1 flex flex-col">
+            {phase === "loading" && <LoadingState />}
+
+            {phase === "quiz" && currentStep && (
+              <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 ease-out fill-mode-both">
+                <StepRenderer
+                  step={currentStep}
+                  session={session}
+                  isPreview={isPreview}
+                  formId={formId}
+                  savedProductIds={savedItemsHook.savedProductIds}
+                  onToggleSave={savedItemsHook.toggleSave}
+                  effectiveCustomerId={effectiveCustomerId} // ← ADD
+                />
+              </div>
+            )}
+
+            {phase === "quiz" && !currentStep && (
+              <div className="py-20 text-center flex flex-col items-center justify-center">
+                <div className="w-16 h-16 bg-muted rounded-full flex items-center justify-center mb-4">
+                  <Loader2 className="w-6 h-6 text-muted-foreground/40" />
+                </div>
+                <p className="text-base font-medium text-muted-foreground/60">
+                  This flow is currently empty.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+        {/* ── End Main Card ─────────────────────────────────────────────── */}
+
+        {/* Powered by footer */}
+        <div className="py-6 sm:py-8 flex justify-center w-full">
+          <p className="text-xs font-semibold text-muted-foreground/40 uppercase tracking-widest flex items-center gap-2">
+            Powered by <span className="text-foreground/40">Mirour</span>
+          </p>
+        </div>
+      </div>
+      {/* ── End container ─────────────────────────────────────────────────── */}
+
+      {/* ── Floating bar + drawer — outside card, outside container ────────── */}
+      {/* {!isPreview && phase !== "done" && (
+        <>
+          <FloatingProfileBar
+            onClick={() => setProfileDrawerOpen(true)}
+            savedCount={savedItemsHook.savedItems.length}
+            customer={localCustomer}
+          />
+
+          <CustomerProfileDrawer
+            open={profileDrawerOpen}
+            onClose={() => setProfileDrawerOpen(false)}
+            savedItems={savedItemsHook.savedItems}
+            onRemoveSavedItem={savedItemsHook.toggleSave}
+            onLogin={handleLogin}
+            onLogout={handleLogout}
+            customerId={effectiveCustomerId}
+            allProducts={allProducts}
+          />
+        </>
+      )} */}
+    </div>
+  );
+}
+
+
+==================================================
+FILE: PageBuilder.tsx
+==================================================
+
+// components/canvas/PageBuilder.tsx
+"use client";
+
+import { useState, useCallback, useRef, useEffect } from "react";
+import { v4 as uuidv4 } from "uuid";
+import {
+  ArrowLeft,
+  Save,
+  MoreHorizontal,
+  Globe,
+  Loader2,
+  CheckCheck,
+  Wand2,
+} from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import type { CanvasFlow, CanvasStep } from "@/types/canvas";
+import { StepList, createBlankStep, duplicateStep } from "./StepList";
+import { CanvasEditor } from "./CanvasEditor";
+import { AIChatPanel } from "../flow/AIChatPanel";
+import { useToast } from "@/hooks/use-toast";
+
+// ── Save status indicator ─────────────────────────────────────────────────────
+
+type SaveStatus = "idle" | "saving" | "saved" | "error";
+
+function SaveIndicator({ status }: { status: SaveStatus }) {
+  if (status === "idle") return null;
+
+  return (
+    <div
+      className={`flex items-center gap-1.5 text-xs font-medium transition-all
+        ${
+          status === "saving"
+            ? "text-muted-foreground"
+            : status === "saved"
+              ? "text-emerald-600"
+              : status === "error"
+                ? "text-destructive"
+                : ""
+        }`}
+    >
+      {status === "saving" && (
+        <>
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          Saving…
+        </>
+      )}
+      {status === "saved" && (
+        <>
+          <CheckCheck className="w-3.5 h-3.5" />
+          Saved
+        </>
+      )}
+      {status === "error" && "Failed to save"}
+    </div>
+  );
+}
+
+// ── No step selected state ────────────────────────────────────────────────────
+
+function NoStepSelected({ onAdd }: { onAdd: () => void }) {
+  return (
+    <div
+      className="flex-1 flex flex-col items-center justify-center gap-5
+      bg-muted/10 text-center px-8"
+    >
+      <div
+        className="w-20 h-20 rounded-3xl border-2 border-dashed border-border/50
+        flex items-center justify-center bg-background"
+      >
+        <svg
+          className="w-9 h-9 text-muted-foreground/25"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <rect x="3" y="3" width="18" height="18" rx="3" strokeWidth="1.5" />
+          <path d="M3 9h18M9 21V9" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+      </div>
+
+      <div>
+        <p className="text-base font-semibold text-foreground/60">
+          No step selected
+        </p>
+        <p className="text-sm text-muted-foreground/50 mt-1 max-w-[280px]">
+          Select a step from the left panel to start editing, or create a new
+          one.
+        </p>
+      </div>
+
+      <button
+        onClick={onAdd}
+        className="flex items-center gap-2 px-5 py-2.5 rounded-xl
+          bg-primary text-primary-foreground text-sm font-semibold
+          hover:bg-primary/90 transition-all shadow-sm"
+      >
+        + Add First Step
+      </button>
+    </div>
+  );
+}
+
+// ── Main PageBuilder ──────────────────────────────────────────────────────────
+
+type PageBuilderProps = {
+  /** Initial flow data — pass from your DB/server */
+  initialFlow?: CanvasFlow;
+  /** Called whenever the user saves — auto or manual */
+  onSave?: (flow: CanvasFlow) => Promise<void>;
+  /** Active store ID — passed through to tag/product pickers */
+  storeId?: string;
+  /** Called when user clicks Back */
+  onBack?: () => void;
+};
+
+export function PageBuilder({
+  initialFlow,
+  onSave,
+  storeId,
+  onBack,
+}: PageBuilderProps) {
+  // ── Flow state ──────────────────────────────────────────────────────────────
+
+  const [flow, setFlow] = useState<CanvasFlow>(
+    initialFlow ?? {
+      id: uuidv4(),
+      name: "Untitled Page",
+      steps: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+  );
+
+  const [selectedStepId, setSelectedStepId] = useState<string | null>(
+    initialFlow?.steps[0]?.id ?? null,
+  );
+
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  const [isEditingName, setIsEditingName] = useState(false);
+  const [nameValue, setNameValue] = useState(flow.name);
+
+  // ── AI panel state ──────────────────────────────────────────────────────────
+
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const { toast } = useToast();
+
+  // ── Stable refs ─────────────────────────────────────────────────────────────
+
+  const onSaveRef = useRef(onSave);
+  useEffect(() => {
+    onSaveRef.current = onSave;
+  }, [onSave]);
+
+  const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isFirstMount = useRef(true);
+
+  // ── Auto-save (debounced, 1.5 s) ────────────────────────────────────────────
+
+  useEffect(() => {
+    if (isFirstMount.current) {
+      isFirstMount.current = false;
+      return;
+    }
+
+    if (!onSaveRef.current) return;
+
+    if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current);
+
+    setSaveStatus("saving");
+
+    autoSaveTimer.current = setTimeout(async () => {
+      try {
+        await onSaveRef.current!({
+          ...flow,
+          updatedAt: new Date().toISOString(),
+        });
+        setSaveStatus("saved");
+        setTimeout(() => setSaveStatus("idle"), 2500);
+      } catch {
+        setSaveStatus("error");
+        setTimeout(() => setSaveStatus("idle"), 3000);
+      }
+    }, 1500);
+  }, [flow]);
+
+  // ── Derived ─────────────────────────────────────────────────────────────────
+
+  const selectedStep = flow.steps.find((s) => s.id === selectedStepId) ?? null;
+
+  // ── Flow mutations ──────────────────────────────────────────────────────────
+
+  const updateFlow = useCallback((patch: Partial<CanvasFlow>) => {
+    setFlow((prev) => ({
+      ...prev,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+    }));
+  }, []);
+
+  const handleAddStep = useCallback(() => {
+    const newStep = createBlankStep(flow.steps.length);
+    updateFlow({ steps: [...flow.steps, newStep] });
+    setSelectedStepId(newStep.id);
+  }, [flow.steps, updateFlow]);
+
+  const handleDeleteStep = useCallback(
+    (id: string) => {
+      const updated = flow.steps.filter((s) => s.id !== id);
+      updateFlow({ steps: updated });
+      if (selectedStepId === id) {
+        const idx = flow.steps.findIndex((s) => s.id === id);
+        const next = updated[idx] ?? updated[idx - 1] ?? null;
+        setSelectedStepId(next?.id ?? null);
+      }
+    },
+    [flow.steps, selectedStepId, updateFlow],
+  );
+
+  const handleDuplicateStep = useCallback(
+    (id: string) => {
+      const original = flow.steps.find((s) => s.id === id);
+      if (!original) return;
+      const idx = flow.steps.findIndex((s) => s.id === id);
+      const copy = duplicateStep(original, idx + 1);
+      const updated = [
+        ...flow.steps.slice(0, idx + 1),
+        copy,
+        ...flow.steps.slice(idx + 1),
+      ];
+      updateFlow({ steps: updated });
+      setSelectedStepId(copy.id);
+    },
+    [flow.steps, updateFlow],
+  );
+
+  const handleRenameStep = useCallback(
+    (id: string, label: string) => {
+      updateFlow({
+        steps: flow.steps.map((s) => (s.id === id ? { ...s, label } : s)),
+      });
+    },
+    [flow.steps, updateFlow],
+  );
+
+  const handleReorderSteps = useCallback(
+    (reordered: CanvasStep[]) => {
+      updateFlow({ steps: reordered });
+    },
+    [updateFlow],
+  );
+
+  const handleStepChange = useCallback(
+    (updatedStep: CanvasStep) => {
+      updateFlow({
+        steps: flow.steps.map((s) =>
+          s.id === updatedStep.id ? updatedStep : s,
+        ),
+      });
+    },
+    [flow.steps, updateFlow],
+  );
+
+  // ── AI: apply generated flow ────────────────────────────────────────────────
+
+  const handleApplyAIFlow = useCallback(
+    (generatedFlow: CanvasFlow) => {
+      // Preserve the DB row's id and createdAt so saves hit the correct record
+      const merged: CanvasFlow = {
+        ...generatedFlow,
+        id: flow.id,
+        createdAt: flow.createdAt,
+        updatedAt: new Date().toISOString(),
+      };
+
+      setFlow(merged);
+      setNameValue(merged.name);
+
+      // Auto-select the first generated step
+      const firstStepId = merged.steps[0]?.id ?? null;
+      setSelectedStepId(firstStepId);
+
+      toast({
+        title: "Flow applied ✨",
+        description: `"${generatedFlow.name}" loaded with ${generatedFlow.steps.length} step${generatedFlow.steps.length !== 1 ? "s" : ""}.`,
+      });
+    },
+    [flow.id, flow.createdAt, toast],
+  );
+
+  // ── Manual save ─────────────────────────────────────────────────────────────
+
+  const handleSave = async () => {
+    if (!onSave) return;
+
+    if (autoSaveTimer.current) {
+      clearTimeout(autoSaveTimer.current);
+      autoSaveTimer.current = null;
+    }
+
+    setSaveStatus("saving");
+    try {
+      await onSave({ ...flow, updatedAt: new Date().toISOString() });
+      setSaveStatus("saved");
+      setTimeout(() => setSaveStatus("idle"), 2500);
+    } catch {
+      setSaveStatus("error");
+      setTimeout(() => setSaveStatus("idle"), 3000);
+    }
+  };
+
+  // ── Flow name rename ────────────────────────────────────────────────────────
+
+  const handleNameSubmit = () => {
+    const trimmed = nameValue.trim() || "Untitled Page";
+    setNameValue(trimmed);
+    updateFlow({ name: trimmed });
+    setIsEditingName(false);
+  };
+
+  // ── Render ──────────────────────────────────────────────────────────────────
+
+  return (
+    <div className="flex flex-col h-screen bg-background overflow-hidden">
+      {/* ── GLOBAL TOP NAV ── */}
+      <header
+        className="flex items-center justify-between px-4 py-2.5
+        border-b border-border bg-background shrink-0 gap-4 z-30"
+      >
+        {/* Left: back + flow name */}
+        <div className="flex items-center gap-3 min-w-0">
+          {onBack && (
+            <>
+              <button
+                onClick={onBack}
+                className="flex items-center gap-1.5 text-sm font-medium
+                  text-muted-foreground hover:text-foreground transition-colors group"
+              >
+                <ArrowLeft
+                  className="w-4 h-4 transition-transform
+                  group-hover:-translate-x-0.5"
+                />
+                Back
+              </button>
+              <div className="w-px h-5 bg-border/60 shrink-0" />
+            </>
+          )}
+
+          {/* Editable flow name */}
+          {isEditingName ? (
+            <input
+              autoFocus
+              value={nameValue}
+              onChange={(e) => setNameValue(e.target.value)}
+              onBlur={handleNameSubmit}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleNameSubmit();
+                if (e.key === "Escape") {
+                  setNameValue(flow.name);
+                  setIsEditingName(false);
+                }
+              }}
+              className="text-sm font-semibold bg-transparent border-b border-primary
+                focus:outline-none text-foreground min-w-[120px] max-w-[280px] pb-0.5"
+            />
+          ) : (
+            <button
+              onClick={() => setIsEditingName(true)}
+              className="text-sm font-semibold text-foreground/80 hover:text-foreground
+                transition-colors truncate max-w-[240px] text-left"
+              title="Click to rename"
+            >
+              {flow.name}
+            </button>
+          )}
+
+          {/* Step breadcrumb */}
+          {selectedStep && (
+            <>
+              <span className="text-muted-foreground/30 text-sm shrink-0">
+                /
+              </span>
+              <span className="text-sm text-muted-foreground/60 truncate max-w-[160px]">
+                {selectedStep.label}
+              </span>
+            </>
+          )}
+        </div>
+
+        {/* Right: status + actions */}
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Save indicator */}
+          <SaveIndicator status={saveStatus} />
+
+          {/* ── AI Build button ── */}
+          <button
+            onClick={() => setAiPanelOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+              bg-primary/8 hover:bg-primary/15 border border-primary/25
+              text-xs font-semibold text-primary transition-all
+              hover:shadow-sm hover:border-primary/40 active:scale-95"
+          >
+            <Wand2 className="w-3.5 h-3.5" />
+            AI Build
+          </button>
+
+          {/* Manual save */}
+          {onSave && (
+            <button
+              onClick={handleSave}
+              disabled={saveStatus === "saving"}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg
+                bg-foreground text-background text-xs font-semibold
+                hover:bg-foreground/90 transition-all disabled:opacity-50
+                disabled:cursor-not-allowed shadow-sm active:scale-95"
+            >
+              {saveStatus === "saving" ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Save className="w-3.5 h-3.5" />
+              )}
+              Save
+            </button>
+          )}
+
+          {/* More options */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="p-1.5 rounded-lg border border-border text-muted-foreground/60
+                  hover:text-foreground hover:bg-muted/60 transition-all"
+              >
+                <MoreHorizontal className="w-4 h-4" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuItem
+                onClick={() => setIsEditingName(true)}
+                className="text-xs gap-2"
+              >
+                <Globe className="w-3.5 h-3.5" />
+                Rename flow
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={handleAddStep}
+                onDoubleClick={() => setAiPanelOpen(true)}
+                className="text-xs gap-2"
+              >
+                + Add step
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => setAiPanelOpen(true)}
+                className="text-xs gap-2"
+              >
+                <Wand2 className="w-3.5 h-3.5 text-primary" />
+                <span className="text-primary font-medium">AI Build</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </header>
+
+      {/* ── MAIN BODY ── */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Step list sidebar */}
+        <StepList
+          steps={flow.steps}
+          selectedStepId={selectedStepId}
+          onSelectStep={setSelectedStepId}
+          onAddStep={handleAddStep}
+          onDeleteStep={handleDeleteStep}
+          onDuplicateStep={handleDuplicateStep}
+          onRenameStep={handleRenameStep}
+          onReorderSteps={handleReorderSteps}
+          flowName={flow.name}
+        />
+
+        {/* Canvas area */}
+        <div className="flex-1 flex overflow-hidden">
+          {selectedStep ? (
+            <CanvasEditor
+              flow={flow}
+              step={selectedStep}
+              allSteps={flow.steps}
+              storeId={storeId}
+              onChange={handleStepChange}
+            />
+          ) : (
+            <NoStepSelected onAdd={handleAddStep} />
+          )}
+        </div>
+      </div>
+
+      {/* ── AI CHAT PANEL ── */}
+      <AIChatPanel
+        isOpen={aiPanelOpen}
+        onClose={() => setAiPanelOpen(false)}
+        onApplyFlow={handleApplyAIFlow}
+      />
+    </div>
+  );
+}
+
+
+==================================================
+FILE: StepList.tsx
+==================================================
+
+// components/canvas/StepList.tsx
+"use client";
+
+import { useState } from "react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
+  Plus,
+  GripVertical,
+  Trash2,
+  Layers,
+  CheckCircle2,
+  MoreHorizontal,
+  Pencil,
+  Copy,
+} from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { v4 as uuidv4 } from "uuid";
+import type { CanvasStep } from "@/types/canvas";
+
+// ── Step thumbnail (mini block type preview) ──────────────────────────────────
+
+function StepThumbnail({ step }: { step: CanvasStep }) {
+  if (step.blocks.length === 0) {
+    return (
+      <div className="w-full h-full flex items-center justify-center">
+        <div
+          className="w-8 h-8 rounded-lg border-2 border-dashed border-border/40
+          flex items-center justify-center"
+        >
+          <Plus className="w-3.5 h-3.5 text-muted-foreground/30" />
+        </div>
+      </div>
+    );
+  }
+
+  // Show up to 4 block type pills
+  const visible = step.blocks.slice(0, 4);
+
+  const TYPE_COLORS: Record<string, string> = {
+    h1: "bg-violet-100 text-violet-600",
+    h2: "bg-violet-100 text-violet-600",
+    h3: "bg-violet-100 text-violet-600",
+    paragraph: "bg-sky-100 text-sky-600",
+    image: "bg-emerald-100 text-emerald-600",
+    carousel: "bg-emerald-100 text-emerald-600",
+    button: "bg-amber-100 text-amber-600",
+    divider: "bg-slate-100 text-slate-500",
+    spacer: "bg-slate-100 text-slate-500",
+  };
+
+  const TYPE_HEIGHTS: Record<string, string> = {
+    h1: "h-3",
+    h2: "h-2.5",
+    h3: "h-2",
+    paragraph: "h-1.5",
+    image: "h-8",
+    carousel: "h-8",
+    button: "h-4",
+    divider: "h-px",
+    spacer: "h-2",
+  };
+
+  return (
+    <div className="w-full h-full flex flex-col justify-center gap-1 px-2 py-2">
+      {visible.map((block) => (
+        <div
+          key={block.id}
+          className={`w-full rounded-sm transition-all
+            ${TYPE_COLORS[block.data.type] ?? "bg-muted"}
+            ${TYPE_HEIGHTS[block.data.type] ?? "h-2"}
+            ${block.data.type === "divider" ? "opacity-40" : "opacity-60"}
+          `}
+        />
+      ))}
+      {step.blocks.length > 4 && (
+        <p className="text-[8px] text-muted-foreground/40 text-center mt-0.5">
+          +{step.blocks.length - 4} more
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ── Sortable step card ────────────────────────────────────────────────────────
+
+type SortableStepCardProps = {
+  step: CanvasStep;
+  index: number;
+  isSelected: boolean;
+  isRenaming: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+  onDuplicate: () => void;
+  onRename: (label: string) => void;
+  onStartRename: () => void;
+  onCancelRename: () => void;
+};
+
+function SortableStepCard({
+  step,
+  index,
+  isSelected,
+  isRenaming,
+  onSelect,
+  onDelete,
+  onDuplicate,
+  onRename,
+  onStartRename,
+  onCancelRename,
+}: SortableStepCardProps) {
+  const [renameValue, setRenameValue] = useState(step.label);
+
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: step.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : 1,
+  };
+
+  const handleRenameSubmit = () => {
+    onRename(renameValue.trim() || `Step ${index + 1}`);
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} className="group/step relative">
+      <div
+        onClick={onSelect}
+        className={`relative flex flex-col rounded-xl border cursor-pointer
+          transition-all duration-150 overflow-hidden
+          ${
+            isSelected
+              ? "border-primary/50 shadow-[0_0_0_3px_hsl(var(--primary)/0.12)] bg-primary/5"
+              : "border-border/60 hover:border-border bg-background hover:shadow-sm"
+          }`}
+      >
+        {/* Step number badge */}
+        <div
+          className={`absolute top-2 left-2 z-10 w-5 h-5 rounded-full
+          flex items-center justify-center text-[9px] font-bold
+          ${
+            isSelected
+              ? "bg-primary text-primary-foreground"
+              : "bg-muted/80 text-muted-foreground/60 border border-border/60"
+          }`}
+        >
+          {index + 1}
+        </div>
+
+        {/* Actions row (top right) */}
+        <div
+          className="absolute top-1.5 right-1.5 z-10 flex items-center gap-0.5
+          opacity-0 group-hover/step:opacity-100 transition-opacity"
+        >
+          {/* Drag handle */}
+          <button
+            {...attributes}
+            {...listeners}
+            onClick={(e) => e.stopPropagation()}
+            className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground
+              hover:bg-background/80 cursor-grab active:cursor-grabbing transition-colors"
+          >
+            <GripVertical className="w-3 h-3" />
+          </button>
+
+          {/* More menu */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                onClick={(e) => e.stopPropagation()}
+                className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground
+                  hover:bg-background/80 transition-colors"
+              >
+                <MoreHorizontal className="w-3.5 h-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40">
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onStartRename();
+                }}
+                className="text-xs gap-2"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDuplicate();
+                }}
+                className="text-xs gap-2"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                Duplicate
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <DropdownMenuItem
+                    onSelect={(e) => e.preventDefault()}
+                    onClick={(e) => e.stopPropagation()}
+                    className="text-xs gap-2 text-destructive focus:text-destructive"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Delete
+                  </DropdownMenuItem>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>Delete "{step.label}"?</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      This will permanently delete this step and all its blocks.
+                      This action cannot be undone.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>Cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                      onClick={onDelete}
+                      className="bg-destructive text-destructive-foreground
+                        hover:bg-destructive/90"
+                    >
+                      Delete
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {/* Thumbnail */}
+        <div
+          className={`w-full h-[100px] border-b transition-colors
+          ${isSelected ? "border-primary/20 bg-primary/5" : "border-border/40 bg-muted/20"}`}
+        >
+          <StepThumbnail step={step} />
+        </div>
+
+        {/* Label row */}
+        <div className="px-2.5 py-2">
+          {isRenaming ? (
+            <input
+              autoFocus
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onBlur={handleRenameSubmit}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleRenameSubmit();
+                if (e.key === "Escape") {
+                  setRenameValue(step.label);
+                  onCancelRename();
+                }
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full text-xs font-medium bg-transparent border-b border-primary
+                focus:outline-none text-foreground pb-0.5"
+            />
+          ) : (
+            <p
+              className={`text-xs font-medium truncate transition-colors
+              ${isSelected ? "text-primary" : "text-foreground/70"}`}
+            >
+              {step.label}
+            </p>
+          )}
+
+          {/* Block count */}
+          <div className="flex items-center gap-1.5 mt-1">
+            <Layers className="w-2.5 h-2.5 text-muted-foreground/30 shrink-0" />
+            <span className="text-[10px] text-muted-foreground/40">
+              {step.blocks.length === 0
+                ? "Empty"
+                : `${step.blocks.length} block${step.blocks.length !== 1 ? "s" : ""}`}
+            </span>
+            {step.blocks.length > 0 && (
+              <CheckCircle2 className="w-2.5 h-2.5 text-emerald-500/60 ml-auto shrink-0" />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Main StepList ─────────────────────────────────────────────────────────────
+
+type StepListProps = {
+  steps: CanvasStep[];
+  selectedStepId: string | null;
+  onSelectStep: (id: string) => void;
+  onAddStep: () => void;
+  onDeleteStep: (id: string) => void;
+  onDuplicateStep: (id: string) => void;
+  onRenameStep: (id: string, label: string) => void;
+  onReorderSteps: (steps: CanvasStep[]) => void;
+  flowName?: string;
+};
+
+export function StepList({
+  steps,
+  selectedStepId,
+  onSelectStep,
+  onAddStep,
+  onDeleteStep,
+  onDuplicateStep,
+  onRenameStep,
+  onReorderSteps,
+  flowName,
+}: StepListProps) {
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIdx = steps.findIndex((s) => s.id === active.id);
+    const newIdx = steps.findIndex((s) => s.id === over.id);
+    if (oldIdx !== -1 && newIdx !== -1) {
+      onReorderSteps(arrayMove(steps, oldIdx, newIdx));
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-background border-r border-border w-[200px] shrink-0">
+      {/* ── Header ── */}
+      <div className="px-3 py-3 border-b border-border shrink-0">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p
+              className="text-[10px] font-bold text-muted-foreground/50
+              uppercase tracking-widest"
+            >
+              Steps
+            </p>
+            {flowName && (
+              <p className="text-xs font-semibold text-foreground/70 truncate mt-0.5">
+                {flowName}
+              </p>
+            )}
+          </div>
+          <span className="text-[10px] text-muted-foreground/40 shrink-0 tabular-nums">
+            {steps.length}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Step cards (scrollable) ── */}
+      <div className="flex-1 overflow-y-auto p-2 space-y-2">
+        {steps.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 gap-3 px-2">
+            <div
+              className="w-10 h-10 rounded-xl border-2 border-dashed border-border/40
+              flex items-center justify-center"
+            >
+              <Layers className="w-4 h-4 text-muted-foreground/30" />
+            </div>
+            <p className="text-[11px] text-muted-foreground/50 text-center leading-relaxed">
+              No steps yet.
+              <br />
+              Add your first step below.
+            </p>
+          </div>
+        ) : (
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleDragEnd}
+          >
+            <SortableContext
+              items={steps.map((s) => s.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              {steps.map((step, index) => (
+                <SortableStepCard
+                  key={step.id}
+                  step={step}
+                  index={index}
+                  isSelected={selectedStepId === step.id}
+                  isRenaming={renamingId === step.id}
+                  onSelect={() => onSelectStep(step.id)}
+                  onDelete={() => onDeleteStep(step.id)}
+                  onDuplicate={() => onDuplicateStep(step.id)}
+                  onRename={(label) => {
+                    onRenameStep(step.id, label);
+                    setRenamingId(null);
+                  }}
+                  onStartRename={() => {
+                    onSelectStep(step.id);
+                    setRenamingId(step.id);
+                  }}
+                  onCancelRename={() => setRenamingId(null)}
+                />
+              ))}
+            </SortableContext>
+          </DndContext>
+        )}
+      </div>
+
+      {/* ── Add step button ── */}
+      <div className="p-2 border-t border-border shrink-0">
+        <button
+          onClick={onAddStep}
+          className="w-full flex items-center justify-center gap-2 py-2.5 px-3
+            rounded-xl border-2 border-dashed border-border/50
+            text-xs font-semibold text-muted-foreground/50
+            hover:border-primary/40 hover:text-primary hover:bg-primary/5
+            transition-all group"
+        >
+          <div
+            className="w-5 h-5 rounded-full border-2 border-current
+            flex items-center justify-center transition-transform
+            group-hover:scale-110"
+          >
+            <Plus className="w-3 h-3" />
+          </div>
+          Add Step
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Helper: create a new blank step ──────────────────────────────────────────
+
+export function createBlankStep(index: number): CanvasStep {
+  return {
+    id: uuidv4(),
+    label: `Step ${index + 1}`,
+    blocks: [],
+    createdAt: new Date().toISOString(),
+  };
+}
+
+// ── Helper: duplicate a step ─────────────────────────────────────────────────
+
+export function duplicateStep(step: CanvasStep, newIndex: number): CanvasStep {
+  return {
+    ...step,
+    id: uuidv4(),
+    label: `${step.label} (copy)`,
+    blocks: step.blocks.map((block) => ({
+      ...block,
+      id: uuidv4(),
+    })),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+

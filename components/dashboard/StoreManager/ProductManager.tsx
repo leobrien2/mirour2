@@ -92,6 +92,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
 
   // ── Global Error State ───────────────────────────────────────────────────
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [deleteQueued, setDeleteQueued] = useState(false);
 
   // ── Filters & Search ─────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState("");
@@ -333,7 +334,13 @@ export function ProductManager({ storeId }: ProductManagerProps) {
     if (confirm("Delete this product?")) {
       setGlobalError(null);
       const res = await deleteProduct(productId);
-      if (res?.error) setGlobalError(res.error);
+      if (res?.error) {
+        setGlobalError(res.error);
+      } else {
+        // Show a brief "delete queued" confirmation
+        setDeleteQueued(true);
+        setTimeout(() => setDeleteQueued(false), 3000);
+      }
     }
   };
 
@@ -447,6 +454,16 @@ export function ProductManager({ storeId }: ProductManagerProps) {
 
   return (
     <div className="space-y-4">
+      {/* ── Delete-queued toast ────────────────────────────────────────── */}
+      {deleteQueued && (
+        <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-sm animate-fade-in">
+          <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+          </svg>
+          Product deleted — completing in the background even if you leave this page.
+        </div>
+      )}
+
       {/* ── Integrations Modal ─────────────────────────────────────────── */}
       {isIntegrationsOpen && (
         <IntegrationsModal

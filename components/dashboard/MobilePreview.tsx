@@ -126,7 +126,6 @@ function PoweredByFooter() {
 export function MobilePreview({ form, onClose, businessName, businessLogo }: MobilePreviewProps) {
   const [currentNodeId, setCurrentNodeId] = useState<string | null>(form.questions[0]?.id || null);
   const [answers, setAnswers] = useState<{ [questionId: string]: any }>({});
-  const [quizScore, setQuizScore] = useState(0);
   const [screen, setScreen] = useState<'flow' | 'contact' | 'thankyou'>('flow');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
@@ -141,23 +140,6 @@ export function MobilePreview({ form, onClose, businessName, businessLogo }: Mob
   const answeredCount = questionNodes.filter(n => answers[n.id] !== undefined).length;
   const progress = questionNodes.length > 0 ? (answeredCount / questionNodes.length) * 100 : 0;
 
-  // Get complete node for score
-  const getCompleteNodeForScore = useCallback((): FlowNode | undefined => {
-    const scoreResultNodes = form.questions.filter(
-      n => n.type === 'complete' && n.isScoreResult && n.scoreThreshold
-    );
-    
-    const matched = scoreResultNodes.find(n => 
-      n.scoreThreshold && 
-      quizScore >= n.scoreThreshold.min && 
-      quizScore <= n.scoreThreshold.max
-    );
-    
-    if (matched) return matched;
-    
-    return form.questions.find(n => n.type === 'complete' && !n.isScoreResult) 
-      || form.questions.find(n => n.type === 'complete');
-  }, [form.questions, quizScore]);
 
   const goToNextNode = useCallback((answer?: any) => {
     if (!currentNode) return;
@@ -198,14 +180,7 @@ export function MobilePreview({ form, onClose, businessName, businessLogo }: Mob
     setAnswers(prev => ({ ...prev, [currentNode.id]: answer }));
     setErrorMessage('');
     
-    // Calculate score for quiz questions
-    if (currentNode.questionType === 'quiz' && currentNode.options && currentNode.optionScores) {
-      const answerIndex = currentNode.options.indexOf(answer);
-      if (answerIndex !== -1 && currentNode.optionScores[answerIndex] !== undefined) {
-        setQuizScore(prev => prev + currentNode.optionScores![answerIndex]);
-      }
-    }
-    
+
     setTimeout(() => {
       // Check if this was the last question before complete
       const nextIndex = form.questions.findIndex(n => n.id === currentNodeId);
@@ -369,7 +344,7 @@ export function MobilePreview({ form, onClose, businessName, businessLogo }: Mob
 
   // Thank You Screen
   if (screen === 'thankyou') {
-    const completeNode = getCompleteNodeForScore();
+    const completeNode = form.questions.find(n => n.type === 'complete');
     const hasPerk = completeNode?.hasPerk && completeNode?.perk;
     const perkText = completeNode?.perk || form.perk;
     

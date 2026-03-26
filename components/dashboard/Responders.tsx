@@ -67,11 +67,15 @@ const loadData = async () => {
     } = await supabase.auth.getUser();
     if (!user?.id) return;
 
+    console.log("user", user);
+
     // Step 1: Get all forms owned by this user
     const { data: forms } = await supabase
       .from("forms")
       .select("id")
       .eq("owner_id", user.id);
+
+      console.log("forms", forms);
 
     if (!forms || forms.length === 0) {
       setCustomers([]);

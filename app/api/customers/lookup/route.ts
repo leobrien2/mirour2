@@ -3,11 +3,12 @@ import { createClient } from "@/utils/supabase/server";
 
 export async function POST(request: Request) {
   try {
-    const { phone, token } = await request.json();
+    const { phone, token, email } = await request.json();
     const supabase = await createClient();
 
     console.log("phone", phone);
     console.log("token", token);
+    console.log("email", email);
 
     if (token) {
       // Lookup by token (customer ID)
@@ -16,6 +17,36 @@ export async function POST(request: Request) {
         .select("*")
         .eq("id", token)
         .single();
+
+      if (error || !customer) {
+        return NextResponse.json(
+          { error: "Profile not found" },
+          { status: 404 },
+        );
+      }
+      return NextResponse.json({
+        success: true,
+        profile: customer,
+        token: customer.id,
+      });
+    }
+
+    if (email) {
+      // Lookup by email (Checks primary email OR secondary_emails array)
+      const normalizedEmail = email.trim().toLowerCase();
+      console.log("normalizedEmail", normalizedEmail);
+
+      const { data: customers, error } = await supabase
+        .from("customers")
+        .select("*")
+        // Use Supabase OR syntax to check the array. 'cs' means "contains"
+        .or(
+          `email.eq.${normalizedEmail},secondary_emails.cs.{"${normalizedEmail}"}`,
+        )
+        .limit(1);
+
+      const customer = customers?.[0];
+      console.log("customer", customer);
 
       if (error || !customer) {
         return NextResponse.json(
@@ -65,17 +96,19 @@ export async function POST(request: Request) {
       const { data: customers, error } = await supabase
         .from("customers")
         .select("*")
-        .in("phone", Array.from(phoneVariations));
+        .in("phone", Array.from(phoneVariations))
+        .limit(1); // Added limit(1) for safety/performance
 
-      if (error || !customers || customers.length === 0) {
+      const customer = customers?.[0];
+      console.log("customer", customer);
+
+      if (error || !customer) {
         return NextResponse.json(
           { error: "Profile not found" },
           { status: 404 },
         );
       }
 
-      const customer = customers[0];
-      console.log("customer", customer);
       return NextResponse.json({
         success: true,
         profile: customer,
@@ -84,7 +117,7 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json(
-      { error: "Provide phone or token" },
+      { error: "Provide phone, email or token" },
       { status: 400 },
     );
   } catch (error) {

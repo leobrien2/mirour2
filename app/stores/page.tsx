@@ -5,7 +5,7 @@ import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { StoreManager } from "@/components/dashboard/StoreManager";
 import { useForms } from "@/hooks/useForms";
 import { useResponses } from "@/hooks/useResponses";
-import { DashboardForm, toDashboardForm } from "@/types/dashboard";
+import { DashboardForm, toDashboardForm, RawDbResponse } from "@/types/dashboard";
 import { useState, useEffect } from "react";
 
 export default function StoresPage() {
@@ -27,7 +27,7 @@ function StoresContent() {
       const enriched = await Promise.all(
         forms.map(async (form) => {
           const responses = await fetchResponses(form.id);
-          return toDashboardForm(form, responses);
+          return toDashboardForm(form, responses as unknown as RawDbResponse[]);
         }),
       );
       setDashboardForms(enriched);

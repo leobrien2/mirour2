@@ -8,7 +8,7 @@ import { ResponderProfile } from "@/components/dashboard/ResponderProfile";
 import { ResponsesView } from "@/components/dashboard/ResponsesView";
 import { useForms } from "@/hooks/useForms";
 import { useResponses } from "@/hooks/useResponses";
-import { DashboardForm, toDashboardForm } from "@/types/dashboard";
+import { DashboardForm, toDashboardForm, RawDbResponse } from "@/types/dashboard";
 
 type SubView =
   | { type: "list" }
@@ -37,7 +37,7 @@ function RespondersContent() {
       const enriched = await Promise.all(
         forms.map(async (form) => {
           const responses = await fetchResponses(form.id);
-          return toDashboardForm(form, responses);
+          return toDashboardForm(form, responses as unknown as RawDbResponse[]);
         }),
       );
       setDashboardForms(enriched);
@@ -58,7 +58,6 @@ function RespondersContent() {
       {view.type === "profile" ? (
         <ResponderProfile
           userId={view.userId}
-          forms={dashboardForms}
           onBack={() => setView({ type: "list" })}
           onNavigateToResponse={(formId, searchQuery) =>
             setView({ type: "responses", formId, search: searchQuery ?? "" })
@@ -72,7 +71,7 @@ function RespondersContent() {
               const enriched = await Promise.all(
                 forms.map(async (form) => {
                   const responses = await fetchResponses(form.id);
-                  return toDashboardForm(form, responses);
+                  return toDashboardForm(form, responses as unknown as RawDbResponse[]);
                 }),
               );
               setDashboardForms(enriched);

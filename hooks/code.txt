@@ -1,0 +1,4404 @@
+==================================================
+FILE: use-mobile.tsx
+==================================================
+
+import * as React from "react";
+
+const MOBILE_BREAKPOINT = 768;
+
+export function useIsMobile() {
+  const [isMobile, setIsMobile] = React.useState<boolean | undefined>(undefined);
+
+  React.useEffect(() => {
+    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`);
+    const onChange = () => {
+      setIsMobile(window.innerWidth < MOBILE_BREAKPOINT);
+    };
+    mql.addEventListener("change", onChange);
+    setIsMobile(window.innerWidth < MOBILE_BREAKPOINT);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+
+  return !!isMobile;
+}
+
+
+==================================================
+FILE: use-toast.ts
+==================================================
+
+import * as React from "react";
+
+import type { ToastActionElement, ToastProps } from "@/components/ui/toast";
+
+const TOAST_LIMIT = 1;
+const TOAST_REMOVE_DELAY = 1000000;
+
+type ToasterToast = ToastProps & {
+  id: string;
+  title?: React.ReactNode;
+  description?: React.ReactNode;
+  action?: ToastActionElement;
+};
+
+const actionTypes = {
+  ADD_TOAST: "ADD_TOAST",
+  UPDATE_TOAST: "UPDATE_TOAST",
+  DISMISS_TOAST: "DISMISS_TOAST",
+  REMOVE_TOAST: "REMOVE_TOAST",
+} as const;
+
+let count = 0;
+
+function genId() {
+  count = (count + 1) % Number.MAX_SAFE_INTEGER;
+  return count.toString();
+}
+
+type ActionType = typeof actionTypes;
+
+type Action =
+  | {
+      type: ActionType["ADD_TOAST"];
+      toast: ToasterToast;
+    }
+  | {
+      type: ActionType["UPDATE_TOAST"];
+      toast: Partial<ToasterToast>;
+    }
+  | {
+      type: ActionType["DISMISS_TOAST"];
+      toastId?: ToasterToast["id"];
+    }
+  | {
+      type: ActionType["REMOVE_TOAST"];
+      toastId?: ToasterToast["id"];
+    };
+
+interface State {
+  toasts: ToasterToast[];
+}
+
+const toastTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+const addToRemoveQueue = (toastId: string) => {
+  if (toastTimeouts.has(toastId)) {
+    return;
+  }
+
+  const timeout = setTimeout(() => {
+    toastTimeouts.delete(toastId);
+    dispatch({
+      type: "REMOVE_TOAST",
+      toastId: toastId,
+    });
+  }, TOAST_REMOVE_DELAY);
+
+  toastTimeouts.set(toastId, timeout);
+};
+
+export const reducer = (state: State, action: Action): State => {
+  switch (action.type) {
+    case "ADD_TOAST":
+      return {
+        ...state,
+        toasts: [action.toast, ...state.toasts].slice(0, TOAST_LIMIT),
+      };
+
+    case "UPDATE_TOAST":
+      return {
+        ...state,
+        toasts: state.toasts.map((t) => (t.id === action.toast.id ? { ...t, ...action.toast } : t)),
+      };
+
+    case "DISMISS_TOAST": {
+      const { toastId } = action;
+
+      // ! Side effects ! - This could be extracted into a dismissToast() action,
+      // but I'll keep it here for simplicity
+      if (toastId) {
+        addToRemoveQueue(toastId);
+      } else {
+        state.toasts.forEach((toast) => {
+          addToRemoveQueue(toast.id);
+        });
+      }
+
+      return {
+        ...state,
+        toasts: state.toasts.map((t) =>
+          t.id === toastId || toastId === undefined
+            ? {
+                ...t,
+                open: false,
+              }
+            : t,
+        ),
+      };
+    }
+    case "REMOVE_TOAST":
+      if (action.toastId === undefined) {
+        return {
+          ...state,
+          toasts: [],
+        };
+      }
+      return {
+        ...state,
+        toasts: state.toasts.filter((t) => t.id !== action.toastId),
+      };
+  }
+};
+
+const listeners: Array<(state: State) => void> = [];
+
+let memoryState: State = { toasts: [] };
+
+function dispatch(action: Action) {
+  memoryState = reducer(memoryState, action);
+  listeners.forEach((listener) => {
+    listener(memoryState);
+  });
+}
+
+type Toast = Omit<ToasterToast, "id">;
+
+function toast({ ...props }: Toast) {
+  const id = genId();
+
+  const update = (props: ToasterToast) =>
+    dispatch({
+      type: "UPDATE_TOAST",
+      toast: { ...props, id },
+    });
+  const dismiss = () => dispatch({ type: "DISMISS_TOAST", toastId: id });
+
+  dispatch({
+    type: "ADD_TOAST",
+    toast: {
+      ...props,
+      id,
+      open: true,
+      onOpenChange: (open) => {
+        if (!open) dismiss();
+      },
+    },
+  });
+
+  return {
+    id: id,
+    dismiss,
+    update,
+  };
+}
+
+function useToast() {
+  const [state, setState] = React.useState<State>(memoryState);
+
+  React.useEffect(() => {
+    listeners.push(setState);
+    return () => {
+      const index = listeners.indexOf(setState);
+      if (index > -1) {
+        listeners.splice(index, 1);
+      }
+    };
+  }, [state]);
+
+  return {
+    ...state,
+    toast,
+    dismiss: (toastId?: string) => dispatch({ type: "DISMISS_TOAST", toastId }),
+  };
+}
+
+export { useToast, toast };
+
+
+==================================================
+FILE: useAIFlowGen.ts
+==================================================
+
+// hooks/useAIFlowGen.ts
+"use client";
+
+import { useState, useCallback, useRef } from "react";
+import type { CanvasFlow } from "@/types/canvas";
+
+export type AIMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  generatedFlow?: CanvasFlow; // set when AI returns a flow
+};
+
+export type AIGenState = "idle" | "loading" | "error";
+
+export function useAIFlowGen() {
+  const [messages, setMessages] = useState<AIMessage[]>([]);
+  const [state, setState] = useState<AIGenState>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const sendMessage = useCallback(
+    async (userText: string) => {
+      if (!userText.trim() || state === "loading") return;
+
+      const userMsg: AIMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content: userText.trim(),
+      };
+
+      setMessages((prev) => [...prev, userMsg]);
+      setState("loading");
+      setError(null);
+
+      abortRef.current = new AbortController();
+
+      // Build message history in OpenAI/Mistral format
+      const apiMessages = [...messages, userMsg].map((m) => ({
+        role: m.role,
+        content:
+          m.role === "assistant" && m.generatedFlow
+            ? `[Generated flow: ${m.generatedFlow.name}]` // Compact for context
+            : m.content,
+      }));
+
+      try {
+        const res = await fetch("/api/ai/generate-flow", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: apiMessages }),
+          signal: abortRef.current.signal,
+        });
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const data = await res.json();
+
+        const assistantMsg: AIMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content:
+            data.type === "question"
+              ? data.content
+              : `I've created **${data.data?.name ?? "your flow"}** with ${data.data?.steps?.length ?? 0} steps. Click "Apply to Canvas" to load it.`,
+          generatedFlow: data.type === "flow" ? data.data : undefined,
+        };
+
+        setMessages((prev) => [...prev, assistantMsg]);
+        setState("idle");
+      } catch (err: any) {
+        if (err.name === "AbortError") return;
+        setError(err.message ?? "Something went wrong");
+        setState("error");
+      }
+    },
+    [messages, state],
+  );
+
+  const reset = useCallback(() => {
+    abortRef.current?.abort();
+    setMessages([]);
+    setState("idle");
+    setError(null);
+  }, []);
+
+  const lastGeneratedFlow =
+    messages.filter((m) => m.generatedFlow).at(-1)?.generatedFlow ?? null;
+
+  return { messages, state, error, sendMessage, reset, lastGeneratedFlow };
+}
+
+
+==================================================
+FILE: useAuth.tsx
+==================================================
+
+"use client";
+
+import {
+  useState,
+  useEffect,
+  createContext,
+  useContext,
+  ReactNode,
+} from "react";
+import { User, Session } from "@supabase/supabase-js";
+import { supabase } from "@/integrations/supabase/client";
+import { Profile } from "@/types/mirour";
+import { trackEvent, identifyUser, resetMixpanel } from "@/lib/mixpanel";
+
+const getURL = () => {
+  let url =
+    process?.env?.NEXT_PUBLIC_SITE_URL ?? // Set this to https://mirour.me
+    process?.env?.NEXT_PUBLIC_VERCEL_URL ?? // Automatically set by Vercel.
+    "http://localhost:3000/";
+
+  // Make sure to include `https://` when not localhost.
+  url = url.includes("http") ? url : `https://${url}`;
+
+  // Make sure to include a trailing `/`.
+  url = url.charAt(url.length - 1) === "/" ? url : `${url}/`;
+  return url;
+};
+
+interface AuthContextType {
+  user: User | null;
+  session: Session | null;
+  profile: Profile | null;
+  loading: boolean;
+  signUp: (
+    email: string,
+    password: string,
+    businessName: string,
+  ) => Promise<{ error: Error | null; user?: User | null }>;
+  signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
+  signOut: () => Promise<void>;
+  resetPassword: (email: string) => Promise<{ error: Error | null }>;
+  updateProfile: (
+    updates: Partial<Profile>,
+  ) => Promise<{ error: Error | null }>;
+  refreshProfile: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const fetchProfile = async (userId: string) => {
+    const { data, error } = await (supabase as any)
+      .from("admin_users")
+      .select("*")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Error fetching profile:", error);
+      return null;
+    }
+    return data as Profile | null;
+  };
+
+  const refreshProfile = async () => {
+    if (user) {
+      const profileData = await fetchProfile(user.id);
+      setProfile(profileData);
+    }
+  };
+
+  useEffect(() => {
+    // Set up auth state listener FIRST
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      setSession(session);
+      setUser(session?.user ?? null);
+
+      // Defer profile fetch with setTimeout to avoid deadlock
+      if (session?.user) {
+        identifyUser(session.user.id, { email: session.user.email });
+        setTimeout(() => {
+          fetchProfile(session.user.id).then((p) => {
+            setProfile(p);
+            if (p?.business_name) {
+              identifyUser(session.user.id, { business_name: p.business_name });
+            }
+          });
+        }, 0);
+      } else {
+        setProfile(null);
+      }
+    });
+
+    // THEN check for existing session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setUser(session?.user ?? null);
+      if (session?.user) {
+        identifyUser(session.user.id, { email: session.user.email });
+        fetchProfile(session.user.id).then((p) => {
+          setProfile(p);
+          if (p?.business_name) {
+            identifyUser(session.user.id, { business_name: p.business_name });
+          }
+        });
+      }
+      setLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const signUp = async (
+    email: string,
+    password: string,
+    businessName: string,
+  ) => {
+    const redirectUrl = getURL();
+
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: redirectUrl,
+        data: {
+          business_name: businessName,
+        },
+      },
+    });
+
+    if (!error && data?.user) {
+      identifyUser(data.user.id, { email, business_name: businessName });
+      trackEvent("Admin Signed Up");
+    }
+
+    return { error: error ? new Error(error.message) : null, user: data?.user };
+  };
+
+  const signIn = async (email: string, password: string) => {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    console.log(data, error);
+
+    if (!error && data?.user) {
+      identifyUser(data.user.id, { email });
+      trackEvent("Admin Logged In");
+    }
+
+    return { error: error ? new Error(error.message) : null };
+  };
+
+  const signOut = async () => {
+    trackEvent("Admin Logged Out");
+    await supabase.auth.signOut();
+    setProfile(null);
+    resetMixpanel();
+  };
+
+  const resetPassword = async (email: string) => {
+    const redirectUrl = `${getURL()}auth`;
+
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: redirectUrl,
+    });
+
+    return { error: error ? new Error(error.message) : null };
+  };
+
+  const updateProfile = async (updates: Partial<Profile>) => {
+    if (!user) return { error: new Error("Not authenticated") };
+
+    const { error } = await (supabase as any)
+      .from("admin_users")
+      .update(updates)
+      .eq("id", user.id);
+
+    if (!error) {
+      await refreshProfile();
+    }
+
+    return { error: error ? new Error(error.message) : null };
+  };
+
+  return (
+    <AuthContext.Provider
+      value={{
+        user,
+        session,
+        profile,
+        loading,
+        signUp,
+        signIn,
+        signOut,
+        resetPassword,
+        updateProfile,
+        refreshProfile,
+      }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error("useAuth must be used within an AuthProvider");
+  }
+  return context;
+}
+
+
+==================================================
+FILE: useCustomerData.tsx
+==================================================
+
+
+
+==================================================
+FILE: useFlowSessions.tsx
+==================================================
+
+// hooks/useFlowSession.ts
+"use client";
+
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { useFormAnalytics } from "@/hooks/useFormAnalytics";
+import { useResponses } from "@/hooks/useResponses";
+import { supabase } from "@/integrations/supabase/client";
+import type { CanvasFlow, CanvasStep } from "@/types/canvas";
+import type { Product } from "@/types/mirour";
+import { flowLog } from "@/lib/flowLogger";
+import {
+  saveCustomerLocally,
+  clearCustomerLocally,
+  getLocalCustomer,
+} from "@/lib/customerSession";
+
+// ─── Public types ─────────────────────────────────────────────────────────────
+
+export type FlowPhase = "loading" | "quiz" | "done";
+
+export interface ContactData {
+  firstName?: string;
+  lastName?: string;
+  email?: string;
+  phone?: string;
+}
+
+export interface FlowSessionState {
+  phase: FlowPhase;
+  currentStep: CanvasStep | null;
+  stepIndex: number;
+  totalSteps: number;
+  answers: Record<string, unknown>;
+  accumulatedTags: string[];
+  filteredProducts: Product[];
+  isSubmitting: boolean;
+  sessionId: string | null;
+  customerId: string | null;
+  canGoBack: boolean;
+}
+
+export interface FlowSessionActions {
+  init: (zoneId?: string) => Promise<void>;
+  selectOption: (
+    blockId: string,
+    value: string | string[],
+    opts?: {
+      tags?: string[];
+      nextStepId?: string | null;
+      autoAdvance?: boolean;
+    },
+  ) => void;
+  submitText: (blockId: string, value: string) => void;
+  submitRating: (blockId: string, value: number) => void;
+  advance: (nextStepId?: string | null) => void;
+  goBack: () => void;
+  goToStep: (stepId: string) => void;
+  submitContact: (data: ContactData) => Promise<{ error: string | null }>;
+  reset: () => void;
+}
+
+// ─── Hook params ──────────────────────────────────────────────────────────────
+
+export interface UseFlowSessionParams {
+  flow: CanvasFlow;
+  formId: string;
+  storeId?: string;
+  allProducts?: Product[];
+  redemptionCode?: string;
+  onComplete?: (responseId: string) => void;
+  isPreview?: boolean;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Must match customerSession.ts KEYS.token
+const CUSTOMER_TOKEN_KEY = "mirour:customertoken";
+
+// ─── Utility: tag-based product filter ───────────────────────────────────────
+
+export function filterProductsByTags(
+  products: Product[],
+  tags: string[],
+  strategy: "any" | "all" = "any",
+  max = 10,
+): Product[] {
+  if (products.length === 0) return [];
+  if (tags.length === 0) return products.slice(0, max);
+
+  const filtered = products.filter((p) => {
+    const ids: string[] = (p.tags ?? []).map((t: any) =>
+      typeof t === "string" ? t : (t.id as string),
+    );
+    return strategy === "all"
+      ? tags.every((tid) => ids.includes(tid))
+      : tags.some((tid) => ids.includes(tid));
+  });
+
+  return filtered.slice(0, max);
+}
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+function linearNextStepId(
+  flow: CanvasFlow,
+  currentStepId: string,
+): string | null {
+  const idx = flow.steps.findIndex((s) => s.id === currentStepId);
+  return flow.steps[idx + 1]?.id ?? null;
+}
+
+function buildQuestionLabelMap(flow: CanvasFlow): Record<string, string> {
+  const map: Record<string, string> = {};
+
+  for (const step of flow.steps) {
+    const heading = step.blocks?.find(
+      (b) => b.data?.type === "h1" || b.data?.type === "h2",
+    );
+    const fallbackLabel = (heading?.data as any)?.text ?? step.label ?? null;
+
+    for (const block of step.blocks ?? []) {
+      const data = block.data as any;
+      const type = data?.type as string | undefined;
+
+      if (type === "select")
+        map[block.id] = data.question ?? fallbackLabel ?? block.id;
+      else if (type === "text-input")
+        map[block.id] = data.placeholder ?? fallbackLabel ?? block.id;
+      else if (type === "rating")
+        map[block.id] = data.question ?? fallbackLabel ?? block.id;
+      else if (type === "contact") map[block.id] = "Contact Information";
+    }
+  }
+
+  return map;
+}
+
+// ─── Main hook ────────────────────────────────────────────────────────────────
+
+export function useFlowSession({
+  flow,
+  formId,
+  storeId,
+  allProducts = [],
+  redemptionCode,
+  onComplete,
+  isPreview = false,
+}: UseFlowSessionParams): FlowSessionState & FlowSessionActions {
+  const analytics = useFormAnalytics(formId, isPreview);
+  const { submitResponse } = useResponses();
+
+  // ── Core state ─────────────────────────────────────────────────────────────
+
+  const [phase, setPhase] = useState<FlowPhase>("loading");
+  const [currentStepId, setCurrentStepId] = useState<string | null>(
+    flow.steps[0]?.id ?? null,
+  );
+  const [history, setHistory] = useState<string[]>([]);
+  const [answers, setAnswers] = useState<Record<string, unknown>>({});
+  const [accumulatedTags, setAccumulatedTags] = useState<string[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [customerId, setCustomerId] = useState<string | null>(null);
+
+  // ── Stable refs ────────────────────────────────────────────────────────────
+
+  const currentStepIdRef = useRef<string | null>(currentStepId);
+  const phaseRef = useRef<FlowPhase>("loading");
+  const answersRef = useRef<Record<string, unknown>>({});
+  const answerTimestampsRef = useRef<Record<string, string>>({});
+  const customerIdRef = useRef<string | null>(null);
+  const tagsByBlockRef = useRef<Record<string, string[]>>({});
+  const responseIdRef = useRef<string | null>(null);
+  const accumulatedTagsRef = useRef<string[]>([]);
+  const analyticsSessionIdRef = useRef<string | null>(null);
+  const sessionCompletedRef = useRef(false);
+
+  const questionLabelMap = useMemo(
+    () => buildQuestionLabelMap(flow),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [formId],
+  );
+
+  useEffect(() => {
+    currentStepIdRef.current = currentStepId;
+  }, [currentStepId]);
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+  useEffect(() => {
+    answersRef.current = answers;
+  }, [answers]);
+  useEffect(() => {
+    accumulatedTagsRef.current = accumulatedTags;
+  }, [accumulatedTags]);
+
+  // ── Derived ────────────────────────────────────────────────────────────────
+
+  const currentStep = useMemo(
+    () => flow.steps.find((s) => s.id === currentStepId) ?? null,
+    [flow.steps, currentStepId],
+  );
+
+  const stepIndex = useMemo(
+    () =>
+      currentStepId
+        ? Math.max(
+            0,
+            flow.steps.findIndex((s) => s.id === currentStepId),
+          )
+        : 0,
+    [flow.steps, currentStepId],
+  );
+
+  const filteredProducts = useMemo(
+    () => filterProductsByTags(allProducts, accumulatedTags),
+    [allProducts, accumulatedTags],
+  );
+
+  // ── Commit Response ────────────────────────────────────────────────────────
+
+  const commitResponse = useCallback(
+    async (cid: string | null, contactData?: ContactData) => {
+      if (isPreview) return null;
+      if (responseIdRef.current) return responseIdRef.current;
+
+      const sessionId = analyticsSessionIdRef.current;
+      const fullName = contactData
+        ? [contactData.firstName, contactData.lastName]
+            .filter(Boolean)
+            .join(" ") || null
+        : null;
+
+      // 1. Build enriched answers
+      const enrichedAnswers: Record<string, any> = {};
+      for (const [blockId, value] of Object.entries(answersRef.current)) {
+        enrichedAnswers[blockId] = {
+          label: questionLabelMap[blockId] ?? blockId,
+          value,
+          answeredAt: answerTimestampsRef.current[blockId] ?? null,
+        };
+      }
+
+      flowLog("ENRICHED_ANSWERS_BUILT", {
+        count: Object.keys(enrichedAnswers).length,
+        answers: enrichedAnswers,
+      });
+
+      // 2. Insert form_responses row
+      const finalCode = redemptionCode
+        ? `${redemptionCode}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
+        : `PERK-${Date.now()}`;
+
+      const responsePayload = {
+        form_id: formId,
+        customer_id: cid ?? undefined,
+        customer_name: fullName ?? undefined,
+        customer_email: contactData?.email ?? undefined,
+        customer_phone: contactData?.phone ?? undefined,
+        answers: enrichedAnswers,
+        redemption_code: finalCode,
+        session_id: sessionId,
+      };
+
+      flowLog(
+        "DB_WRITE form_responses — insert",
+        responsePayload,
+        "db_write",
+        "form_responses",
+      );
+
+      const { error: responseError, data: responseData } =
+        await submitResponse(responsePayload);
+
+      if (responseError || !responseData) {
+        flowLog(
+          "FORM_RESPONSE_ERROR",
+          { error: responseError?.message },
+          "error",
+        );
+        return null;
+      }
+
+      flowLog("FORM_RESPONSE_SAVED", { responseId: responseData.id });
+      responseIdRef.current = responseData.id;
+
+      // 3. Bulk insert submission_answers
+      const answerRows = Object.entries(answersRef.current).map(
+        ([blockId, value]) => ({
+          response_id: responseData.id,
+          form_id: formId,
+          customer_id: cid,
+          question_id: blockId,
+          question_label: questionLabelMap[blockId] ?? null,
+          answer_value:
+            typeof value === "string" ? value : JSON.stringify(value),
+        }),
+      );
+
+      if (answerRows.length > 0) {
+        flowLog(
+          "DB_WRITE submission_answers — bulk insert",
+          { count: answerRows.length, rows: answerRows },
+          "db_write",
+          "submission_answers",
+        );
+        (supabase as any)
+          .from("submission_answers")
+          .insert(answerRows)
+          .then(({ error: answersError }: { error: any }) => {
+            if (answersError) {
+              flowLog(
+                "SUBMISSION_ANSWERS_ERROR",
+                { error: answersError.message },
+                "error",
+              );
+              console.error(
+                "[submission_answers] bulk insert failed:",
+                answersError.message,
+              );
+            } else {
+              flowLog("SUBMISSION_ANSWERS_SAVED", { count: answerRows.length });
+            }
+          });
+      }
+
+      // 4. Backfill response_id on flow_sessions row
+      if (sessionId) {
+        flowLog(
+          "DB_WRITE flow_sessions — backfill response_id",
+          { sessionId, responseId: responseData.id },
+          "db_write",
+          "flow_sessions",
+        );
+        (supabase as any)
+          .from("flow_sessions")
+          .update({ response_id: responseData.id })
+          .eq("id", sessionId)
+          .then(({ error: sessionRespErr }: { error: any }) => {
+            if (sessionRespErr) {
+              flowLog(
+                "SESSION_UPDATE_ERROR",
+                { field: "response_id", error: sessionRespErr.message },
+                "error",
+              );
+            }
+          });
+      }
+
+      onComplete?.(responseData.id);
+      return responseData.id;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      formId,
+      isPreview,
+      redemptionCode,
+      questionLabelMap,
+      submitResponse,
+      onComplete,
+    ],
+  );
+
+  // ── Abandon on unmount ─────────────────────────────────────────────────────
+
+  useEffect(() => {
+    return () => {
+      if (phaseRef.current !== "done" && !sessionCompletedRef.current) {
+        flowLog("SESSION_ABANDON", { formId, phase: phaseRef.current }, "warn");
+        analytics.markAbandoned();
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Session Completion Watcher ─────────────────────────────────────────────
+
+  useEffect(() => {
+    if (phase !== "quiz" || !currentStep) return;
+
+    const isLastStep = flow.steps[flow.steps.length - 1]?.id === currentStep.id;
+    flowLog("isLastStep", isLastStep);
+    if (!isLastStep) return;
+    if (sessionCompletedRef.current) return;
+
+    sessionCompletedRef.current = true;
+
+    const finalizeSession = async () => {
+      let finalResponseId = responseIdRef.current;
+
+      if (!finalResponseId && Object.keys(answersRef.current).length > 0) {
+        flowLog("AUTO_SAVING_ANONYMOUS_RESPONSE", {
+          cid: customerIdRef.current,
+        });
+        finalResponseId = await commitResponse(customerIdRef.current);
+      }
+
+      flowLog(
+        "COMPLETE_SESSION",
+        { responseId: finalResponseId },
+        "db_write",
+        "flow_sessions",
+      );
+      await analytics.completeSession(finalResponseId ?? "");
+
+  
+      flowLog(
+        "LOCALSTORAGE_CLEAR",
+        { keys: ["mirour:customertoken", "mirour:customer:profile"] },
+        "warn",
+      );
+
+
+
+      flowLog("setPhase", "done");
+    };
+
+    finalizeSession();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentStep?.id, phase, commitResponse]);
+
+  // ── Init ───────────────────────────────────────────────────────────────────
+
+  const init = useCallback(
+    async (zoneId?: string) => {
+      flowLog("FLOW_INIT_START", {
+        formId,
+        isPreview,
+        zoneId,
+        totalSteps: flow.steps.length,
+      });
+      setPhase("loading");
+      const firstStepId = flow.steps[0]?.id ?? null;
+
+      if (isPreview) {
+        flowLog("FLOW_INIT_PREVIEW_MODE", { firstStepId });
+        setCurrentStepId(firstStepId);
+        setHistory([]);
+        setAnswers({});
+        setAccumulatedTags([]);
+        answerTimestampsRef.current = {};
+        tagsByBlockRef.current = {};
+        responseIdRef.current = null;
+        customerIdRef.current = null;
+        accumulatedTagsRef.current = [];
+        setCustomerId(null);
+        setPhase(firstStepId ? "quiz" : "done");
+        return;
+      }
+
+      // ✅ Fix 1: read from the unified key "mirour:customertoken"
+      const existingCustomerId =
+        typeof window !== "undefined"
+          ? (localStorage.getItem(CUSTOMER_TOKEN_KEY) ?? null)
+          : null;
+
+      flowLog(
+        "LOCALSTORAGE_READ",
+        { key: CUSTOMER_TOKEN_KEY, value: existingCustomerId },
+        "db_read",
+      );
+
+      customerIdRef.current = existingCustomerId;
+      setCustomerId(existingCustomerId);
+
+      await analytics.trackVisit(zoneId);
+
+      const sessionId = await analytics.startSession(firstStepId ?? undefined, {
+        flowVersion: "v1",
+        customerId: existingCustomerId,
+      });
+
+      analyticsSessionIdRef.current = sessionId;
+
+      if (existingCustomerId && sessionId) {
+        flowLog(
+          "DB_WRITE flow_sessions — backfill customer_id on init",
+          { sessionId, customerId: existingCustomerId },
+          "db_write",
+          "flow_sessions",
+        );
+        (supabase as any)
+          .from("flow_sessions")
+          .update({ customer_id: existingCustomerId })
+          .eq("id", sessionId)
+          .then();
+      }
+
+      if (storeId && sessionId) {
+        await analytics.recordJourney(sessionId, storeId);
+      }
+
+      setCurrentStepId(firstStepId);
+      setHistory([]);
+      setAnswers({});
+      setAccumulatedTags([]);
+      answerTimestampsRef.current = {};
+      tagsByBlockRef.current = {};
+      responseIdRef.current = null;
+      accumulatedTagsRef.current = [];
+      setPhase(firstStepId ? "quiz" : "done");
+      flowLog("FLOW_INIT_COMPLETE", { firstStepId, sessionId });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [flow.steps, storeId, isPreview],
+  );
+
+  // ── Navigation ─────────────────────────────────────────────────────────────
+
+  const goToStep = useCallback(
+    (stepId: string) => {
+      const current = currentStepIdRef.current;
+      flowLog("STEP_ADVANCE", { from: current, to: stepId }, "nav");
+      if (current) setHistory((prev) => [...prev, current]);
+      setCurrentStepId(stepId);
+      analytics.updateProgress(stepId);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [analytics],
+  );
+
+  const advance = useCallback(
+    async (overrideNextStepId?: string | null) => {
+      const csid = currentStepIdRef.current;
+      if (!csid) return;
+      const nextId =
+        overrideNextStepId === undefined
+          ? linearNextStepId(flow, csid)
+          : overrideNextStepId;
+
+      if (nextId) {
+        flowLog("STEP_ADVANCE", { from: csid, to: nextId }, "nav");
+        goToStep(nextId);
+      } else {
+        flowLog("STEP_ADVANCE", { from: csid, to: "done" }, "nav");
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [flow, goToStep],
+  );
+
+  const goBack = useCallback(() => {
+    setHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const updated = [...prev];
+      const prevStepId = updated.pop()!;
+      flowLog(
+        "STEP_BACK",
+        { to: prevStepId, from: currentStepIdRef.current },
+        "nav",
+      );
+      setCurrentStepId(prevStepId);
+      analytics.updateProgress(prevStepId);
+      return updated;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Answer recording ───────────────────────────────────────────────────────
+
+  const recordAnswer = useCallback(
+    (blockId: string, value: unknown) => {
+      const now = new Date().toISOString();
+      answerTimestampsRef.current[blockId] = now;
+      setAnswers((prev) => ({ ...prev, [blockId]: value }));
+
+      const csid = currentStepIdRef.current;
+      if (csid) analytics.updateProgress(csid, { questionId: blockId, value });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // ── Select option ──────────────────────────────────────────────────────────
+
+  const selectOption = useCallback(
+    (
+      blockId: string,
+      value: string | string[],
+      opts: {
+        tags?: string[];
+        nextStepId?: string | null;
+        autoAdvance?: boolean;
+      } = {},
+    ) => {
+      const { tags = [], nextStepId, autoAdvance = false } = opts;
+      flowLog("ANSWER_SELECTED", {
+        blockId,
+        value,
+        tags,
+        nextStepId,
+        autoAdvance,
+      });
+
+      recordAnswer(blockId, value);
+
+      setAccumulatedTags((prev) => {
+        const oldTags = tagsByBlockRef.current[blockId] ?? [];
+        const stripped = prev.filter((t) => !oldTags.includes(t));
+        const next = Array.from(new Set([...stripped, ...tags]));
+        if (JSON.stringify(next) === JSON.stringify(prev)) return prev;
+        tagsByBlockRef.current[blockId] = tags;
+        accumulatedTagsRef.current = next;
+        flowLog("TAGS_UPDATED", {
+          blockId,
+          addedTags: tags,
+          accumulatedTags: next,
+        });
+        return next;
+      });
+
+      if (autoAdvance) advance(nextStepId);
+    },
+    [recordAnswer, advance],
+  );
+
+  // ── Text / Rating ──────────────────────────────────────────────────────────
+
+  const submitText = useCallback(
+    (blockId: string, value: string) => {
+      flowLog("TEXT_SUBMITTED", { blockId, value });
+      recordAnswer(blockId, value);
+    },
+    [recordAnswer],
+  );
+
+  const submitRating = useCallback(
+    (blockId: string, value: number) => {
+      flowLog("RATING_SUBMITTED", { blockId, value });
+      recordAnswer(blockId, value);
+    },
+    [recordAnswer],
+  );
+
+  // ── Contact submit ─────────────────────────────────────────────────────────
+
+const submitContact = useCallback(
+  async (data: ContactData): Promise<{ error: string | null }> => {
+    if (isPreview) return { error: null };
+
+    setIsSubmitting(true);
+    flowLog("CONTACT_SUBMIT_START", {
+      hasFirstName: !!data.firstName,
+      hasLastName: !!data.lastName,
+      hasEmail: !!data.email,
+      hasPhone: !!data.phone,
+    });
+
+    try {
+      const sessionId = analyticsSessionIdRef.current;
+      const fullName =
+        [data.firstName, data.lastName].filter(Boolean).join(" ") || null;
+
+      let cid: string;
+
+      // ── Path 1: Known customer — skip DB entirely ──────────────────────
+      if (customerIdRef.current) {
+        cid = customerIdRef.current;
+        flowLog("CONTACT_SUBMIT_SKIP_UPSERT", {
+          reason: "customer already identified via floating bar login",
+          customerId: cid,
+        });
+
+        // Silently patch any new data — fire & forget
+        if (data.email || data.phone || fullName) {
+          (supabase as any)
+            .from("customers")
+            .update({
+              ...(fullName ? { name: fullName } : {}),
+              ...(data.firstName ? { first_name: data.firstName } : {}),
+              ...(data.email ? { email: data.email } : {}),
+              ...(data.phone ? { phone: data.phone } : {}),
+              last_active: new Date().toISOString(),
+            })
+            .eq("id", cid)
+            .then(({ error: patchErr }: { error: any }) => {
+              if (patchErr)
+                flowLog(
+                  "CUSTOMER_PATCH_ERROR",
+                  { error: patchErr.message },
+                  "error",
+                );
+            });
+        }
+
+        // ── Path 2: Customer with phone — SELECT first, then INSERT/UPDATE ─
+      } else if (data.phone) {
+        flowLog(
+          "DB_READ customers — lookup by phone",
+          { phone: data.phone, storeId },
+          "db_read",
+          "customers",
+        );
+
+        // Step 1: Find existing customer by phone
+        const { data: existing, error: lookupError } = await (supabase as any)
+          .from("customers")
+          .select("id")
+          .eq("phone", data.phone)
+          .maybeSingle();
+
+        if (lookupError) {
+          flowLog(
+            "CUSTOMER_LOOKUP_ERROR",
+            { error: lookupError.message },
+            "error",
+          );
+          return {
+            error:
+              "We encountered an issue verifying your phone number. Please try again.",
+          };
+        }
+
+        if (existing) {
+          // Step 2a: Found — UPDATE by primary key
+          cid = existing.id;
+          flowLog("CUSTOMER_FOUND", {
+            customerId: cid,
+            method: "phone_lookup",
+          });
+
+          (supabase as any)
+            .from("customers")
+            .update({
+              ...(fullName ? { name: fullName } : {}),
+              ...(data.firstName ? { first_name: data.firstName } : {}),
+              ...(data.email ? { email: data.email } : {}),
+              traits: { tags: accumulatedTagsRef.current },
+              last_active: new Date().toISOString(),
+            })
+            .eq("id", cid)
+            .then(({ error: updateErr }: { error: any }) => {
+              if (updateErr) {
+                flowLog(
+                  "CUSTOMER_UPDATE_ERROR",
+                  { error: updateErr.message },
+                  "error",
+                );
+              } else {
+                flowLog("CUSTOMER_UPDATED", { customerId: cid });
+              }
+            });
+        } else {
+          // Step 2b: Not found — INSERT fresh row without email first
+          const insertPayload = {
+            name: fullName,
+            first_name: data.firstName ?? null,
+            phone: data.phone,
+            store_id: storeId ?? null,
+            traits: { tags: accumulatedTagsRef.current },
+            last_active: new Date().toISOString(),
+          };
+          flowLog(
+            "DB_WRITE customers — insert (new phone customer)",
+            insertPayload,
+            "db_write",
+            "customers",
+          );
+
+          const { data: newCustomer, error: insertError } = await (
+            supabase as any
+          )
+            .from("customers")
+            .insert(insertPayload)
+            .select("id")
+            .single();
+
+          if (insertError || !newCustomer) {
+            flowLog(
+              "CUSTOMER_INSERT_ERROR",
+              { error: insertError?.message },
+              "error",
+            );
+            return {
+              error:
+                "We couldn't save your details at this time. Please try again.",
+            };
+          }
+
+          cid = newCustomer.id;
+          flowLog("CUSTOMER_SAVED", {
+            customerId: cid,
+            method: "insert_phone",
+          });
+
+          // Patch email separately by primary key
+          if (data.email) {
+            (supabase as any)
+              .from("customers")
+              .update({ email: data.email })
+              .eq("id", cid)
+              .then(({ error: emailErr }: { error: any }) => {
+                if (emailErr) {
+                  flowLog(
+                    "CUSTOMER_EMAIL_PATCH_ERROR",
+                    { error: emailErr.message },
+                    "error",
+                  );
+                } else {
+                  flowLog("CUSTOMER_EMAIL_PATCHED", { customerId: cid });
+                }
+              });
+          }
+        }
+
+        saveCustomerLocally({
+          id: cid,
+          name: fullName,
+          firstname: data.firstName ?? null,
+          email: data.email ?? null,
+          phone: data.phone ?? null,
+        });
+        flowLog("LOCALSTORAGE_WRITE", {
+          key: "mirour:customertoken + mirour:customer:profile",
+          cid,
+        });
+
+        customerIdRef.current = cid;
+        setCustomerId(cid);
+
+        // ── Path 3: Email only (no phone) — safe select then insert/update ──────────
+      } else if (data.email) {
+        flowLog(
+          "DB_READ customers — lookup by email",
+          { email: data.email, storeId },
+          "db_read",
+          "customers",
+        );
+
+        // Step 1: Find existing customer by email
+        let query = (supabase as any)
+          .from("customers")
+          .select("id")
+          .eq("email", data.email);
+       if (storeId) {
+         query = query.eq("store_id", storeId);
+       } else {
+         query = query.is("store_id", null); // ← must be explicit
+       }
+
+        const { data: existing, error: lookupError } =
+          await query.maybeSingle();
+
+        if (lookupError) {
+          flowLog(
+            "CUSTOMER_LOOKUP_ERROR",
+            { error: lookupError.message },
+            "error",
+          );
+          return {
+            error:
+              "We encountered an issue verifying your email address. Please try again.",
+          };
+        }
+
+        if (existing) {
+          // Step 2a: Found — UPDATE by primary key
+          cid = existing.id;
+          flowLog("CUSTOMER_FOUND", {
+            customerId: cid,
+            method: "email_lookup",
+          });
+
+          (supabase as any)
+            .from("customers")
+            .update({
+              ...(fullName ? { name: fullName } : {}),
+              ...(data.firstName ? { first_name: data.firstName } : {}),
+              traits: { tags: accumulatedTagsRef.current },
+              last_active: new Date().toISOString(),
+            })
+            .eq("id", cid)
+            .then(({ error: updateErr }: { error: any }) => {
+              if (updateErr) {
+                flowLog(
+                  "CUSTOMER_UPDATE_ERROR",
+                  { error: updateErr.message },
+                  "error",
+                );
+              } else {
+                flowLog("CUSTOMER_UPDATED", { customerId: cid });
+              }
+            });
+        } else {
+          // Step 2b: Not found — INSERT fresh row
+          const insertPayload = {
+            name: fullName,
+            first_name: data.firstName ?? null,
+            email: data.email,
+            phone: null,
+            store_id: storeId ?? null,
+            traits: { tags: accumulatedTagsRef.current },
+            last_active: new Date().toISOString(),
+          };
+
+          flowLog(
+            "DB_WRITE customers — insert (new email customer)",
+            insertPayload,
+            "db_write",
+            "customers",
+          );
+
+          const { data: newCustomer, error: insertError } = await (
+            supabase as any
+          )
+            .from("customers")
+            .insert(insertPayload)
+            .select("id")
+            .single();
+
+          if (insertError || !newCustomer) {
+            flowLog(
+              "CUSTOMER_INSERT_ERROR",
+              { error: insertError?.message },
+              "error",
+            );
+            return {
+              error:
+                "We couldn't save your details at this time. Please try again.",
+            };
+          }
+
+          cid = newCustomer.id;
+          flowLog("CUSTOMER_SAVED", {
+            customerId: cid,
+            method: "insert_email",
+          });
+        }
+
+        saveCustomerLocally({
+          id: cid,
+          name: fullName,
+          firstname: data.firstName ?? null,
+          email: data.email,
+          phone: null,
+        });
+
+        flowLog("LOCALSTORAGE_WRITE", {
+          key: "mirour:customertoken + mirour:customer:profile",
+          cid,
+        });
+
+        customerIdRef.current = cid;
+        setCustomerId(cid);
+      } else {
+        // Fallback if neither email nor phone is provided but somehow passed validation
+        return {
+          error: "Please provide either an email address or a phone number.",
+        };
+      }
+
+      // ── Backfill session — runs for all 3 paths ────────────────────────
+      if (sessionId) {
+        flowLog(
+          "DB_WRITE flow_sessions — backfill customer_id post-contact",
+          { sessionId, customerId: cid },
+          "db_write",
+          "flow_sessions",
+        );
+        const { error: sessionCustErr } = await (supabase as any)
+          .from("flow_sessions")
+          .update({ customer_id: cid })
+          .eq("id", sessionId);
+        if (sessionCustErr) {
+          flowLog(
+            "SESSION_UPDATE_ERROR",
+            { field: "customer_id", error: sessionCustErr.message },
+            "error",
+          );
+        }
+      }
+
+      // ── Commit response ────────────────────────────────────────────────
+      const responseId = await commitResponse(cid, data);
+      if (!responseId) {
+        return { error: "We couldn't submit your response. Please try again." };
+      }
+
+      flowLog("CONTACT_SUBMIT_SUCCESS", {
+        responseId,
+        customerId: cid,
+        sessionId,
+      });
+      return { error: null };
+    } catch (err: any) {
+      flowLog(
+        "CONTACT_SUBMIT_FATAL_ERROR",
+        { error: err?.message || err },
+        "error",
+      );
+      return {
+        error:
+          "An unexpected error occurred while saving your information. Please try again.",
+      };
+    } finally {
+      setIsSubmitting(false);
+    }
+  },
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  [commitResponse, storeId, isPreview],
+);
+  // ── Reset ──────────────────────────────────────────────────────────────────
+
+  const reset = useCallback(() => {
+    flowLog("SESSION_RESET", { formId }, "warn");
+
+    if (typeof window !== "undefined") {
+      // ✅ Fix 4: clearCustomerLocally handles mirour:customertoken
+      //    and mirour:customer:profile. Also clear saved items + any
+      //    legacy mirour_ underscore keys.
+      // clearCustomerLocally();
+      Object.keys(localStorage).forEach((key) => {
+        if (key.startsWith("mirour_") || key.startsWith("mirour:saved:")) {
+          localStorage.removeItem(key);
+        }
+      });
+    }
+
+    setPhase("loading");
+    setCurrentStepId(flow.steps[0]?.id ?? null);
+    setHistory([]);
+    setAnswers({});
+    setAccumulatedTags([]);
+    setIsSubmitting(false);
+    setCustomerId(null);
+    answerTimestampsRef.current = {};
+    tagsByBlockRef.current = {};
+    responseIdRef.current = null;
+    accumulatedTagsRef.current = [];
+    customerIdRef.current = null;
+    sessionCompletedRef.current = false;
+    analyticsSessionIdRef.current = null;
+  }, [flow.steps, formId]);
+
+  // ── Return ─────────────────────────────────────────────────────────────────
+
+  return {
+    phase,
+    currentStep,
+    stepIndex,
+    totalSteps: flow.steps.length,
+    answers,
+    accumulatedTags,
+    filteredProducts,
+    isSubmitting,
+    sessionId: analytics.sessionId,
+    customerId,
+    canGoBack: history.length > 0,
+    init,
+    selectOption,
+    submitText,
+    submitRating,
+    advance,
+    goBack,
+    goToStep,
+    submitContact,
+    reset,
+  };
+}
+
+
+==================================================
+FILE: useFormAnalytics.ts
+==================================================
+
+// hooks/useFormAnalytics.ts
+"use client";
+
+import { useCallback, useRef } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { v4 as uuidv4 } from "uuid";
+import { flowLog } from "@/lib/flowLogger";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const VISITOR_ID_KEY = "mirour_visitor_id"; // permanent device ID — keep underscore
+const CUSTOMER_TOKEN_KEY = "mirour:customertoken"; // ✅ matches customerSession.ts
+
+// ─── Visitor ID ───────────────────────────────────────────────────────────────
+
+const generateVisitorId = (): string => "v_" + uuidv4();
+
+export const getOrCreateVisitorId = (): string => {
+  if (typeof window === "undefined") return generateVisitorId();
+  let visitorId = localStorage.getItem(VISITOR_ID_KEY);
+  if (!visitorId) {
+    visitorId = generateVisitorId();
+    localStorage.setItem(VISITOR_ID_KEY, visitorId);
+  }
+  return visitorId;
+};
+
+// ─── Device / browser helpers ─────────────────────────────────────────────────
+
+const getDeviceType = (): "mobile" | "tablet" | "desktop" => {
+  if (typeof navigator === "undefined") return "desktop";
+  const ua = navigator.userAgent;
+  if (/tablet|ipad|playbook|silk/i.test(ua)) return "tablet";
+  if (
+    /mobile|iphone|ipod|android|blackberry|opera mini|windows phone/i.test(ua)
+  )
+    return "mobile";
+  return "desktop";
+};
+
+const getOS = (): string => {
+  if (typeof navigator === "undefined") return "Unknown";
+  const ua = navigator.userAgent;
+  if (/windows/i.test(ua)) return "Windows";
+  if (/mac/i.test(ua)) return "macOS";
+  if (/linux/i.test(ua)) return "Linux";
+  if (/android/i.test(ua)) return "Android";
+  if (/ipad|iphone|ipod/i.test(ua)) return "iOS";
+  return "Unknown";
+};
+
+const getBrowser = (): string => {
+  if (typeof navigator === "undefined") return "Unknown";
+  const ua = navigator.userAgent;
+  if (/chrome|crios/i.test(ua) && !/edge|edg|opr|brave/i.test(ua))
+    return "Chrome";
+  if (/safari/i.test(ua) && !/chrome|crios|opr|edg/i.test(ua)) return "Safari";
+  if (/firefox|fxios/i.test(ua)) return "Firefox";
+  if (/edg/i.test(ua)) return "Edge";
+  if (/opr/i.test(ua)) return "Opera";
+  return "Unknown";
+};
+
+// ─── Main hook ────────────────────────────────────────────────────────────────
+
+export const useFormAnalytics = (
+  formId: string | undefined,
+  isPreview = false,
+) => {
+  const sessionIdRef = useRef<string | null>(null);
+  const visitorIdRef = useRef<string>(getOrCreateVisitorId());
+  const visitedNodesRef = useRef<string[]>([]);
+  const partialAnswersRef = useRef<Record<string, unknown>>({});
+  const sessionStartRef = useRef<number | null>(null);
+  const nodeStartRef = useRef<number | null>(null);
+
+  const pendingUpdatesRef = useRef<
+    Array<{ nodeId: string; answer?: { questionId: string; value: unknown } }>
+  >([]);
+  const sessionReadyRef = useRef(false);
+
+  // ── Generic analytics event ───────────────────────────────────────────────
+
+  const trackEvent = useCallback(
+    async (eventType: string, payload: any = {}) => {
+      if (isPreview) return;
+
+      try {
+        const anonId =
+          typeof window !== "undefined"
+            ? sessionStorage.getItem("anon_id") || ""
+            : "";
+        if (!anonId) return;
+
+        await (supabase as any).from("analytics_events").insert({
+          anon_id: anonId,
+          event_type: eventType,
+          payload,
+          location_id: payload.location_id || null,
+        });
+      } catch (e) {
+        console.error("Failed to track event", e);
+      }
+    },
+    [isPreview],
+  );
+
+  // ── Flush queued updates after session is ready ───────────────────────────
+
+  const flushPendingUpdates = useCallback(async () => {
+    if (isPreview) return;
+
+    const sessionId = sessionIdRef.current;
+    if (!sessionId || pendingUpdatesRef.current.length === 0) return;
+
+    for (const update of pendingUpdatesRef.current) {
+      if (
+        visitedNodesRef.current[visitedNodesRef.current.length - 1] !==
+        update.nodeId
+      ) {
+        visitedNodesRef.current = [...visitedNodesRef.current, update.nodeId];
+      }
+      if (update.answer) {
+        partialAnswersRef.current = {
+          ...partialAnswersRef.current,
+          [update.answer.questionId]: update.answer.value,
+        };
+      }
+    }
+    pendingUpdatesRef.current = [];
+
+    const flushPayload = {
+      current_node_id:
+        visitedNodesRef.current[visitedNodesRef.current.length - 1] || null,
+      visited_nodes: visitedNodesRef.current as unknown as null,
+      partial_answers: partialAnswersRef.current as unknown as null,
+      last_activity_at: new Date().toISOString(),
+    };
+    flowLog(
+      "DB_WRITE flow_sessions — flush pending updates",
+      { sessionId, ...flushPayload },
+      "db_write",
+      "flow_sessions",
+    );
+    try {
+      await supabase
+        .from("flow_sessions")
+        .update(flushPayload)
+        .eq("id", sessionId);
+    } catch (error) {
+      flowLog("ANALYTICS_ERROR", { fn: "flushPendingUpdates", error }, "error");
+      console.error("Error flushing pending updates:", error);
+    }
+  }, [isPreview]);
+
+  // ── Track QR scan / page visit ────────────────────────────────────────────
+
+  const trackVisit = useCallback(
+    async (zoneId?: string) => {
+      if (isPreview) return;
+      if (!formId) return;
+
+      const preExistingId = localStorage.getItem(VISITOR_ID_KEY);
+      const isReturnVisitor = !!preExistingId;
+
+      const visitPayload = {
+        form_id: formId,
+        visitor_id: visitorIdRef.current,
+        referrer: document.referrer || null,
+        user_agent: navigator.userAgent || null,
+        zone_id: zoneId || null,
+        is_return_visitor: isReturnVisitor,
+      };
+      flowLog(
+        "DB_WRITE form_visits — insert",
+        visitPayload,
+        "db_write",
+        "form_visits",
+      );
+
+      try {
+        await supabase.from("form_visits").insert(visitPayload);
+      } catch (error) {
+        flowLog("ANALYTICS_ERROR", { fn: "trackVisit", error }, "error");
+        console.error("Error tracking visit:", error);
+      }
+    },
+    [formId, isPreview],
+  );
+
+  // ── Start a new flow session ──────────────────────────────────────────────
+
+  const startSession = useCallback(
+    async (
+      initialNodeId?: string,
+      opts?: {
+        flowVersion?: string;
+        customerId?: string | null;
+      },
+    ): Promise<string | null> => {
+      if (isPreview) {
+        const fakeId = "preview_" + uuidv4();
+        sessionIdRef.current = fakeId;
+        sessionReadyRef.current = true;
+        visitedNodesRef.current = initialNodeId ? [initialNodeId] : [];
+        partialAnswersRef.current = {};
+        sessionStartRef.current = Date.now();
+        nodeStartRef.current = Date.now();
+        return fakeId;
+      }
+
+      if (!formId) return null;
+
+      try {
+        const sessionId = uuidv4();
+        sessionStartRef.current = Date.now();
+
+        if (typeof sessionStorage !== "undefined") {
+          sessionStorage.setItem(
+            `mirour_session_start_${sessionId}`,
+            String(sessionStartRef.current),
+          );
+        }
+
+        // ✅ Reads "mirour:customertoken" — now consistent with customerSession.ts
+        const customerId =
+          opts?.customerId ??
+          (typeof window !== "undefined"
+            ? localStorage.getItem(CUSTOMER_TOKEN_KEY)
+            : null) ??
+          null;
+
+        const sessionPayload = {
+          id: sessionId,
+          form_id: formId,
+          visitor_id: visitorIdRef.current,
+          current_node_id: initialNodeId || null,
+          visited_nodes: initialNodeId ? [initialNodeId] : [],
+          partial_answers: {},
+          status: "in_progress",
+          flow_version: opts?.flowVersion || "v1",
+          device_type: getDeviceType(),
+          os: getOS(),
+          browser: getBrowser(),
+          customer_id: customerId,
+        };
+        flowLog(
+          "DB_WRITE flow_sessions — insert",
+          sessionPayload,
+          "db_write",
+          "flow_sessions",
+        );
+
+        const { error } = await supabase
+          .from("flow_sessions")
+          .insert(sessionPayload);
+
+        if (error) throw error;
+
+        // Async location fetch — fire and forget
+        flowLog("FETCH geo — ipapi.co", null, "db_read");
+        fetch("https://ipapi.co/json/")
+          .then((res) => res.json())
+          .then((data) => {
+            if (data?.city) {
+              const locUpdate = {
+                city: data.city,
+                region: data.region,
+                country: data.country_name,
+              };
+              flowLog(
+                "DB_WRITE flow_sessions — update location",
+                { sessionId, ...locUpdate },
+                "db_write",
+                "flow_sessions",
+              );
+              supabase
+                .from("flow_sessions")
+                .update(locUpdate)
+                .eq("id", sessionId)
+                .then();
+            }
+          })
+          .catch(() => {});
+
+        visitedNodesRef.current = initialNodeId ? [initialNodeId] : [];
+        partialAnswersRef.current = {};
+        sessionIdRef.current = sessionId;
+        sessionReadyRef.current = true;
+        nodeStartRef.current = Date.now();
+
+        await flushPendingUpdates();
+        await trackEvent("quiz_start", { form_id: formId, initialNodeId });
+
+        return sessionId;
+      } catch (error) {
+        console.error("Error starting session:", error);
+        return null;
+      }
+    },
+    [formId, isPreview, flushPendingUpdates, trackEvent],
+  );
+
+  // ── Record a visitor journey row ──────────────────────────────────────────
+
+  const recordJourney = useCallback(
+    async (sessionId: string, storeId: string, customerId?: string) => {
+      if (isPreview) return;
+
+      try {
+        const { data: existing } = await (supabase as any)
+          .from("visitor_location_journeys")
+          .select("id")
+          .eq("visitor_id", visitorIdRef.current)
+          .eq("session_id", sessionId)
+          .maybeSingle();
+
+        if (!existing) {
+          const journeyPayload = {
+            visitor_id: visitorIdRef.current,
+            customer_id: customerId || null,
+            store_id: storeId,
+            session_id: sessionId,
+          };
+          flowLog(
+            "DB_WRITE visitor_location_journeys — insert",
+            journeyPayload,
+            "db_write",
+            "visitor_location_journeys",
+          );
+          await (supabase as any)
+            .from("visitor_location_journeys")
+            .insert(journeyPayload);
+        } else {
+          flowLog(
+            "DB_READ visitor_location_journeys — already exists, skip",
+            { sessionId },
+            "db_read",
+          );
+        }
+      } catch (error) {
+        flowLog("ANALYTICS_ERROR", { fn: "recordJourney", error }, "error");
+        console.error("Error recording journey:", error);
+      }
+    },
+    [isPreview],
+  );
+
+  // ── Update progress ───────────────────────────────────────────────────────
+
+  const updateProgress = useCallback(
+    async (nodeId: string, answer?: { questionId: string; value: unknown }) => {
+      if (isPreview) return;
+
+      if (!sessionReadyRef.current || !sessionIdRef.current) {
+        pendingUpdatesRef.current.push({ nodeId, answer });
+        return;
+      }
+
+      const sessionId = sessionIdRef.current;
+      const prevNodeId =
+        visitedNodesRef.current[visitedNodesRef.current.length - 1];
+
+      try {
+        let timeInPrevNode = 0;
+        let enteredAtIso: string | undefined = undefined;
+
+        if (nodeStartRef.current) {
+          timeInPrevNode = Math.round(
+            (Date.now() - nodeStartRef.current) / 1000,
+          );
+          enteredAtIso = new Date(nodeStartRef.current).toISOString();
+        }
+
+        if (prevNodeId && prevNodeId !== nodeId) {
+          const nodePayload = {
+            session_id: sessionId,
+            form_id: formId,
+            node_id: prevNodeId,
+            time_spent_seconds: timeInPrevNode,
+            entered_at: enteredAtIso,
+            exited_at: new Date().toISOString(),
+            is_dropoff: false,
+          };
+          flowLog(
+            "DB_WRITE flow_session_nodes — insert",
+            nodePayload,
+            "db_write",
+            "flow_session_nodes",
+          );
+          (supabase as any)
+            .from("flow_session_nodes")
+            .insert(nodePayload)
+            .then();
+        }
+
+        if (prevNodeId !== nodeId) {
+          nodeStartRef.current = Date.now();
+        }
+
+        if (
+          visitedNodesRef.current[visitedNodesRef.current.length - 1] !== nodeId
+        ) {
+          visitedNodesRef.current = [...visitedNodesRef.current, nodeId];
+        }
+
+        if (answer) {
+          partialAnswersRef.current = {
+            ...partialAnswersRef.current,
+            [answer.questionId]: answer.value,
+          };
+        }
+
+        const progressUpdate = {
+          current_node_id: nodeId,
+          visited_nodes: visitedNodesRef.current as unknown as null,
+          partial_answers: partialAnswersRef.current as unknown as null,
+          last_activity_at: new Date().toISOString(),
+        };
+        flowLog(
+          "DB_WRITE flow_sessions — update progress",
+          { sessionId, nodeId, ...progressUpdate },
+          "db_write",
+          "flow_sessions",
+        );
+        await supabase
+          .from("flow_sessions")
+          .update(progressUpdate)
+          .eq("id", sessionId);
+
+        if (answer) {
+          await trackEvent(`${answer.questionId.toLowerCase()}_answer`, {
+            value: answer.value,
+          });
+        }
+      } catch (error) {
+        console.error("Error updating progress:", error);
+      }
+    },
+    [formId, isPreview, trackEvent],
+  );
+
+  // ── Complete session ──────────────────────────────────────────────────────
+
+  const completeSession = useCallback(
+    async (responseId: string, customerId?: string) => {
+      if (isPreview) return;
+
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+
+      const lastNodeId =
+        visitedNodesRef.current[visitedNodesRef.current.length - 1];
+      const nodeTimeSec = nodeStartRef.current
+        ? Math.round((Date.now() - nodeStartRef.current) / 1000)
+        : null;
+      const enteredAt = nodeStartRef.current
+        ? new Date(nodeStartRef.current).toISOString()
+        : null;
+
+      const storedStart =
+        typeof sessionStorage !== "undefined"
+          ? sessionStorage.getItem(`mirour_session_start_${sessionId}`)
+          : null;
+      const startTime =
+        sessionStartRef.current ??
+        (storedStart ? parseInt(storedStart, 10) : null);
+      const totalTimeSec =
+        startTime != null ? Math.round((Date.now() - startTime) / 1000) : null;
+
+      if (typeof sessionStorage !== "undefined") {
+        sessionStorage.removeItem(`mirour_session_start_${sessionId}`);
+      }
+
+      // ✅ Reads "mirour:customertoken" — now consistent with customerSession.ts
+      const resolvedCustomerId =
+        customerId ??
+        (typeof window !== "undefined"
+          ? localStorage.getItem(CUSTOMER_TOKEN_KEY)
+          : null) ??
+        null;
+
+      const completePayload = {
+        sessionId,
+        responseId,
+        customerId: resolvedCustomerId,
+        totalTimeSec,
+        lastNodeId: lastNodeId || null,
+        nodeTimeSec,
+        enteredAt,
+      };
+      flowLog("FETCH /api/sessions/complete", completePayload, "db_write");
+
+      try {
+        const res = await fetch("/api/sessions/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(completePayload),
+        });
+
+        const json = await res.json();
+        if (!json.ok) {
+          flowLog(
+            "ANALYTICS_ERROR",
+            { fn: "completeSession", error: json.error },
+            "error",
+          );
+          console.error("completeSession failed:", json.error);
+        }
+      } catch (err) {
+        flowLog(
+          "ANALYTICS_ERROR",
+          { fn: "completeSession", error: err },
+          "error",
+        );
+        console.error("completeSession fetch error:", err);
+      }
+    },
+    [isPreview],
+  );
+
+  // ── Abandon session ───────────────────────────────────────────────────────
+
+  const markAbandoned = useCallback(() => {
+    if (isPreview) return;
+
+    const sessionId = sessionIdRef.current;
+    if (!sessionId) return;
+
+    const dropOffNode =
+      visitedNodesRef.current[visitedNodesRef.current.length - 1] || null;
+
+    const storedStart =
+      typeof sessionStorage !== "undefined"
+        ? sessionStorage.getItem(`mirour_session_start_${sessionId}`)
+        : null;
+    const startTime =
+      sessionStartRef.current ??
+      (storedStart ? parseInt(storedStart, 10) : null);
+    const totalTimeSec =
+      startTime != null ? Math.round((Date.now() - startTime) / 1000) : null;
+
+    const payload = JSON.stringify({ sessionId, dropOffNode, totalTimeSec });
+    flowLog(
+      "BEACON /api/sessions/abandon",
+      { sessionId, dropOffNode, totalTimeSec },
+      "warn",
+    );
+
+    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+      navigator.sendBeacon("/api/sessions/abandon", payload);
+    } else {
+      fetch("/api/sessions/abandon", {
+        method: "POST",
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    }
+  }, [isPreview]);
+
+  // ── Track QR scan interaction ─────────────────────────────────────────────
+
+  const trackQrScan = useCallback(
+    async (storeId: string, customerId?: string, zoneId?: string) => {
+      if (isPreview) return;
+      if (!formId || !storeId) return;
+
+      const sessionId = sessionIdRef.current;
+
+      try {
+        await (supabase as any).from("interactions").insert({
+          store_id: storeId,
+          session_id: sessionId || null,
+          customer_id: customerId || null,
+          event_type: "qr_scan",
+          metadata: {
+            form_id: formId,
+            zone_id: zoneId || null,
+            scanned_at: new Date().toISOString(),
+          },
+        });
+
+        if (customerId) {
+          await (supabase as any).rpc("increment_customer_visit_count", {
+            p_customer_id: customerId,
+          });
+        }
+      } catch (error) {
+        console.error("Error tracking QR scan:", error);
+      }
+    },
+    [formId, isPreview],
+  );
+
+  // ── Track link click interaction ──────────────────────────────────────────
+
+  const trackLinkClick = useCallback(
+    async (
+      storeId: string | null | undefined,
+      linkUrl: string,
+      linkTitle: string,
+      customerId?: string,
+    ) => {
+      if (isPreview) return;
+      if (!storeId) return;
+
+      const sessionId = sessionIdRef.current;
+      if (!sessionId) return;
+
+      try {
+        await (supabase as any).from("interactions").insert({
+          store_id: storeId,
+          session_id: sessionId,
+          customer_id: customerId || null,
+          event_type: "link_clicked",
+          metadata: {
+            url: linkUrl,
+            title: linkTitle,
+            clicked_at: new Date().toISOString(),
+          },
+        });
+      } catch (error) {
+        console.error("Error tracking link click:", error);
+      }
+    },
+    [isPreview],
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  return {
+    visitorId: visitorIdRef.current,
+    sessionId: sessionIdRef.current,
+    trackVisit,
+    trackQrScan,
+    startSession,
+    recordJourney,
+    updateProgress,
+    completeSession,
+    markAbandoned,
+    trackEvent,
+    trackLinkClick,
+    getDeviceType,
+  };
+};
+
+
+==================================================
+FILE: useForms.tsx
+==================================================
+
+"use client";
+
+import { useState, useEffect, createContext, useContext } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { Form, FlowNode, FlowType } from "@/types/mirour";
+import { useAuth } from "./useAuth";
+import { useToast } from "./use-toast";
+
+// ─── Context ──────────────────────────────────────────────────────────────
+
+type FormsContextType = ReturnType<typeof useFormsInternal>;
+const FormsContext = createContext<FormsContextType | undefined>(undefined);
+
+export function FormsProvider({ children }: { children: React.ReactNode }) {
+  const value = useFormsInternal();
+  return (
+    <FormsContext.Provider value={value}>{children}</FormsContext.Provider>
+  );
+}
+
+export function useForms() {
+  const ctx = useContext(FormsContext);
+  if (!ctx) throw new Error("useForms must be used within a FormsProvider");
+  return ctx;
+}
+
+// ─── Implementation ────────────────────────────────────────────────────────
+
+function useFormsInternal() {
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [forms, setForms] = useState<Form[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchForms = async () => {
+    if (!user) {
+      setForms([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    const { data, error } = await supabase
+      .from("forms")
+      .select("*")
+      .eq("owner_id", user.id)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Error fetching forms:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load forms",
+        variant: "destructive",
+      });
+    } else {
+      // Parse questions from JSONB
+      const parsedForms = (data || []).map((form) => ({
+        ...form,
+        store_id: form.store_id ?? undefined,
+        zone_id: form.zone_id ?? undefined,
+        flow_type: (form.flow_type as FlowType) ?? undefined,
+        internal_goal: form.internal_goal ?? undefined,
+        questions: (form.questions as unknown as FlowNode[]) || [],
+      }));
+      setForms(parsedForms);
+    }
+    setLoading(false);
+  };
+
+  const userId = user?.id;
+  useEffect(() => {
+    if (userId) {
+      fetchForms();
+    } else {
+      setForms([]);
+      setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  const createForm = async (formData: {
+    name: string;
+    internal_goal?: string;
+    questions: FlowNode[];
+    perk: string;
+    capture_name: boolean;
+    capture_email: boolean;
+    capture_phone: boolean;
+    show_start_page?: boolean;
+    store_id?: string;
+  }) => {
+    if (!user) return { error: new Error("Not authenticated"), data: null };
+
+    const { data, error } = await supabase
+      .from("forms")
+      .insert({
+        owner_id: user.id,
+        store_id: formData.store_id, // Link to store
+        name: formData.name,
+        internal_goal: formData.internal_goal,
+        questions: formData.questions as unknown as any,
+        perk: formData.perk,
+        capture_name: formData.capture_name,
+        capture_email: formData.capture_email,
+        capture_phone: formData.capture_phone,
+        show_start_page: formData.show_start_page ?? true,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      toast({
+        title: "Error",
+        description: "Failed to create form",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message), data: null };
+    }
+
+    const newForm = {
+      ...data,
+      store_id: data.store_id ?? undefined,
+      zone_id: data.zone_id ?? undefined,
+      flow_type: (data.flow_type as FlowType) ?? undefined,
+      internal_goal: data.internal_goal ?? undefined,
+      questions: (data.questions as unknown as FlowNode[]) || [],
+    };
+
+    setForms((prev) => [newForm, ...prev]);
+    toast({
+      title: "Success",
+      description: "Form created successfully",
+    });
+
+    return { error: null, data: newForm };
+  };
+
+  const updateForm = async (formId: string, updates: Partial<Form>) => {
+    // Save original state for possible rollback
+    const originalForms = [...forms];
+    
+    // Optimistic update
+    setForms((prev) =>
+      prev.map((f) => (f.id === formId ? { ...f, ...updates } : f)),
+    );
+
+    const updateData: any = { ...updates };
+    if (updates.questions) {
+      updateData.questions = updates.questions as unknown as any;
+    }
+
+    const { error } = await supabase
+      .from("forms")
+      .update(updateData)
+      .eq("id", formId);
+
+    if (error) {
+      console.error("updateForm Error:", error);
+      // Rollback to original state
+      setForms(originalForms);
+      toast({
+        title: "Error",
+        description: "Failed to update form",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message) };
+    }
+
+    return { error: null };
+  };
+
+  const deleteForm = async (formId: string) => {
+    const { error } = await supabase.from("forms").delete().eq("id", formId);
+
+    if (error) {
+      toast({
+        title: "Error",
+        description: "Failed to delete form",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message) };
+    }
+
+    setForms((prev) => prev.filter((f) => f.id !== formId));
+    toast({
+      title: "Success",
+      description: "Form deleted successfully",
+    });
+
+    return { error: null };
+  };
+
+  const toggleFormActive = async (formId: string) => {
+    const form = forms.find((f) => f.id === formId);
+    if (!form) return { error: new Error("Form not found") };
+
+    return updateForm(formId, { active: !form.active });
+  };
+
+  const fetchForm = async (formId: string) => {
+    if (!user) return null;
+    const { data, error } = await supabase
+      .from("forms")
+      .select("*")
+      .eq("id", formId)
+      .single();
+
+    if (error || !data) {
+      console.error("Error fetching form:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load latest form data",
+        variant: "destructive",
+      });
+      return null;
+    }
+
+    const parsedForm = {
+      ...data,
+      store_id: data.store_id ?? undefined,
+      zone_id: data.zone_id ?? undefined,
+      flow_type: (data.flow_type as FlowType) ?? undefined,
+      internal_goal: data.internal_goal ?? undefined,
+      questions: (data.questions as unknown as FlowNode[]) || [],
+    };
+
+    setForms((prev) => {
+      const exists = prev.some((f) => f.id === formId);
+      if (exists) {
+        return prev.map((f) => (f.id === formId ? parsedForm : f));
+      }
+      return [parsedForm, ...prev];
+    });
+
+    return parsedForm;
+  };
+
+  return {
+    forms,
+    loading,
+    fetchForms,
+    fetchForm,
+    createForm,
+    updateForm,
+    deleteForm,
+    toggleFormActive,
+  };
+}
+
+
+==================================================
+FILE: useLocationAnalytics.ts
+==================================================
+
+import { useState, useEffect, useCallback } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import type { LocationMetrics } from "@/types/analytics";
+
+/**
+ * Fetches store-level rollup analytics from the
+ * get_location_metrics() Postgres RPC.
+ *
+ * Usage:
+ *   const { metrics, loading, error, refetch } = useLocationAnalytics(storeId);
+ */
+export const useLocationAnalytics = (storeId: string | undefined) => {
+  const [metrics, setMetrics] = useState<LocationMetrics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+
+  const fetch = useCallback(async () => {
+    if (!storeId) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const { data, error: rpcError } = await (supabase as any).rpc(
+        "get_location_metrics",
+        { p_store_id: storeId },
+      );
+
+      if (rpcError) throw rpcError;
+      setMetrics(data as LocationMetrics);
+    } catch (err: any) {
+      console.error("useLocationAnalytics:", err);
+      setError(err?.message || "Failed to load location metrics");
+    } finally {
+      setLoading(false);
+    }
+  }, [storeId]);
+
+  useEffect(() => {
+    fetch();
+  }, [fetch]);
+
+  return { metrics, loading, error, refetch: fetch };
+};
+
+
+==================================================
+FILE: useResponses.tsx
+==================================================
+
+import { useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import {
+  Response as MirourResponse,
+  SubmissionAnswer,
+  AnswerRevision,
+} from "@/types/mirour";
+import { useToast } from "./use-toast";
+import { flowLog } from "@/lib/flowLogger";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface SubmitResponseParams {
+  form_id: string;
+  customer_name?: string;
+  customer_email?: string;
+  customer_phone?: string;
+  customer_id?: string | null;
+  answers: Record<string, any>;
+  redemption_code: string;
+  additional_feedback?: string;
+  session_id?: string | null;
+  form_snapshot?: Record<string, any> | null;
+}
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
+export function useResponses() {
+  const { toast } = useToast();
+  const [responses, setResponses] = useState<MirourResponse[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  // ── Fetch all responses for a form ─────────────────────────────────────────
+
+  const fetchResponses = async (formId: string): Promise<MirourResponse[]> => {
+    setLoading(true);
+    flowLog("DB_READ responses — fetchResponses", { formId }, "db_read", "responses");
+
+    const { data, error } = await supabase
+      .from("responses")
+      .select("*")
+      .eq("form_id", formId)
+      .order("submitted_at", { ascending: false });
+
+    if (error) {
+      flowLog("RESPONSES_ERROR", { fn: "fetchResponses", error: error.message }, "error");
+      console.error("Error fetching responses:", error);
+      toast({
+        title: "Error",
+        description: "Failed to load responses",
+        variant: "destructive",
+      });
+      setResponses([]);
+      setLoading(false);
+      return [];
+    }
+
+    const parsedData: MirourResponse[] = (data || []).map((r) => {
+      // Cast to any to safely read new columns (session_id, form_snapshot)
+      // that Supabase generated types don't include yet.
+      // Remove these casts after running: npx supabase gen types typescript
+      const row = r as any;
+      return {
+        id: r.id,
+        form_id: r.form_id,
+        answers: (r.answers as Record<string, any>) || {},
+        redemption_code: r.redemption_code,
+        perk_redeemed: r.perk_redeemed,
+        submitted_at: r.submitted_at,
+        customer_name: r.customer_name ?? undefined,
+        customer_email: r.customer_email ?? undefined,
+        customer_phone: r.customer_phone ?? undefined,
+        additional_feedback: r.additional_feedback ?? undefined,
+        notes: r.notes ?? undefined,
+        session_id: row.session_id ?? null,
+        form_snapshot: row.form_snapshot ?? null,
+      };
+    });
+
+    setResponses(parsedData);
+    setLoading(false);
+    flowLog("RESPONSES_FETCHED", { count: parsedData.length, formId }, "db_read");
+    return parsedData;
+  };
+
+  // ── Submit a new response ──────────────────────────────────────────────────
+
+const submitResponse = async (params: SubmitResponseParams) => {
+  const {
+    form_id,
+    customer_name,
+    customer_email,
+    customer_phone,
+    customer_id = null,
+    answers,
+    redemption_code,
+    additional_feedback,
+    session_id = null,
+    form_snapshot = null,
+  } = params;
+  const uniqueCode = redemption_code
+    ? `${redemption_code}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
+    : `PERK-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+
+  const insertPayload = {
+    form_id,
+    customer_name: customer_name || null,
+    customer_email: customer_email || null,
+    customer_phone: customer_phone || null,
+    customer_id: customer_id || null,
+    answers,
+    redemption_code: uniqueCode,
+    additional_feedback: additional_feedback || null,
+    session_id,
+  };
+  flowLog("DB_WRITE responses — insert", insertPayload, "db_write", "responses");
+
+  const { data, error } = await (supabase as any)
+    .from("responses")
+    .insert(insertPayload)
+    .select()
+    .single();
+
+  if (error) {
+    flowLog("RESPONSES_ERROR", { fn: "submitResponse", error: error.message }, "error");
+    console.error("Error submitting response:", error);
+    return { error: new Error(error.message), data: null };
+  }
+
+  flowLog("RESPONSE_SAVED", { responseId: data.id, redemption_code: uniqueCode });
+  return { error: null, data };
+};
+
+
+  // ── Mark perk as redeemed ──────────────────────────────────────────────────
+
+  const markAsRedeemed = async (responseId: string) => {
+    flowLog("DB_WRITE responses — mark redeemed", { responseId }, "db_write", "responses");
+    const { error } = await supabase
+      .from("responses")
+      .update({ perk_redeemed: true })
+      .eq("id", responseId);
+
+    if (error) {
+      flowLog("RESPONSES_ERROR", { fn: "markAsRedeemed", error: error.message }, "error");
+      toast({
+        title: "Error",
+        description: "Failed to mark as redeemed",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message) };
+    }
+
+    setResponses((prev) =>
+      prev.map((r) =>
+        r.id === responseId ? { ...r, perk_redeemed: true } : r,
+      ),
+    );
+
+    toast({ title: "Success", description: "Perk marked as redeemed" });
+    return { error: null };
+  };
+
+  // ── Delete a response ──────────────────────────────────────────────────────
+
+  const deleteResponse = async (responseId: string) => {
+    flowLog("DB_WRITE responses — delete", { responseId }, "db_write", "responses");
+    const { error } = await supabase
+      .from("responses")
+      .delete()
+      .eq("id", responseId);
+
+    if (error) {
+      flowLog("RESPONSES_ERROR", { fn: "deleteResponse", error: error.message }, "error");
+      toast({
+        title: "Error",
+        description: "Failed to delete response",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message) };
+    }
+
+    setResponses((prev) => prev.filter((r) => r.id !== responseId));
+    return { error: null };
+  };
+
+  // ── Update customer info on a response ────────────────────────────────────
+
+  const updateResponseCustomerInfo = async (
+    responseId: string,
+    updates: {
+      customer_name?: string;
+      customer_email?: string;
+      customer_phone?: string;
+    },
+  ) => {
+    const { error } = await supabase
+      .from("responses")
+      .update(updates)
+      .eq("id", responseId);
+
+    if (error) {
+      toast({
+        title: "Error",
+        description: "Failed to update customer info",
+        variant: "destructive",
+      });
+      return { error: new Error(error.message) };
+    }
+
+    setResponses((prev) =>
+      prev.map((r) => (r.id === responseId ? { ...r, ...updates } : r)),
+    );
+
+    toast({ title: "Success", description: "Customer info updated" });
+    return { error: null };
+  };
+
+  // ── Find response by redemption code ──────────────────────────────────────
+
+  const findByRedemptionCode = async (code: string) => {
+    const { data, error } = await supabase
+      .from("responses")
+      .select("*, forms!inner(name, perk, owner_id)")
+      .eq("redemption_code", code)
+      .maybeSingle();
+
+    if (error) {
+      console.error("Error finding redemption code:", error);
+      return { error: new Error(error.message), data: null };
+    }
+
+    return { error: null, data };
+  };
+
+  // ── Redeem perk by code ───────────────────────────────────────────────────
+
+  const redeemByCode = async (code: string) => {
+    const { error } = await supabase
+      .from("responses")
+      .update({ perk_redeemed: true })
+      .eq("redemption_code", code);
+
+    if (error) return { error: new Error(error.message) };
+    return { error: null };
+  };
+
+  // ── Fetch response + its session in one query ─────────────────────────────
+  // Joins via session_id FK — shows timing, device, node path
+
+  const fetchResponseWithSession = async (responseId: string) => {
+    // Cast to any — session_id FK join not in generated types yet
+    const { data, error } = await (supabase as any)
+      .from("responses")
+      .select(
+        `
+        *,
+        flow_sessions!session_id (
+          id,
+          visitor_id,
+          visited_nodes,
+          total_time_seconds,
+          device_type,
+          browser,
+          os,
+          city,
+          country,
+          started_at,
+          completed_at
+        )
+      `,
+      )
+      .eq("id", responseId)
+      .single();
+
+    if (error) {
+      console.error("Error fetching response with session:", error);
+      return { error: new Error(error.message), data: null };
+    }
+
+    return { error: null, data };
+  };
+
+  // ── Fetch submission answers for a response ───────────────────────────────
+  // One row per question — queryable source of truth for answer history
+
+  const fetchSubmissionAnswers = async (
+    responseId: string,
+  ): Promise<{ error: Error | null; data: SubmissionAnswer[] | null }> => {
+    flowLog("DB_READ submission_answers — fetchSubmissionAnswers", { responseId }, "db_read", "submission_answers");
+    const { data, error } = await (supabase as any)
+      .from("submission_answers")
+      .select("*")
+      .eq("response_id", responseId)
+      .order("answered_at", { ascending: true });
+
+    if (error) {
+      flowLog("RESPONSES_ERROR", { fn: "fetchSubmissionAnswers", error: error.message }, "error");
+      console.error("Error fetching submission answers:", error);
+      return { error: new Error(error.message), data: null };
+    }
+
+    flowLog("SUBMISSION_ANSWERS_FETCHED", { responseId, count: (data as any[])?.length ?? 0 }, "db_read");
+    return { error: null, data: data as SubmissionAnswer[] };
+  };
+
+  // ── Fetch answer revisions for a session ─────────────────────────────────
+  // Every time user went back and changed their mind — ordered chronologically
+
+  const fetchAnswerRevisions = async (
+    sessionId: string,
+  ): Promise<{ error: Error | null; data: AnswerRevision[] | null }> => {
+    flowLog("DB_READ answer_revisions — fetchAnswerRevisions", { sessionId }, "db_read", "answer_revisions");
+    const { data, error } = await (supabase as any)
+      .from("answer_revisions")
+      .select("*")
+      .eq("session_id", sessionId)
+      .order("revised_at", { ascending: true });
+
+    if (error) {
+      flowLog("RESPONSES_ERROR", { fn: "fetchAnswerRevisions", error: error.message }, "error");
+      console.error("Error fetching answer revisions:", error);
+      return { error: new Error(error.message), data: null };
+    }
+
+    flowLog("ANSWER_REVISIONS_FETCHED", { sessionId, count: (data as any[])?.length ?? 0 }, "db_read");
+    return { error: null, data: data as AnswerRevision[] };
+  };
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  return {
+    responses,
+    loading,
+    fetchResponses,
+    submitResponse,
+    markAsRedeemed,
+    deleteResponse,
+    updateResponseCustomerInfo,
+    findByRedemptionCode,
+    redeemByCode,
+    fetchResponseWithSession,
+    fetchSubmissionAnswers,
+    fetchAnswerRevisions,
+  };
+}
+
+
+==================================================
+FILE: useSavedItems.ts
+==================================================
+
+"use client";
+
+import { useState, useEffect, useCallback, useRef } from "react";
+import {
+  saveItem as dbSave,
+  unsaveItem as dbUnsave,
+  getSavedItems,
+  linkSavedItemsToCustomer,
+} from "@/lib/savedItems";
+import { SavedItem } from "@/types/mirour";
+
+const localKey = (sid: string) => `mirour:saved:${sid}`;
+
+export interface UseSavedItemsReturn {
+  savedItems: SavedItem[];
+  savedProductIds: Set<string>;
+  loading: boolean;
+  isSaved: (productId: string) => boolean;
+  toggleSave: (productId: string) => Promise<void>;
+  refetch: () => Promise<void>;
+}
+
+export function useSavedItems(
+  sessionId: string | null,
+  storeId: string | null | undefined,
+  customerId: string | null,
+): UseSavedItemsReturn {
+  const [savedItems, setSavedItems] = useState<SavedItem[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const prevCustomerIdRef = useRef<string | null>(null);
+  const migrationLockRef = useRef(false);
+  const initialLoadDoneRef = useRef(false);
+
+  const savedProductIds = new Set(savedItems.map((i) => i.product_id));
+
+  // ─── localStorage helpers ──────────────────────────────────────────────────
+
+  const readLocal = useCallback((): string[] => {
+    if (!sessionId || typeof window === "undefined") return [];
+    try {
+      return JSON.parse(localStorage.getItem(localKey(sessionId)) || "[]");
+    } catch {
+      return [];
+    }
+  }, [sessionId]);
+
+  const writeLocal = useCallback(
+    (ids: string[]) => {
+      if (!sessionId || typeof window === "undefined") return;
+      localStorage.setItem(localKey(sessionId), JSON.stringify(ids));
+    },
+    [sessionId],
+  );
+
+  // ─── DB load ───────────────────────────────────────────────────────────────
+
+  const loadItems = useCallback(async () => {
+    if (!sessionId) return;
+    setLoading(true);
+    try {
+      // ✅ Fix 1: getSavedItems(sessionId, customerId?) — storeId removed
+      const dbItems = await getSavedItems(sessionId, customerId || undefined);
+
+      if (dbItems.length > 0) {
+        setSavedItems(dbItems);
+        if (!customerId) writeLocal(dbItems.map((i) => i.product_id));
+        return;
+      }
+
+      // DB empty — check localStorage fallback (anon only)
+      if (!customerId) {
+        const localIds = readLocal();
+        if (localIds.length > 0) {
+          setSavedItems(
+            localIds.map(
+              (pid) =>
+                ({
+                  id: `local:${pid}`,
+                  product_id: pid,
+                  session_id: sessionId,
+                  customer_id: null,
+                  store_id: storeId ?? null,
+                  created_at: new Date().toISOString(),
+                }) as SavedItem,
+            ),
+          );
+          return;
+        }
+      }
+
+      setSavedItems([]);
+    } catch (e) {
+      console.error("useSavedItems load error", e);
+    } finally {
+      setLoading(false);
+      initialLoadDoneRef.current = true;
+    }
+  }, [sessionId, storeId, customerId, readLocal, writeLocal]);
+
+  // ─── Initial load ──────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (sessionId && !initialLoadDoneRef.current) {
+      loadItems();
+    }
+  }, [sessionId, loadItems]);
+
+  // ─── Migration: null → string customerId ──────────────────────────────────
+
+  useEffect(() => {
+    const prev = prevCustomerIdRef.current;
+    prevCustomerIdRef.current = customerId;
+
+    if (!customerId || prev === customerId) return;
+    if (!sessionId || migrationLockRef.current) return;
+
+    migrationLockRef.current = true;
+    (async () => {
+      try {
+        await linkSavedItemsToCustomer(sessionId, customerId);
+        await loadItems();
+        if (typeof window !== "undefined") {
+          localStorage.removeItem(localKey(sessionId));
+        }
+      } finally {
+        migrationLockRef.current = false;
+      }
+    })();
+  }, [customerId, sessionId, loadItems]);
+
+  // ─── Toggle (optimistic) ──────────────────────────────────────────────────
+
+  const toggleSave = useCallback(
+    async (productId: string) => {
+      if (!sessionId) return;
+      const alreadySaved = savedProductIds.has(productId);
+
+      if (alreadySaved) {
+        // Optimistic remove
+        setSavedItems((prev) => prev.filter((i) => i.product_id !== productId));
+        if (!customerId) {
+          writeLocal(readLocal().filter((id) => id !== productId));
+        }
+
+        // ✅ Fix 2: unsaveItem(sessionId, productId, customerId?) — storeId removed
+        const ok = await dbUnsave(
+          sessionId,
+          productId,
+          customerId || undefined,
+        );
+        if (!ok) {
+          await loadItems(); // rollback
+        }
+      } else {
+        const tmpId = `optimistic:${productId}:${Date.now()}`;
+        const optimistic: SavedItem = {
+          id: tmpId,
+          product_id: productId,
+          session_id: sessionId,
+          customer_id: customerId ?? null,
+          store_id: storeId ?? null,
+          created_at: new Date().toISOString(),
+        } as SavedItem;
+
+        // Optimistic add
+        setSavedItems((prev) => [optimistic, ...prev]);
+        if (!customerId) {
+          const local = readLocal();
+          if (!local.includes(productId)) writeLocal([...local, productId]);
+        }
+
+        // ✅ Fix 3: saveItem(sessionId, productId, storeId?, customerId?)
+        // storeId is now 3rd optional param — coerce null→undefined since it's optional
+        const saved = await dbSave(
+          sessionId,
+          productId,
+          storeId ?? undefined,
+          customerId || undefined,
+        );
+
+        if (saved) {
+          // Swap optimistic → real DB row
+          setSavedItems((prev) =>
+            prev.map((i) => (i.id === tmpId ? saved : i)),
+          );
+        } else {
+          // Rollback
+          setSavedItems((prev) => prev.filter((i) => i.id !== tmpId));
+          if (!customerId)
+            writeLocal(readLocal().filter((id) => id !== productId));
+        }
+      }
+    },
+    [
+      savedProductIds,
+      customerId,
+      sessionId,
+      storeId,
+      readLocal,
+      writeLocal,
+      loadItems,
+    ],
+  );
+
+  return {
+    savedItems,
+    savedProductIds,
+    loading,
+    isSaved: (pid: string) => savedProductIds.has(pid),
+    toggleSave,
+    refetch: loadItems,
+  };
+}
+
+
+==================================================
+FILE: useStores.tsx
+==================================================
+
+"use client";
+
+import {
+  useState,
+  useCallback,
+  useEffect,
+  createContext,
+  useContext,
+} from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
+import { queueProductDelete } from "@/lib/product-delete-sync";
+import {
+  Store,
+  Zone,
+  Product,
+  Tag,
+  StoreIntegration,
+  IntegrationPlatform,
+} from "@/types/mirour";
+
+/**
+ * Strips HTML tags from a string and decodes common HTML entities.
+ * Used to sanitize product descriptions imported from CSVs or external systems.
+ */
+function stripHtml(html: string | null | undefined): string | null {
+  if (!html) return null;
+  return (
+    html
+      // Replace block-level closing tags with a newline so paragraphs separate properly
+      .replace(/<\/(p|div|h[1-6]|li|br|section|article|blockquote)>/gi, "\n")
+      // Replace <br /> and <br> with a newline
+      .replace(/<br\s*\/?>/gi, "\n")
+      // Strip all remaining HTML tags
+      .replace(/<[^>]+>/g, "")
+      // Decode common HTML entities
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      // Collapse multiple blank lines into one
+      .replace(/\n{3,}/g, "\n\n")
+      .trim() || null
+  );
+}
+
+// ─── Context ──────────────────────────────────────────────────────────────
+
+type StoresContextType = ReturnType<typeof useStoresInternal>;
+const StoresContext = createContext<StoresContextType | undefined>(undefined);
+
+export function StoresProvider({ children }: { children: React.ReactNode }) {
+  const value = useStoresInternal();
+  return (
+    <StoresContext.Provider value={value}>{children}</StoresContext.Provider>
+  );
+}
+
+export function useStores() {
+  const ctx = useContext(StoresContext);
+  if (!ctx) throw new Error("useStores must be used within a StoresProvider");
+  return ctx;
+}
+
+// ─── Implementation ────────────────────────────────────────────────────────
+
+function useStoresInternal() {
+  const { user } = useAuth();
+  const [stores, setStores] = useState<Store[]>([]);
+  const [zones, setZones] = useState<Zone[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [integrations, setIntegrations] = useState<StoreIntegration[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // --- Fetching ---
+
+  const fetchStores = useCallback(async () => {
+    if (!user) return;
+    try {
+      const { data, error } = await supabase
+        .from("stores" as any)
+        .select("*")
+        .eq("owner_id", user.id)
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setStores((data as unknown as Store[]) || []);
+    } catch (err: any) {
+      console.error("Error fetching stores:", err);
+      setError(err.message);
+    }
+  }, [user]);
+
+  const fetchZones = useCallback(
+    async (storeId?: string) => {
+      if (!user) return;
+      try {
+        // Fetch zones with their associated tags via zone_tags junction
+        let query = supabase.from("zones" as any).select("*, tags(*)");
+
+        if (storeId) {
+          query = query.eq("store_id", storeId);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        if (storeId) {
+          setZones((prev) => {
+            const otherZones = prev.filter((z) => z.store_id !== storeId);
+            return [...otherZones, ...((data as unknown as Zone[]) || [])];
+          });
+        } else {
+          setZones((data as unknown as Zone[]) || []);
+        }
+      } catch (err: any) {
+        console.error("Error fetching zones:", err);
+      }
+    },
+    [user],
+  );
+
+  const fetchProducts = useCallback(async () => {
+    if (!user) return;
+    try {
+      // Supabase defaults to a maximum of 1,000 rows per query.
+      // We paginate using .range() to fetch all products beyond that limit.
+      const PAGE_SIZE = 1000;
+      let allData: any[] = [];
+      let from = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const { data, error } = await supabase
+          .from("products" as any)
+          .select("*, tags(*), zones(*), store_products(store_id)")
+          .eq("owner_id", user.id)
+          .range(from, from + PAGE_SIZE - 1);
+
+        if (error) throw error;
+
+        const page = (data as any[]) || [];
+        allData = [...allData, ...page];
+
+        // If we got fewer rows than PAGE_SIZE, we've reached the last page.
+        hasMore = page.length === PAGE_SIZE;
+        from += PAGE_SIZE;
+      }
+
+      // Transform the data to include an array of connected store_ids
+      const formattedProducts = allData.map((p) => ({
+        ...p,
+        store_ids: p.store_products
+          ? p.store_products.map((sp: any) => sp.store_id)
+          : [],
+        // Retain store_id as the primary store for legacy support until fully migrated
+        store_id:
+          p.store_products && p.store_products.length > 0
+            ? p.store_products[0].store_id
+            : p.store_id,
+      }));
+
+      setProducts(formattedProducts as unknown as Product[]);
+    } catch (err: any) {
+      console.error("Error fetching products:", err);
+    }
+  }, [user]);
+
+  const fetchTags = useCallback(
+    async (storeId?: string) => {
+      if (!user) return;
+      try {
+        let query = supabase
+          .from("tags" as any)
+          .select("*")
+          .eq("owner_id", user.id);
+
+        if (storeId) {
+          query = query.eq("store_id", storeId);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+        const fetched = (data as unknown as Tag[]) || [];
+
+        if (storeId) {
+          // Merge: replace only this store's tags, keep all others
+          setTags((prev) => [
+            ...prev.filter((t) => t.store_id !== storeId),
+            ...fetched,
+          ]);
+        } else {
+          setTags(fetched);
+        }
+      } catch (err: any) {
+        console.error("Error fetching tags:", err);
+      }
+    },
+    [user],
+  );
+
+  const createTag = async (
+    storeId: string,
+    name: string,
+    category?: string,
+    isHardConstraint?: boolean,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("tags" as any)
+        .insert([
+          {
+            store_id: storeId || null,
+            owner_id: user?.id, // ✅ set owner on create
+            name,
+            category,
+            is_hard_constraint: isHardConstraint || false,
+          },
+        ])
+        .select()
+        .single();
+      if (error) throw error;
+      const newTag = data as unknown as Tag;
+      setTags((prev) => [...prev, newTag]);
+      return { data: newTag, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  // Initialize — depend only on user?.id (stable string) so that auth token
+  // refreshes (which recreate the user object) don't trigger a full re-fetch.
+  const userId = user?.id;
+  useEffect(() => {
+    if (userId) {
+      setIsLoading(true);
+      Promise.all([
+        fetchStores(),
+        fetchZones(),
+        fetchProducts(),
+        fetchTags(),
+      ]).finally(() => setIsLoading(false));
+    } else {
+      // User signed out – clear all state
+      setStores([]);
+      setZones([]);
+      setProducts([]);
+      setTags([]);
+      setIntegrations([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  // --- Mutations ---
+
+  const createStore = async (name: string, location?: string) => {
+    if (!user) return { error: "Not authenticated" };
+    try {
+      const { data, error } = await supabase
+        .from("stores" as any)
+        .insert([{ owner_id: user.id, name, location }])
+        .select()
+        .single();
+
+      if (error) throw error;
+      const newStore = data as unknown as Store;
+      setStores((prev) => [newStore, ...prev]);
+      return { data: newStore, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const updateStore = async (id: string, updates: Partial<Store>) => {
+    try {
+      const { data, error } = await supabase
+        .from("stores" as any)
+        .update(updates)
+        .eq("id", id)
+        .select()
+        .single();
+
+      if (error) throw error;
+      const updatedStore = data as unknown as Store;
+      setStores((prev) => prev.map((s) => (s.id === id ? updatedStore : s)));
+      return { data: updatedStore, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const deleteStore = async (id: string) => {
+    try {
+      const { error } = await supabase
+        .from("stores" as any)
+        .delete()
+        .eq("id", id);
+      if (error) throw error;
+      setStores((prev) => prev.filter((s) => s.id !== id));
+      setZones((prev) => prev.filter((z) => z.store_id !== id));
+      setProducts((prev) => prev.filter((p) => p.store_id !== id));
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  // Zones
+  const createZone = async (
+    storeId: string,
+    name: string,
+    description?: string,
+    zoneWhat?: string,
+    zoneWhen?: string,
+    zoneWho?: string,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("zones" as any)
+        .insert([
+          {
+            store_id: storeId,
+            name,
+            description,
+            zone_what: zoneWhat || "",
+            zone_when: zoneWhen || "",
+            zone_who: zoneWho || "",
+          },
+        ])
+        .select()
+        .single();
+      if (error) throw error;
+      const newZone = data as unknown as Zone;
+      setZones((prev) => [...prev, newZone]);
+      return { data: newZone, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const updateZone = async (id: string, updates: Partial<Zone>) => {
+    try {
+      const { data, error } = await supabase
+        .from("zones" as any)
+        .update(updates)
+        .eq("id", id)
+        .select()
+        .single();
+      if (error) throw error;
+      const updatedZone = data as unknown as Zone;
+      setZones((prev) => prev.map((z) => (z.id === id ? updatedZone : z)));
+      return { data: updatedZone, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const deleteZone = async (id: string) => {
+    try {
+      const { error } = await supabase
+        .from("zones" as any)
+        .delete()
+        .eq("id", id);
+      if (error) throw error;
+      setZones((prev) => prev.filter((z) => z.id !== id));
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  // Products
+  const createProduct = async (
+    storeId: string | null,
+    product: Partial<Product>,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("products" as any)
+        .insert([{ ...product, owner_id: user?.id, store_id: storeId || null }])
+        .select()
+        .single();
+      if (error) throw error;
+
+      const newProduct = data as unknown as Product;
+
+      if (storeId) {
+        const { error: spError } = await supabase
+          .from("store_products" as any)
+          .insert([{ store_id: storeId, product_id: newProduct.id }]);
+        if (spError)
+          console.error(
+            "Failed to link new product to store_products:",
+            spError,
+          );
+      }
+
+      const productWithStores = {
+        ...newProduct,
+        store_ids: storeId ? [storeId] : [],
+      };
+      setProducts((prev) => [...prev, productWithStores]);
+      return { data: productWithStores, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const updateProduct = async (id: string, updates: Partial<Product>) => {
+    try {
+      const { data, error } = await supabase
+        .from("products" as any)
+        .update(updates)
+        .eq("id", id)
+        .select("*, tags(*), zones(*), store_products(store_id)")
+        .single();
+      if (error) throw error;
+
+      const dt = data as any;
+
+      // Transform incoming data to map store_products to store_ids
+      const mappedData = {
+        ...dt,
+        store_ids: dt.store_products
+          ? dt.store_products.map((sp: any) => sp.store_id)
+          : [],
+        store_id:
+          dt.store_products && dt.store_products.length > 0
+            ? dt.store_products[0].store_id
+            : dt.store_id,
+      };
+
+      const updatedProduct = mappedData as unknown as Product;
+      setProducts((prev) =>
+        prev.map((p) => (p.id === id ? updatedProduct : p)),
+      );
+      return { data: updatedProduct, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const deleteProduct = async (id: string) => {
+    if (!user?.id) return { error: "Not authenticated" };
+
+    // ── Optimistic UI update ──────────────────────────────────────────────
+    // Remove from local state immediately so the UI feels instant.
+    // The actual DB delete happens in the background service worker.
+    setProducts((prev) => prev.filter((p) => p.id !== id));
+
+    // ── Background Sync delete ────────────────────────────────────────────
+    // Gets the current session token to authenticate the REST call in the SW.
+    const { data: { session } } = await supabase.auth.getSession();
+    const authToken = session?.access_token ?? "";
+
+    const supabaseUrl =
+      process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co";
+    const supabaseAnonKey =
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+
+    const { error } = await queueProductDelete(
+      id,
+      supabaseUrl,
+      supabaseAnonKey,
+      authToken,
+      user.id,
+    );
+
+    if (error) {
+      // Rollback: restore the product from the server so UI stays consistent
+      console.error("[deleteProduct] Background queue failed:", error);
+      // Re-fetch just this product to restore it
+      try {
+        const { data } = await supabase
+          .from("products" as any)
+          .select("*, tags(*), zones(*), store_products(store_id)")
+          .eq("id", id)
+          .single();
+        if (data) {
+          const d = data as any;
+          const restored = {
+            ...d,
+            store_ids: d.store_products?.map((sp: any) => sp.store_id) ?? [],
+            store_id: d.store_products?.[0]?.store_id ?? d.store_id,
+          };
+          setProducts((prev) => [...prev, restored]);
+        }
+      } catch {
+        // ignore restore error
+      }
+      return { error };
+    }
+
+    return { error: null };
+  };
+
+  const linkProductToStore = async (productId: string, storeId: string) => {
+    try {
+      const { error } = await supabase
+        .from("store_products" as any)
+        .insert([{ store_id: storeId, product_id: productId }]);
+      if (error) throw error;
+
+      // Update local state
+      setProducts((prev) =>
+        prev.map((p) => {
+          if (p.id === productId) {
+            const currentStoreIds = p.store_ids || [];
+            return { ...p, store_ids: [...currentStoreIds, storeId] };
+          }
+          return p;
+        }),
+      );
+      return { error: null };
+    } catch (err: any) {
+      if (err.code === "23505") return { error: null }; // Ignore duplicates
+      return { error: err.message };
+    }
+  };
+
+  const unlinkProductFromStore = async (productId: string, storeId: string) => {
+    try {
+      const { error } = await supabase
+        .from("store_products" as any)
+        .delete()
+        .eq("product_id", productId)
+        .eq("store_id", storeId);
+      if (error) throw error;
+
+      // Update local state
+      setProducts((prev) =>
+        prev.map((p) => {
+          if (p.id === productId) {
+            const currentStoreIds = p.store_ids || [];
+            return {
+              ...p,
+              store_ids: currentStoreIds.filter((id) => id !== storeId),
+            };
+          }
+          return p;
+        }),
+      );
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  // Tags
+
+  const updateTag = async (tagId: string, updates: Partial<Tag>) => {
+    try {
+      const { data, error } = await supabase
+        .from("tags" as any)
+        .update(updates)
+        .eq("id", tagId)
+        .select()
+        .single();
+      if (error) throw error;
+      const updatedTag = data as unknown as Tag;
+      setTags((prev) => prev.map((t) => (t.id === tagId ? updatedTag : t)));
+      return { data: updatedTag, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const deleteTag = async (tagId: string) => {
+    try {
+      const { error } = await supabase
+        .from("tags" as any)
+        .delete()
+        .eq("id", tagId);
+      if (error) throw error;
+      setTags((prev) => prev.filter((t) => t.id !== tagId));
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const linkTagToProduct = async (productId: string, tagId: string) => {
+    try {
+      const { error } = await supabase
+        .from("product_tags" as any)
+        .insert([{ product_id: productId, tag_id: tagId }]);
+      if (error) throw error;
+      return { error: null };
+    } catch (err: any) {
+      // Ignore duplicate key errors if already linked
+      if (err.code === "23505") return { error: null };
+      return { error: err.message };
+    }
+  };
+
+  const unlinkTagFromProduct = async (productId: string, tagId: string) => {
+    try {
+      const { error } = await supabase
+        .from("product_tags" as any)
+        .delete()
+        .eq("product_id", productId)
+        .eq("tag_id", tagId);
+      if (error) throw error;
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  /**
+   * Re-fetches a single product by ID from the DB and updates local state.
+   * Call this after tag link/unlink operations to ensure local state stays
+   * in sync with the database (fixing the "product disappears after edit" bug).
+   */
+  const refreshProduct = async (productId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("products" as any)
+        .select("*, tags(*), zones(*), store_products(store_id)")
+        .eq("id", productId)
+        .single();
+      if (error) throw error;
+      const dt = data as any;
+      const refreshed = {
+        ...dt,
+        store_ids: dt.store_products
+          ? dt.store_products.map((sp: any) => sp.store_id)
+          : [],
+        store_id:
+          dt.store_products && dt.store_products.length > 0
+            ? dt.store_products[0].store_id
+            : dt.store_id,
+      } as unknown as Product;
+      setProducts((prev) =>
+        prev.map((p) => (p.id === productId ? refreshed : p)),
+      );
+      return { data: refreshed, error: null };
+    } catch (err: any) {
+      return { data: null, error: err.message };
+    }
+  };
+
+  // Zone-Tag Management (NEW for Sprint 1B)
+  const linkTagToZone = async (zoneId: string, tagId: string) => {
+    try {
+      const { error } = await supabase
+        .from("zone_tags" as any)
+        .insert([{ zone_id: zoneId, tag_id: tagId }]);
+      if (error) throw error;
+      // Refresh zones to show updated tags
+      await fetchZones();
+      return { error: null };
+    } catch (err: any) {
+      // Ignore duplicate key errors if already linked
+      if (err.code === "23505") return { error: null };
+      return { error: err.message };
+    }
+  };
+
+  const unlinkTagFromZone = async (zoneId: string, tagId: string) => {
+    try {
+      const { error } = await supabase
+        .from("zone_tags" as any)
+        .delete()
+        .eq("zone_id", zoneId)
+        .eq("tag_id", tagId);
+      if (error) throw error;
+      // Refresh zones to show updated tags
+      await fetchZones();
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  // --- Integrations ---
+
+  const fetchIntegrations = useCallback(
+    async (storeId: string) => {
+      if (!user) return;
+      try {
+        const { data, error } = await supabase
+          .from("store_integrations" as any)
+          .select("*")
+          .eq("store_id", storeId);
+        if (error) throw error;
+        setIntegrations((prev) => {
+          const otherIntegrations = prev.filter((i) => i.store_id !== storeId);
+          return [
+            ...otherIntegrations,
+            ...((data as unknown as StoreIntegration[]) || []),
+          ];
+        });
+      } catch (err: any) {
+        console.error("Error fetching integrations:", err);
+      }
+    },
+    [user],
+  );
+
+  const saveIntegration = async (
+    storeId: string,
+    platform: IntegrationPlatform,
+    apiKey: string,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("store_integrations" as any)
+        .upsert([{ store_id: storeId, platform, api_key: apiKey }], {
+          onConflict: "store_id,platform",
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      const saved = data as unknown as StoreIntegration;
+      setIntegrations((prev) => {
+        const others = prev.filter(
+          (i) => !(i.store_id === storeId && i.platform === platform),
+        );
+        return [...others, saved];
+      });
+      return { data: saved, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const importSquarespaceProducts = async (
+    storeId: string,
+    apiKey: string,
+  ): Promise<{ imported: number; skipped: number; error: string | null }> => {
+    try {
+      // Call our server-side proxy to avoid CORS and keep key server-side
+      const res = await fetch("/api/squarespace/products", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${res.status}`);
+      }
+
+      const { products: sqProducts } = await res.json();
+
+      if (!sqProducts || sqProducts.length === 0) {
+        return { imported: 0, skipped: 0, error: null };
+      }
+
+      // Fetch existing SKUs for this store to deduplicate
+      const { data: existingProducts } = await supabase
+        .from("products" as any)
+        .select("sku")
+        .eq("store_id", storeId);
+
+      const existingSkus = new Set(
+        ((existingProducts as any[]) || [])
+          .map((p: any) => p.sku)
+          .filter(Boolean),
+      );
+
+      // Filter out products that already exist
+      const toInsert = sqProducts.filter(
+        (p: any) => !p.sku || !existingSkus.has(p.sku),
+      );
+
+      const skipped = sqProducts.length - toInsert.length;
+
+      if (toInsert.length === 0) {
+        return { imported: 0, skipped, error: null };
+      }
+
+      // Bulk insert
+      const rows = toInsert.map((p: any) => ({
+        store_id: storeId,
+        name: p.name,
+        description: p.description || null,
+        image_url: p.image_url || null,
+        sku: p.sku || null,
+        price: p.price ? parseFloat(p.price) : null,
+        in_stock: p.in_stock ?? true,
+      }));
+
+      const { data: inserted, error: insertError } = await supabase
+        .from("products" as any)
+        .insert(rows)
+        .select();
+
+      if (insertError) throw insertError;
+
+      const newProducts = (inserted as unknown as Product[]) || [];
+      setProducts((prev) => [...prev, ...newProducts]);
+
+      return { imported: newProducts.length, skipped, error: null };
+    } catch (err: any) {
+      return { imported: 0, skipped: 0, error: err.message };
+    }
+  };
+
+  const importProductsFromFile = async (
+    parsedData: any[],
+    storeId?: string,
+    imageIndex: number = 0,
+  ): Promise<{ imported: number; skipped: number; error: string | null }> => {
+    try {
+      console.log(
+        "[import] ▶ START — storeId:",
+        storeId,
+        "| userId:",
+        user?.id,
+        "| rows:",
+        parsedData?.length,
+      );
+
+      if (!user?.id) {
+        console.log("[import] ✖ Not authenticated — aborting");
+        return { imported: 0, skipped: 0, error: "Not authenticated." };
+      }
+      if (!parsedData || parsedData.length === 0) {
+        console.log("[import] ✖ No parsed data — aborting");
+        return { imported: 0, skipped: 0, error: null };
+      }
+
+      // Helper function to dynamically find the tag column, regardless of case
+      const extractTagsFromRow = (row: any): string => {
+        if (!row || typeof row !== "object") return "";
+        const tagKey = Object.keys(row).find((key) => {
+          const lowerKey = key.toLowerCase().trim();
+          return lowerKey === "tag" || lowerKey === "tags";
+        });
+        return tagKey ? String(row[tagKey] || "") : "";
+      };
+
+      let existingProductRows: { sku: string | null; name: string }[] = [];
+
+      if (storeId) {
+        console.log(
+          "[import] 🔍 DEDUP MODE: by storeId:",
+          storeId,
+          "+ owner_id:",
+          user.id,
+        );
+
+        const { data: byStoreId, error: e1 } = await supabase
+          .from("products" as any)
+          .select("sku, name")
+          .eq("store_id", storeId)
+          .eq("owner_id", user.id);
+
+        const { data: byJunction, error: e2 } = await supabase
+          .from("store_products" as any)
+          .select("products!inner(sku, name, owner_id)")
+          .eq("store_id", storeId)
+          .eq("products.owner_id", user.id);
+
+        const junctionRows = ((byJunction as any[]) || [])
+          .map((r: any) => r.products)
+          .filter(Boolean);
+
+        const merged = new Map<string, { sku: string | null; name: string }>();
+        [...((byStoreId as any[]) || []), ...junctionRows].forEach((p: any) => {
+          if (p?.name) merged.set(p.name, p);
+        });
+        existingProductRows = Array.from(merged.values());
+      } else {
+        console.log("[import] 🔍 DEDUP MODE: global — owner_id:", user.id);
+        const { data, error: e3 } = await supabase
+          .from("products" as any)
+          .select("sku, name")
+          .eq("owner_id", user.id);
+        existingProductRows = (data as any[]) || [];
+      }
+
+      const existingSkus = new Set(
+        existingProductRows.map((p) => p.sku).filter(Boolean),
+      );
+      const existingNames = new Set(
+        existingProductRows.map((p) => p.name).filter(Boolean),
+      );
+
+      let tagsQuery = supabase
+        .from("tags" as any)
+        .select("*")
+        .eq("owner_id", user.id);
+      if (storeId) {
+        tagsQuery = tagsQuery.eq("store_id", storeId);
+      }
+      const { data: existingTagsData } = await tagsQuery;
+
+      const existingTagsMap = new Map(
+        ((existingTagsData as unknown as Tag[]) || []).map((t) => [
+          t.name.toLowerCase(),
+          t,
+        ]),
+      );
+
+      const toInsert: any[] = [];
+      const isShopifyFormat =
+        parsedData.length > 0 && "Handle" in parsedData[0];
+      let normalizedRows: any[] = parsedData;
+
+      if (isShopifyFormat) {
+        const handleMap = new Map<string, any>();
+
+        for (const row of parsedData) {
+          const handle = row["Handle"];
+          if (!handle) continue;
+
+          if (!handleMap.has(handle)) {
+            handleMap.set(handle, {
+              name: row["Title"] || "",
+              sku: row["Variant SKU"] || "",
+              price: row["Variant Price"] || "",
+              description: row["Body (HTML)"] || "",
+              image_url: row["Image Src"] || "",
+              tags: extractTagsFromRow(row), // Using dynamic extraction
+              in_stock: (row["Status"] || "").toLowerCase() === "active",
+            });
+          } else {
+            const merged = handleMap.get(handle)!;
+            if (!merged.sku && row["Variant SKU"])
+              merged.sku = row["Variant SKU"];
+            if (!merged.price && row["Variant Price"])
+              merged.price = row["Variant Price"];
+            if (!merged.description && row["Body (HTML)"])
+              merged.description = row["Body (HTML)"];
+
+            const currentTags = extractTagsFromRow(row); // Using dynamic extraction
+            if (!merged.tags && currentTags) merged.tags = currentTags;
+
+            if (!merged.image_url || row["Image Position"] === "1")
+              if (row["Image Src"]) merged.image_url = row["Image Src"];
+          }
+        }
+        normalizedRows = Array.from(handleMap.values()).filter((r) => r.name);
+      }
+
+      for (const row of normalizedRows) {
+        const name =
+          row.name ||
+          row.product_name ||
+          row.Name ||
+          row["Product Name"] ||
+          row.Title ||
+          row.title ||
+          row.composite_name;
+        const sku =
+          row.sku || row.SKU || row["Variant SKU"] || row.composite_sku;
+        if (!name) continue;
+
+        const isDuplicate = sku
+          ? existingSkus.has(sku)
+          : existingNames.has(name);
+        if (isDuplicate) continue;
+
+        const priceStr =
+          row.price ||
+          row.retail_price ||
+          row.Price ||
+          row["Variant Price"] ||
+          "";
+        const price = String(priceStr).replace(/[^0-9.]/g, "");
+        const rawDescription =
+          row.description || row.Description || row["Body (HTML)"] || null;
+        const description = stripHtml(rawDescription);
+        // Lightspeed (and some other POS systems) may store multiple comma-
+        // separated image URLs in a single quoted field. We pick the URL at
+        // imageIndex (0-based), falling back to the first if out of range.
+        const rawImageUrl =
+          row.image_url || row["Image URL"] || row["Image Src"] || null;
+        const imageUrl = rawImageUrl
+          ? ((String(rawImageUrl).split(",").map((u: string) => u.trim()).filter(Boolean)[imageIndex]
+              ?? String(rawImageUrl).split(",")[0].trim()) || null)
+          : null;
+
+        let inStock = true;
+        // Lightspeed: `active` column (1 = active/in-stock, 0 = inactive)
+        if (row.active !== undefined && row.active !== "") {
+          inStock = String(row.active).trim() === "1";
+        } else if (row.in_stock !== undefined) {
+          inStock = Boolean(row.in_stock);
+        }
+        if (
+          row.inventory_quantity !== undefined ||
+          row.stock_quantity !== undefined
+        ) {
+          const qty = parseInt(
+            row.inventory_quantity || row.stock_quantity || "0",
+            10,
+          );
+          inStock = qty > 0;
+        }
+
+        toInsert.push({
+          raw: row,
+          dbRow: {
+            store_id: storeId || null,
+            owner_id: user?.id,
+            name,
+            description,
+            image_url: imageUrl,
+            sku: sku || null,
+            price: price ? parseFloat(price) : null,
+            in_stock: inStock,
+          },
+        });
+      }
+
+      const totalDistinct = isShopifyFormat
+        ? normalizedRows.length
+        : parsedData.length;
+      const skipped = totalDistinct - toInsert.length;
+
+      if (toInsert.length === 0) {
+        return { imported: 0, skipped, error: null };
+      }
+
+      const { data: insertedProducts, error: insertError } = await supabase
+        .from("products" as any)
+        .insert(toInsert.map((t) => t.dbRow))
+        .select();
+
+      if (insertError) throw insertError;
+
+      const newProducts = (insertedProducts as unknown as Product[]) || [];
+
+      if (storeId && newProducts.length > 0) {
+        const storeProductsToInsert = newProducts.map((p) => ({
+          store_id: storeId,
+          product_id: p.id,
+        }));
+        const { error: spError } = await supabase
+          .from("store_products" as any)
+          .upsert(storeProductsToInsert, {
+            onConflict: "store_id, product_id",
+            ignoreDuplicates: true,
+          });
+        if (spError) {
+          console.error("[import] ⚠️ store_products link failed:", spError);
+        }
+        newProducts.forEach((p) => {
+          p.store_ids = [storeId];
+        });
+      } else {
+        newProducts.forEach((p) => {
+          p.store_ids = [];
+        });
+      }
+
+      setProducts((prev) => [...prev, ...newProducts]);
+
+      // Process Tags
+      const productTagsToInsert: { product_id: string; tag_id: string }[] = [];
+      const newTagsToInsertMap = new Map<string, string>();
+
+      // Collect new tags
+      toInsert.forEach((item) => {
+        const tagsStr = extractTagsFromRow(item.raw); // Using dynamic extraction
+        if (tagsStr && typeof tagsStr === "string") {
+          const rowTags = tagsStr
+            .split(",")
+            .map((t: string) => t.trim())
+            .filter(Boolean);
+          rowTags.forEach((t: string) => {
+            const tl = t.toLowerCase();
+            if (!existingTagsMap.has(tl) && !newTagsToInsertMap.has(tl)) {
+              newTagsToInsertMap.set(tl, t);
+            }
+          });
+        }
+      });
+
+      // Create new tags
+      if (newTagsToInsertMap.size > 0) {
+        // ✅ removed storeId check
+        const tagsToInsertDb = Array.from(newTagsToInsertMap.values()).map(
+          (tagName) => ({
+            store_id: storeId || null, // ✅ null if no store, that's fine
+            owner_id: user?.id,
+            name: tagName,
+            is_hard_constraint: false,
+          }),
+        );
+        // ...
+
+        const { data: insertedTags, error: tagsInsertError } = await supabase
+          .from("tags" as any)
+          .insert(tagsToInsertDb)
+          .select();
+
+        if (!tagsInsertError && insertedTags) {
+          (insertedTags as unknown as Tag[]).forEach((t) => {
+            existingTagsMap.set(t.name.toLowerCase(), t);
+          });
+          setTags((prev) => {
+            const existingIds = new Set(prev.map((t) => t.id));
+            const newTs = (insertedTags as unknown as Tag[]).filter(
+              (t) => !existingIds.has(t.id),
+            );
+            return [...prev, ...newTs];
+          });
+        }
+      }
+
+      // Build a fast lookup: (name::sku) → raw CSV row so we can match
+      // inserted products back to their source rows regardless of return order.
+      const rawRowByKey = new Map<string, any>();
+      toInsert.forEach((item) => {
+        const key = `${item.dbRow.name}::${item.dbRow.sku ?? ""}`;
+        rawRowByKey.set(key, item.raw);
+      });
+
+      // Create product-tag relationships
+      newProducts.forEach((product) => {
+        const key = `${product.name}::${product.sku ?? ""}`;
+        const rawRow = rawRowByKey.get(key);
+        if (!rawRow) return;
+
+        const tagsStr = extractTagsFromRow(rawRow);
+        if (tagsStr && typeof tagsStr === "string") {
+          const rowTags = Array.from(
+            new Set(
+              tagsStr
+                .split(",")
+                .map((t: string) => t.trim())
+                .filter(Boolean),
+            ),
+          );
+          rowTags.forEach((tagStr: string) => {
+            const tagObj = existingTagsMap.get(tagStr.toLowerCase());
+            if (tagObj) {
+              productTagsToInsert.push({
+                product_id: product.id,
+                tag_id: tagObj.id,
+              });
+            }
+          });
+        }
+      });
+
+      if (productTagsToInsert.length > 0) {
+        const { error: ptError } = await supabase
+          .from("product_tags" as any)
+          .upsert(productTagsToInsert, {
+            onConflict: "product_id, tag_id",
+            ignoreDuplicates: true,
+          });
+        if (ptError) {
+          console.error("[import] ⚠️ product_tags insert failed:", ptError);
+        } else {
+          console.log(
+            `[import] ✅ linked ${productTagsToInsert.length} product-tag entries`,
+          );
+        }
+      }
+
+      await fetchProducts();
+
+      return { imported: newProducts.length, skipped, error: null };
+    } catch (err: any) {
+      console.error("[import] 💥 CAUGHT ERROR:", err);
+      return {
+        imported: 0,
+        skipped: 0,
+        error: err.message || "Failed to import products.",
+      };
+    }
+  };
+
+  return {
+    stores,
+    zones,
+    products,
+    tags,
+    integrations,
+    isLoading,
+    error,
+    fetchStores,
+    fetchProducts,
+    createStore,
+    updateStore,
+    deleteStore,
+    createZone,
+    updateZone,
+    deleteZone,
+    createProduct,
+    updateProduct,
+    deleteProduct,
+    refreshProduct,
+    createTag,
+    updateTag,
+    deleteTag,
+    fetchTags,
+    linkTagToProduct,
+    unlinkTagFromProduct,
+    linkTagToZone,
+    unlinkTagFromZone,
+    fetchIntegrations,
+    saveIntegration,
+    importSquarespaceProducts,
+    importProductsFromFile,
+    linkProductToStore,
+    unlinkProductFromStore,
+  };
+}
+
+
+==================================================
+FILE: useTouchpointAnalytics.ts
+==================================================
+
+import { useState, useEffect, useCallback } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import type { TouchpointMetrics } from "@/types/analytics";
+
+/**
+ * Fetches per-touchpoint (per-form) analytics from the
+ * get_touchpoint_metrics() Postgres RPC.
+ *
+ * Usage:
+ *   const { metrics, loading, error, refetch } = useTouchpointAnalytics(formId);
+ */
+export const useTouchpointAnalytics = (formId: string | undefined) => {
+  const [metrics, setMetrics] = useState<TouchpointMetrics | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+
+  const fetch = useCallback(async () => {
+    if (!formId) return;
+
+    setLoading(true);
+    setError(null);
+
+    try {
+      const { data, error: rpcError } = await (supabase as any).rpc(
+        "get_touchpoint_metrics",
+        { p_form_id: formId },
+      );
+
+      if (rpcError) throw rpcError;
+      setMetrics(data as TouchpointMetrics);
+    } catch (err: any) {
+      console.error("useTouchpointAnalytics:", err);
+      setError(err?.message || "Failed to load touchpoint metrics");
+    } finally {
+      setLoading(false);
+    }
+  }, [formId]);
+
+  useEffect(() => {
+    fetch();
+  }, [fetch]);
+
+  return { metrics, loading, error, refetch: fetch };
+};
+
+

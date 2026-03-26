@@ -27,7 +27,12 @@ const NAV_TABS = [
   { id: "stores", label: "Locations", icon: Store, href: "/stores" },
   // { id: "tags", label: "Tags", icon: Tag, href: "/tags" },
   { id: "customers", label: "Customers", icon: Users, href: "/customers" },
-  { id: "analytics", label: "Analytics", icon: ChartColumn, href: "/analytics" },
+  {
+    id: "analytics",
+    label: "Analytics",
+    icon: ChartColumn,
+    href: "/analytics",
+  },
 ] as const;
 
 interface DashboardLayoutProps {
