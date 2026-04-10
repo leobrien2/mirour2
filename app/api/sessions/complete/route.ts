@@ -21,9 +21,9 @@ export async function POST(req: Request) {
       enteredAt,
     } = await req.json();
 
-    if (!sessionId || !responseId) {
+    if (!sessionId) {
       return NextResponse.json(
-        { ok: false, error: "missing fields" },
+        { ok: false, error: "missing fields (sessionId)" },
         { status: 400 },
       );
     }
@@ -45,7 +45,7 @@ export async function POST(req: Request) {
         status: "completed",
         completed_at: new Date().toISOString(),
         last_activity_at: new Date().toISOString(),
-        response_id: responseId,
+        response_id: responseId || null,
         customer_id: customerId ?? null,
         total_time_seconds:
           typeof totalTimeSec === "number" ? totalTimeSec : null,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useStores } from "@/hooks/useStores";
 import { Product } from "@/types/mirour";
 import {
@@ -18,15 +18,15 @@ import {
   Loader2,
   Box,
   Tag,
-  ChevronLeft,
-  ChevronRight,
   Search,
   Filter,
+  ChevronLeft,
+  ChevronRight,
+  SlidersHorizontal,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { IntegrationsModal } from "./IntegrationsModal";
 
-/** Strip HTML tags and decode entities for clean display. */
 function stripHtml(html: string | null | undefined): string {
   if (!html) return "";
   return html
@@ -54,9 +54,14 @@ export function ProductManager({ storeId }: ProductManagerProps) {
     zones,
     stores,
     isLoading,
+    isProductsLoading,
+    productCount,
+    fetchProducts,
+    fetchProductCount,
     createProduct,
     updateProduct,
     deleteProduct,
+    deleteAllProductsByOwner,
     createTag,
     linkTagToProduct,
     unlinkTagFromProduct,
@@ -65,19 +70,12 @@ export function ProductManager({ storeId }: ProductManagerProps) {
     refreshProduct,
   } = useStores();
 
-  const storeProducts = useMemo(() => {
-    return storeId
-      ? products.filter(
-          (p) => p.store_ids?.includes(storeId) || p.store_id === storeId,
-        )
-      : products;
-  }, [products, storeId]);
+  const isGlobalMode = !storeId;
 
   const storeTags = useMemo(() => {
     const relevantTags = storeId
       ? tags.filter((t) => t.store_id === storeId)
       : tags;
-    // Sort latest tags first (descending by created_at)
     return relevantTags.sort(
       (a, b) =>
         new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
@@ -88,77 +86,78 @@ export function ProductManager({ storeId }: ProductManagerProps) {
     return storeId ? zones.filter((z) => z.store_id === storeId) : zones;
   }, [zones, storeId]);
 
-  const isGlobalMode = !storeId;
-
   // ── Global Error State ───────────────────────────────────────────────────
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [deleteQueued, setDeleteQueued] = useState(false);
 
-  // ── Filters & Search ─────────────────────────────────────────────────────
+  // ── Scalable Server-Side Filters, Search & Pagination ────────────────────
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [filterZone, setFilterZone] = useState("all");
   const [filterTag, setFilterTag] = useState("all");
   const [filterStore, setFilterStore] = useState("all");
 
-  const filteredProducts = useMemo(() => {
-    return storeProducts.filter((product) => {
-      // Search
-      const matchesSearch =
-        searchQuery === "" ||
-        product.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        product.sku?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        product.description?.toLowerCase().includes(searchQuery.toLowerCase());
+  // UI State for Filters Panel
+  const [showFilters, setShowFilters] = useState(false);
 
-      // Zone filter
-      const matchesZone =
-        filterZone === "all" ||
-        (filterZone === "none" && !product.zone_id) ||
-        product.zone_id === filterZone;
+  const [currentPage, setCurrentPage] = useState(1);
+  const PAGE_SIZE = 8;
+  const totalPages = Math.max(1, Math.ceil(productCount / PAGE_SIZE));
 
-      // Tag filter
-      const matchesTag =
-        filterTag === "all" ||
-        (filterTag === "none" &&
-          (!product.tags || product.tags.length === 0)) ||
-        product.tags?.some((t) => t.id === filterTag);
+  // Calculate active filters for the badge
+  const activeFilterCount =
+    (filterZone !== "all" ? 1 : 0) +
+    (filterTag !== "all" ? 1 : 0) +
+    (isGlobalMode && filterStore !== "all" ? 1 : 0);
 
-      // Store filter (only relevant in global mode)
-      const matchesStore =
-        !isGlobalMode ||
-        filterStore === "all" ||
-        (filterStore === "none" &&
-          (!product.store_ids || product.store_ids.length === 0)) ||
-        product.store_ids?.includes(filterStore);
+  // Debounce search input to prevent spamming the database
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedSearch(searchQuery), 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
-      return matchesSearch && matchesZone && matchesTag && matchesStore;
-    });
+  // Trigger backend fetch when filters change
+  useEffect(() => {
+    const activeFilters = {
+      search: debouncedSearch,
+      zoneId: filterZone,
+      tagId: filterTag,
+      storeId: isGlobalMode ? filterStore : storeId,
+      page: currentPage,
+    };
+    fetchProducts(activeFilters);
+    fetchProductCount(activeFilters);
   }, [
-    storeProducts,
-    searchQuery,
+    debouncedSearch,
     filterZone,
     filterTag,
     filterStore,
+    storeId,
+    isGlobalMode,
+    currentPage,
+    fetchProducts,
+    fetchProductCount,
+  ]);
+
+  // If the user searches/filters, immediately jump back to Page 1
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    debouncedSearch,
+    filterZone,
+    filterTag,
+    filterStore,
+    storeId,
     isGlobalMode,
   ]);
-  // ── Pagination state ─────────────────────────────────────────────────────
-  const ITEMS_PER_PAGE = 8;
-  const [currentPage, setCurrentPage] = useState(1);
-  const totalPages = Math.max(
-    1,
-    Math.ceil(filteredProducts.length / ITEMS_PER_PAGE),
-  );
 
-  // Ensure we don't land on a non-existent page after deletions
-  if (currentPage > totalPages && totalPages > 0) {
-    setCurrentPage(totalPages);
-  }
+  const clearAllFilters = () => {
+    setFilterZone("all");
+    setFilterTag("all");
+    setFilterStore("all");
+  };
 
-  const paginatedProducts = useMemo(() => {
-    return filteredProducts.slice(
-      (currentPage - 1) * ITEMS_PER_PAGE,
-      currentPage * ITEMS_PER_PAGE,
-    );
-  }, [filteredProducts, currentPage, ITEMS_PER_PAGE]);
+  const filteredProducts = products;
 
   // ── Modal state ──────────────────────────────────────────────────────────
   const [isCreating, setIsCreating] = useState(false);
@@ -224,7 +223,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       if (updError) setGlobalError(updError);
 
       if (!updError) {
-        // Update Tags
         const currentTagIds = (editingProduct.tags || []).map((t) => t.id);
         for (const tagId of selectedTagIds.filter(
           (id) => !currentTagIds.includes(id),
@@ -237,7 +235,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
           await unlinkTagFromProduct(editingProduct.id, tagId);
         }
 
-        // Update Stores (Global Mode)
         if (isGlobalMode) {
           const currentStoreIds = editingProduct.store_ids || [];
           for (const sId of selectedStoreIds.filter(
@@ -304,7 +301,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       setIsCreateTagOpen(false);
       setNewTagName("");
       setNewTagCategory("");
-      setShowAllTags(true); // Automatically show all tags if they created a new one, to ensure it stays visible
+      setShowAllTags(true);
     } else if (result.error) {
       setGlobalError(result.error);
     }
@@ -337,7 +334,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       if (res?.error) {
         setGlobalError(res.error);
       } else {
-        // Show a brief "delete queued" confirmation
         setDeleteQueued(true);
         setTimeout(() => setDeleteQueued(false), 3000);
       }
@@ -362,10 +358,10 @@ export function ProductManager({ storeId }: ProductManagerProps) {
   };
 
   const toggleSelectAll = () => {
-    if (selectedProductIds.size === storeProducts.length) {
+    if (selectedProductIds.size === filteredProducts.length) {
       setSelectedProductIds(new Set());
     } else {
-      setSelectedProductIds(new Set(storeProducts.map((p) => p.id)));
+      setSelectedProductIds(new Set(filteredProducts.map((p) => p.id)));
     }
   };
 
@@ -398,17 +394,11 @@ export function ProductManager({ storeId }: ProductManagerProps) {
   const handleDeleteAll = async () => {
     setIsBulkDeleting(true);
     setShowDeleteAllConfirm(false);
-    let failCount = 0;
-    for (const product of storeProducts) {
-      const res = await deleteProduct(product.id);
-      if (res?.error) failCount++;
-    }
+    const res = await deleteAllProductsByOwner(storeId);
     setIsBulkDeleting(false);
     exitSelectMode();
-    if (failCount > 0) {
-      setGlobalError(
-        `${failCount} product(s) could not be deleted from the database. Try refreshing the page.`,
-      );
+    if (res?.error) {
+      setGlobalError(res.error);
     }
   };
 
@@ -428,14 +418,13 @@ export function ProductManager({ storeId }: ProductManagerProps) {
     if (bulkTagIds.length === 0) return;
     setIsBulkTagging(true);
     for (const productId of Array.from(selectedProductIds)) {
-      const product = storeProducts.find((p) => p.id === productId);
+      const product = filteredProducts.find((p) => p.id === productId);
       const existingTagIds = (product?.tags || []).map((t) => t.id);
       for (const tagId of bulkTagIds) {
         if (!existingTagIds.includes(tagId)) {
           await linkTagToProduct(productId, tagId);
         }
       }
-
       if (bulkTagIds.length > 0) {
         await refreshProduct(productId);
       }
@@ -447,8 +436,8 @@ export function ProductManager({ storeId }: ProductManagerProps) {
   };
 
   const allSelected =
-    storeProducts.length > 0 &&
-    selectedProductIds.size === storeProducts.length;
+    filteredProducts.length > 0 &&
+    selectedProductIds.size === filteredProducts.length;
   const someSelected = selectedProductIds.size > 0;
   const isFormOpen = isCreating || !!editingProduct;
 
@@ -457,10 +446,20 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       {/* ── Delete-queued toast ────────────────────────────────────────── */}
       {deleteQueued && (
         <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300 text-sm animate-fade-in">
-          <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+          <svg
+            className="w-4 h-4 flex-shrink-0"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={2}
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M5 13l4 4L19 7"
+            />
           </svg>
-          Product deleted — completing in the background even if you leave this page.
+          Product deleted — completing in the background.
         </div>
       )}
 
@@ -483,8 +482,8 @@ export function ProductManager({ storeId }: ProductManagerProps) {
               <div>
                 <h3 className="font-semibold">Delete All Products?</h3>
                 <p className="text-sm text-muted-foreground">
-                  This will permanently delete all {storeProducts.length}{" "}
-                  products in this store.
+                  This will permanently delete all products matching your
+                  filters.
                 </p>
               </div>
             </div>
@@ -497,8 +496,10 @@ export function ProductManager({ storeId }: ProductManagerProps) {
               </button>
               <button
                 onClick={handleDeleteAll}
-                className="px-4 py-2 text-sm bg-destructive text-destructive-foreground rounded-lg hover:opacity-90 font-medium"
+                className="flex items-center gap-2 px-4 py-2 text-sm bg-destructive text-destructive-foreground rounded-lg hover:opacity-90 font-medium disabled:opacity-50"
+                disabled={isBulkDeleting}
               >
+                {isBulkDeleting && <Loader2 className="w-4 h-4 animate-spin" />}
                 Delete All
               </button>
             </div>
@@ -510,7 +511,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       {isFormOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-border shadow-2xl w-full max-w-lg mx-4 flex flex-col max-h-[70vh] animate-fade-in">
-            {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-border flex-shrink-0">
               <div className="flex items-center gap-2">
                 <Box className="w-5 h-5 text-primary" />
@@ -527,13 +527,11 @@ export function ProductManager({ storeId }: ProductManagerProps) {
               </button>
             </div>
 
-            {/* Scrollable body */}
             <form
               onSubmit={handleSubmit}
               className="flex flex-col flex-1 min-h-0"
             >
               <div className="overflow-y-auto flex-1 px-6 py-4 space-y-4">
-                {/* Name + SKU */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="flex flex-col gap-1">
                     <label className="text-xs font-medium text-muted-foreground">
@@ -562,7 +560,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   </div>
                 </div>
 
-                {/* Price */}
                 <div className="flex flex-col gap-1">
                   <label className="text-xs font-medium text-muted-foreground">
                     Price
@@ -578,7 +575,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   />
                 </div>
 
-                {/* Image URL — full width so it is easy to find */}
                 <div className="flex flex-col gap-1">
                   <label className="text-xs font-medium text-muted-foreground">
                     Image URL
@@ -592,7 +588,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   />
                 </div>
 
-                {/* Image preview — always visible */}
                 <div className="flex flex-col gap-1">
                   <label className="text-xs font-medium text-muted-foreground">
                     Image Preview
@@ -618,7 +613,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   </div>
                 </div>
 
-                {/* Description */}
                 <div className="flex flex-col gap-1">
                   <label className="text-xs font-medium text-muted-foreground">
                     Description
@@ -631,7 +625,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   />
                 </div>
 
-                {/* Zone Assignment */}
                 <div className="flex flex-col gap-1">
                   <label className="text-xs font-medium text-muted-foreground">
                     Zone Assignment
@@ -648,12 +641,8 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                       </option>
                     ))}
                   </select>
-                  <p className="text-xs text-muted-foreground">
-                    For zone-first filtering when customer scans a zone QR
-                  </p>
                 </div>
 
-                {/* Global Store Assignment */}
                 {isGlobalMode && (
                   <div className="flex flex-col gap-1">
                     <label className="text-xs font-medium text-muted-foreground mb-1">
@@ -674,11 +663,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                                     : [...prev, s.id],
                                 )
                               }
-                              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors border ${
-                                isSelected
-                                  ? "bg-primary text-primary-foreground border-primary"
-                                  : "bg-muted text-muted-foreground border-border hover:bg-muted/80"
-                              }`}
+                              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors border ${isSelected ? "bg-primary text-primary-foreground border-primary" : "bg-muted text-muted-foreground border-border hover:bg-muted/80"}`}
                             >
                               {s.name}
                             </button>
@@ -690,14 +675,9 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                         No stores created yet.
                       </p>
                     )}
-                    <p className="text-xs text-muted-foreground mt-1 text-balance">
-                      Choose which stores this product is available in. This
-                      determines where the product appears to customers.
-                    </p>
                   </div>
                 )}
 
-                {/* Staff Pick Toggle */}
                 <button
                   type="button"
                   onClick={() => setIsStaffPick(!isStaffPick)}
@@ -712,13 +692,9 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   </div>
                   <div>
                     <span className="text-sm font-medium">Staff Pick</span>
-                    <p className="text-xs text-muted-foreground">
-                      Shown as fallback when no tag matches
-                    </p>
                   </div>
                 </button>
 
-                {/* Tags */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <label className="block text-xs font-medium text-muted-foreground">
@@ -734,63 +710,53 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                     </button>
                   </div>
                   {storeTags.length > 0 ? (
-                    <>
-                      <div className="flex flex-wrap gap-2">
-                        {storeTags
-                          .slice(0, showAllTags ? storeTags.length : 20)
-                          .map((tag) => {
-                            const isSelected = selectedTagIds.includes(tag.id);
-                            return (
-                              <button
-                                key={tag.id}
-                                type="button"
-                                onClick={() => toggleTag(tag.id)}
-                                className={`px-3 py-1 rounded-md text-sm font-medium transition-colors ${
-                                  isSelected
-                                    ? "bg-primary-100 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300 border-2 border-primary-500"
-                                    : "bg-muted text-muted-foreground border border-border hover:bg-muted/80"
-                                }`}
-                              >
-                                {tag.name}
-                                {isSelected && (
-                                  <X className="inline-block w-3 h-3 ml-1" />
-                                )}
-                              </button>
-                            );
-                          })}
-
-                        {!showAllTags && storeTags.length > 20 && (
-                          <button
-                            type="button"
-                            onClick={() => setShowAllTags(true)}
-                            className="px-3 py-1 rounded-md text-sm font-medium transition-colors bg-secondary text-secondary-foreground hover:bg-secondary/80 flex items-center gap-1 border border-transparent"
-                          >
-                            <Plus className="w-3 h-3" />
-                            Show {storeTags.length - 20} more tags
-                          </button>
-                        )}
-                        {showAllTags && storeTags.length > 20 && (
-                          <button
-                            type="button"
-                            onClick={() => setShowAllTags(false)}
-                            className="px-3 py-1 rounded-md text-sm font-medium transition-colors bg-muted text-muted-foreground hover:bg-muted/80 flex items-center gap-1 border border-border"
-                          >
-                            Show less
-                          </button>
-                        )}
-                      </div>
-                    </>
+                    <div className="flex flex-wrap gap-2">
+                      {storeTags
+                        .slice(0, showAllTags ? storeTags.length : 20)
+                        .map((tag) => {
+                          const isSelected = selectedTagIds.includes(tag.id);
+                          return (
+                            <button
+                              key={tag.id}
+                              type="button"
+                              onClick={() => toggleTag(tag.id)}
+                              className={`px-3 py-1 rounded-md text-sm font-medium transition-colors ${isSelected ? "bg-primary-100 text-primary-700 dark:bg-primary-900/30 dark:text-primary-300 border-2 border-primary-500" : "bg-muted text-muted-foreground border border-border hover:bg-muted/80"}`}
+                            >
+                              {tag.name}
+                              {isSelected && (
+                                <X className="inline-block w-3 h-3 ml-1" />
+                              )}
+                            </button>
+                          );
+                        })}
+                      {!showAllTags && storeTags.length > 20 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllTags(true)}
+                          className="px-3 py-1 rounded-md text-sm font-medium transition-colors bg-secondary text-secondary-foreground hover:bg-secondary/80 flex items-center gap-1 border border-transparent"
+                        >
+                          <Plus className="w-3 h-3" />
+                          Show {storeTags.length - 20} more tags
+                        </button>
+                      )}
+                      {showAllTags && storeTags.length > 20 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowAllTags(false)}
+                          className="px-3 py-1 rounded-md text-sm font-medium transition-colors bg-muted text-muted-foreground hover:bg-muted/80 flex items-center gap-1 border border-border"
+                        >
+                          Show less
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <p className="text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-2">
-                      No tags for this store yet. Go to the{" "}
-                      <span className="font-medium text-foreground">Tags</span>{" "}
-                      tab to create some first.
+                      No tags for this store yet.
                     </p>
                   )}
                 </div>
               </div>
 
-              {/* Footer */}
               <div className="flex gap-2 justify-end px-6 py-4 border-t border-border flex-shrink-0 bg-muted/20">
                 <button
                   type="button"
@@ -837,7 +803,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g., Spicy, Vegan, Large"
                     value={newTagName}
                     onChange={(e) => setNewTagName(e.target.value)}
                     className="w-full px-3 py-2 rounded-lg border border-input bg-background text-sm"
@@ -850,7 +815,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g., Dietary, Size"
                     value={newTagCategory}
                     onChange={(e) => setNewTagCategory(e.target.value)}
                     className="w-full px-3 py-2 rounded-lg border border-input bg-background text-sm"
@@ -884,7 +848,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       {/* ── Top Bar ────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
         <h3 className="text-lg font-semibold">
-          Products ({filteredProducts.length})
+          Products ({productCount} total)
         </h3>
 
         {globalError && (
@@ -895,8 +859,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
         )}
 
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Select mode toggle */}
-          {storeProducts.length > 0 && (
+          {filteredProducts.length > 0 && (
             <button
               onClick={() =>
                 isSelectMode ? exitSelectMode() : setIsSelectMode(true)
@@ -912,8 +875,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
             </button>
           )}
 
-          {/* Delete All */}
-          {storeProducts.length > 0 && !isSelectMode && (
+          {filteredProducts.length > 0 && !isSelectMode && (
             <button
               onClick={() => setShowDeleteAllConfirm(true)}
               className="flex items-center gap-2 px-3 py-1.5 bg-muted text-muted-foreground rounded-lg hover:bg-destructive/10 hover:text-destructive border border-border transition-colors text-sm"
@@ -944,96 +906,107 @@ export function ProductManager({ storeId }: ProductManagerProps) {
         </div>
       </div>
 
-      {/* ── Filters Bar ────────────────────────────────────────────────── */}
-      <div className="flex flex-col md:flex-row gap-3 bg-muted/30 p-3 rounded-xl border border-border">
-        <div className="relative flex-1">
+      {/* ── Unified Search and Filter Bar ──────────────────────────────── */}
+      <div className="flex flex-wrap items-center gap-3 bg-muted/30 p-2.5 rounded-xl border border-border shadow-sm">
+        <div className="relative flex-1 min-w-[250px]">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             type="text"
-            placeholder="Search products by name, SKU, or description..."
+            placeholder="Search all products by name, SKU, or description..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 rounded-lg border border-input bg-background text-sm focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all"
+            className="w-full pl-9 pr-4 py-2 rounded-lg border border-input bg-background text-sm focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all shadow-sm"
           />
         </div>
 
-        <div className="flex flex-wrap gap-2 md:mt-0">
-          <div className="relative">
-            <Filter className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-            <select
-              value={filterZone}
-              onChange={(e) => setFilterZone(e.target.value)}
-              className="pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all min-w-[140px]"
-            >
-              <option value="all">All Zones</option>
-              <option value="none">No Zone</option>
-              {storeZones.map((z) => (
-                <option key={z.id} value={z.id}>
-                  {z.name}
-                </option>
-              ))}
-            </select>
-          </div>
+        <button
+          onClick={() => setShowFilters(!showFilters)}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium transition-all shadow-sm flex-shrink-0 ${
+            showFilters || activeFilterCount > 0
+              ? "bg-secondary text-secondary-foreground border-secondary"
+              : "bg-background border-input hover:bg-muted text-foreground"
+          }`}
+        >
+          <SlidersHorizontal className="w-4 h-4" />
+          <span className="hidden sm:inline">Filters</span>
+          {activeFilterCount > 0 && (
+            <span className="flex items-center justify-center w-5 h-5 rounded-full bg-background text-foreground text-xs font-bold border border-border">
+              {activeFilterCount}
+            </span>
+          )}
+        </button>
 
-          <div className="relative">
-            <Tag className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-            <select
-              value={filterTag}
-              onChange={(e) => setFilterTag(e.target.value)}
-              className="pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all min-w-[140px]"
-            >
-              <option value="all">All Tags</option>
-              <option value="none">No Tags</option>
-              {storeTags.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-            {filterTag !== "all" && filterTag !== "none" && (
-              <button
-                onClick={() => setFilterTag("all")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            )}
-          </div>
-
-          {/* Store filter — only in Global Inventory mode */}
-          {isGlobalMode && (
-            <div className="relative">
-              <Box className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+        {/* ── Expandable Inline Filters ────────────────────────────────── */}
+        {showFilters && (
+          <div className="flex flex-wrap items-center gap-2 animate-in fade-in zoom-in-95 duration-200 w-full md:w-auto">
+            <div className="relative flex-1 md:flex-none">
+              <MapPin className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <select
-                value={filterStore}
-                onChange={(e) => setFilterStore(e.target.value)}
-                className="pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all min-w-[150px]"
+                value={filterZone}
+                onChange={(e) => setFilterZone(e.target.value)}
+                className="w-full pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all md:min-w-[140px]"
               >
-                <option value="all">All Stores</option>
-                <option value="none">No Store</option>
-                {stores.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.name}
+                <option value="all">All Zones</option>
+                <option value="none">No Zone</option>
+                {storeZones.map((z) => (
+                  <option key={z.id} value={z.id}>
+                    {z.name}
                   </option>
                 ))}
               </select>
-              {filterStore !== "all" && filterStore !== "none" && (
-                <button
-                  onClick={() => setFilterStore("all")}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
             </div>
-          )}
-        </div>
+
+            <div className="relative flex-1 md:flex-none">
+              <Tag className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+              <select
+                value={filterTag}
+                onChange={(e) => setFilterTag(e.target.value)}
+                className="w-full pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all md:min-w-[140px]"
+              >
+                <option value="all">All Tags</option>
+                <option value="none">No Tags</option>
+                {storeTags.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {isGlobalMode && (
+              <div className="relative flex-1 md:flex-none">
+                <Box className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <select
+                  value={filterStore}
+                  onChange={(e) => setFilterStore(e.target.value)}
+                  className="w-full pl-9 pr-8 py-2 rounded-lg border border-input bg-background text-sm appearance-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all md:min-w-[150px]"
+                >
+                  <option value="all">All Stores</option>
+                  <option value="none">No Store</option>
+                  {stores.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {activeFilterCount > 0 && (
+              <button
+                onClick={clearAllFilters}
+                className="px-3 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors ml-1"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* ── Bulk Action Bar (shown when in select mode) ────────────────── */}
+      {/* ── Bulk Action Bar ────────────────────────────────────────────── */}
       {isSelectMode && (
         <div className="flex items-center gap-3 px-4 py-3 bg-muted/40 border border-border rounded-xl flex-wrap">
-          {/* Select All checkbox */}
           <button
             onClick={toggleSelectAll}
             className="flex items-center gap-2 text-sm font-medium"
@@ -1050,7 +1023,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
             {selectedProductIds.size} selected
           </span>
 
-          {/* Bulk actions */}
           {someSelected && (
             <div className="flex items-center gap-2 ml-auto flex-wrap">
               {showBulkZonePicker ? (
@@ -1090,7 +1062,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                 <>
                   {storeTags.length === 0 ? (
                     <span className="text-xs text-muted-foreground">
-                      No tags available for this store.
+                      No tags available.
                     </span>
                   ) : (
                     <div className="flex flex-wrap gap-1.5 max-w-sm">
@@ -1107,13 +1079,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                                   : [...prev, tag.id],
                               )
                             }
-                            className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
-                              sel
-                                ? tag.is_hard_constraint
-                                  ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 border-2 border-red-500"
-                                  : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-2 border-blue-500"
-                                : "bg-muted text-muted-foreground border border-border hover:bg-muted/80"
-                            }`}
+                            className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${sel ? (tag.is_hard_constraint ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 border-2 border-red-500" : "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-2 border-blue-500") : "bg-muted text-muted-foreground border border-border hover:bg-muted/80"}`}
                           >
                             {tag.name}
                             {sel && <X className="inline-block w-3 h-3 ml-1" />}
@@ -1133,7 +1099,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                       <Tag className="w-3.5 h-3.5" />
                     )}
                     Add Tags
-                    {bulkTagIds.length > 0 ? ` (${bulkTagIds.length})` : ""}
                   </button>
                   <button
                     onClick={() => {
@@ -1151,16 +1116,14 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                     onClick={() => setShowBulkZonePicker(true)}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-muted text-muted-foreground rounded-lg hover:bg-muted/80 border border-border"
                   >
-                    <MapPin className="w-3.5 h-3.5" />
-                    Change Zone
+                    <MapPin className="w-3.5 h-3.5" /> Change Zone
                   </button>
                   {storeTags.length > 0 && (
                     <button
                       onClick={() => setShowBulkTagPicker(true)}
                       className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-muted text-muted-foreground rounded-lg hover:bg-muted/80 border border-border"
                     >
-                      <Tag className="w-3.5 h-3.5" />
-                      Add Tags
+                      <Tag className="w-3.5 h-3.5" /> Add Tags
                     </button>
                   )}
                   <button
@@ -1186,11 +1149,16 @@ export function ProductManager({ storeId }: ProductManagerProps) {
       {isLoading ? (
         <div className="flex flex-col items-center justify-center py-12 text-muted-foreground w-full col-span-full">
           <Loader2 className="w-8 h-8 animate-spin mb-4 text-primary" />
-          <p>Loading products...</p>
+          <p>Initializing store data...</p>
+        </div>
+      ) : isProductsLoading ? (
+        <div className="flex flex-col items-center justify-center py-12 text-muted-foreground w-full col-span-full border-2 border-dashed border-muted rounded-xl">
+          <Loader2 className="w-6 h-6 animate-spin mb-3 text-muted-foreground" />
+          <p className="text-sm">Loading page {currentPage}...</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-          {paginatedProducts.map((product) => {
+          {filteredProducts.map((product) => {
             const productTags = product.tags || [];
             const productZone = storeZones.find(
               (z) => z.id === product.zone_id,
@@ -1201,11 +1169,8 @@ export function ProductManager({ storeId }: ProductManagerProps) {
               <div
                 key={product.id}
                 onClick={() => isSelectMode && toggleSelectProduct(product.id)}
-                className={`bg-card rounded-xl border overflow-hidden group hover:shadow-lg transition-all duration-200 flex flex-col h-[380px] ${
-                  isSelectMode ? "cursor-pointer" : ""
-                } ${isSelected ? "border-primary ring-2 ring-primary/30" : "border-border"}`}
+                className={`bg-card rounded-xl border overflow-hidden group hover:shadow-lg transition-all duration-200 flex flex-col h-[370px] ${isSelectMode ? "cursor-pointer" : ""} ${isSelected ? "border-primary ring-2 ring-primary/30" : "border-border"}`}
               >
-                {/* Product Image */}
                 <div className="relative w-full h-48 bg-accent/10 overflow-hidden">
                   {product.image_url ? (
                     <img
@@ -1219,22 +1184,16 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                     </div>
                   )}
 
-                  {/* Staff Pick Badge */}
                   {product.is_staff_pick && (
                     <div className="absolute top-2 right-2 bg-yellow-500 text-white rounded-full p-1.5 shadow-lg">
                       <Star className="w-4 h-4 fill-current" />
                     </div>
                   )}
 
-                  {/* Selection checkbox */}
                   {isSelectMode && (
                     <div className="absolute top-2 left-2">
                       <div
-                        className={`w-6 h-6 rounded-md border-2 flex items-center justify-center shadow-md transition-colors ${
-                          isSelected
-                            ? "bg-primary border-primary"
-                            : "bg-background/90 border-border"
-                        }`}
+                        className={`w-6 h-6 rounded-md border-2 flex items-center justify-center shadow-md transition-colors ${isSelected ? "bg-primary border-primary" : "bg-background/90 border-border"}`}
                       >
                         {isSelected && (
                           <X className="w-3.5 h-3.5 text-primary-foreground" />
@@ -1243,18 +1202,23 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                     </div>
                   )}
 
-                  {/* Action Buttons (only when NOT in select mode) */}
                   {!isSelectMode && (
                     <div className="absolute top-2 left-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button
-                        onClick={() => startEdit(product)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          startEdit(product);
+                        }}
                         className="p-2 bg-background/90 hover:bg-background rounded-lg text-foreground shadow-md"
                         title="Edit Product"
                       >
                         <Pencil className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDelete(product.id)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDelete(product.id);
+                        }}
                         className="p-2 bg-background/90 hover:bg-destructive/90 rounded-lg text-foreground hover:text-destructive-foreground shadow-md"
                         title="Delete Product"
                       >
@@ -1264,7 +1228,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                   )}
                 </div>
 
-                {/* Product Info */}
                 <div className="flex-1 p-4 flex flex-col overflow-hidden">
                   <h4
                     className="font-semibold text-base mb-2 truncate"
@@ -1289,7 +1252,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                       )}
                     </div>
 
-                    {/* Store links in global mode */}
                     <div className="flex justify-between">
                       <div className="flex items-center gap-2 text-xs">
                         <p>Store:</p>
@@ -1324,7 +1286,6 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                       </div>
                     </div>
                     {product.description && (
-                      // two line max
                       <div
                         className="text-xs line-clamp-2"
                         title={stripHtml(product.description)}
@@ -1334,15 +1295,13 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                     )}
                   </div>
 
-                  {/* Tag chips */}
                   {productTags.length > 0 && (
                     <div className="relative group/tags">
                       <div className="flex flex-wrap gap-1">
                         {productTags.slice(0, 2).map((tag) => (
                           <Badge
                             key={tag.id}
-                            variant={ "secondary"
-                            }
+                            variant="secondary"
                             className="text-xs px-2 py-0.5 truncate"
                           >
                             {tag.name}
@@ -1366,7 +1325,7 @@ export function ProductManager({ storeId }: ProductManagerProps) {
                             {productTags.map((tag) => (
                               <Badge
                                 key={tag.id}
-                                variant={"secondary"}
+                                variant="secondary"
                                 className="text-xs px-2 py-0.5"
                               >
                                 {tag.name}
@@ -1382,49 +1341,49 @@ export function ProductManager({ storeId }: ProductManagerProps) {
             );
           })}
 
-          {storeProducts.length === 0 && (
-            <div className="col-span-full text-center py-12 text-muted-foreground text-sm border-2 border-dashed border-muted rounded-xl">
-              No products yet. Add products or import from Integrations.
-            </div>
-          )}
+          {filteredProducts.length === 0 &&
+            !isLoading &&
+            !isProductsLoading && (
+              <div className="col-span-full text-center py-12 text-muted-foreground text-sm border-2 border-dashed border-muted rounded-xl">
+                No products found matching your filters.
+              </div>
+            )}
         </div>
       )}
 
-      {/* ── Pagination Controls ────────────────────────────────────────── */}
-      {!isLoading && storeProducts.length > ITEMS_PER_PAGE && (
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border mt-4">
-          <p className="text-sm text-muted-foreground">
+      {/* ── Page-Based Pagination Action ───────────────────────────────── */}
+      {totalPages > 1 && (
+        <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-4 border-t border-border mt-6">
+          <div className="text-sm text-muted-foreground order-2 sm:order-1">
             Showing{" "}
             <span className="font-medium text-foreground">
-              {(currentPage - 1) * ITEMS_PER_PAGE + 1}
+              {Math.min((currentPage - 1) * PAGE_SIZE + 1, productCount)}
             </span>{" "}
             to{" "}
             <span className="font-medium text-foreground">
-              {Math.min(currentPage * ITEMS_PER_PAGE, storeProducts.length)}
+              {Math.min(currentPage * PAGE_SIZE, productCount)}
             </span>{" "}
             of{" "}
-            <span className="font-medium text-foreground">
-              {storeProducts.length}
-            </span>{" "}
+            <span className="font-medium text-foreground">{productCount}</span>{" "}
             products
-          </p>
-          <div className="flex items-center gap-2">
+          </div>
+          <div className="flex items-center gap-2 order-1 sm:order-2">
             <button
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-              disabled={currentPage === 1}
-              className="p-1.5 rounded-lg border border-border bg-background hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              disabled={currentPage === 1 || isProductsLoading}
+              className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium rounded-lg border border-border bg-background hover:bg-muted disabled:opacity-50 transition-colors"
             >
-              <ChevronLeft className="w-4 h-4" />
+              <ChevronLeft className="w-4 h-4" /> Previous
             </button>
-            <span className="text-sm font-medium px-2">
+            <div className="text-sm font-medium px-2">
               Page {currentPage} of {totalPages}
-            </span>
+            </div>
             <button
               onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-              disabled={currentPage === totalPages}
-              className="p-1.5 rounded-lg border border-border bg-background hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              disabled={currentPage === totalPages || isProductsLoading}
+              className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium rounded-lg border border-border bg-background hover:bg-muted disabled:opacity-50 transition-colors"
             >
-              <ChevronRight className="w-4 h-4" />
+              Next <ChevronRight className="w-4 h-4" />
             </button>
           </div>
         </div>

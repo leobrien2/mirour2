@@ -5,7 +5,9 @@ FILE: BlockInspector.tsx
 // components/canvas/BlockInspector.tsx
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
+import { supabase } from "@/integrations/supabase/client";
+
 import {
   Trash2,
   Plus,
@@ -26,6 +28,7 @@ import {
   AlignCenter,
   AlignRight,
   Eye,
+  Loader2,
   Asterisk,
 } from "lucide-react";
 import { v4 as uuidv4 } from "uuid";
@@ -53,7 +56,11 @@ import type {
   CarouselItem,
   SelectOption,
   PinnedProduct,
+  CanvasStep,
+  BlockType,
 } from "@/types/canvas";
+
+type ExtractBlockData<T extends BlockType> = Extract<BlockData, { type: T }>;
 import { useStores } from "@/hooks/useStores";
 
 // ── Ultra-Compact UI Primitives (Optimized for 300px width) ───────────────────
@@ -65,7 +72,7 @@ const inputCls =
   "w-full px-2 py-1.5 h-8 rounded border border-border/60 bg-background text-xs text-foreground shadow-sm placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary/30 focus:border-primary transition-all";
 
 const sectionCls =
-  "space-y-3 py-4 border-b border-border/40 last:border-0 last:pb-0";
+  "space-y-3 py-1 border-b border-border/40 last:border-0 last:pb-0";
 
 function Field({
   label,
@@ -449,25 +456,35 @@ function DbTagSelector({
   );
 }
 
-// ── DbProductPicker (Compact) ─────────────────────────────────────────────────
-
 function DbProductPicker({
   storeId,
+  formId, // Added formId to pass to the API
   pinnedProducts,
   onAdd,
+  onAddMultiple,
   onRemove,
 }: {
   storeId?: string;
+  formId?: string;
   pinnedProducts: PinnedProduct[];
   onAdd: (p: PinnedProduct) => void;
+  onAddMultiple: (products: PinnedProduct[]) => void;
   onRemove: (id: string) => void;
 }) {
-  const { products } = useStores();
+  const { products, tags } = useStores();
+
+  // Product Search State
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState(false);
 
+  // Tag Search State
+  const [tagSearch, setTagSearch] = useState("");
+  const [tagOpen, setTagOpen] = useState(false);
+  const [isAddingFromTag, setIsAddingFromTag] = useState(false);
+
   const pinnedIds = new Set(pinnedProducts.map((p) => p.id));
 
+  // --- Product Logic (Manual Search) ---
   const storeProducts = useMemo(() => {
     if (!storeId) return products;
     return products.filter(
@@ -475,28 +492,101 @@ function DbProductPicker({
     );
   }, [products, storeId]);
 
-  const filtered = useMemo(
+  const filteredProducts = useMemo(
     () =>
       storeProducts.filter((p) =>
-        (p.name ?? p.tags ?? "").toLowerCase().includes(search.toLowerCase()),
+        (p.name ?? p.name ?? p.id ?? "")
+          .toLowerCase()
+          .includes(search.toLowerCase()),
       ),
     [storeProducts, search],
   );
 
-  const handleSelect = (p: any) => {
-    if (pinnedIds.has(p.id)) return;
-    onAdd({
-      id: p.id,
-      title: p.name ?? p.title ?? p.id,
-      imageUrl: p.image_url ?? p.imageUrl ?? undefined,
-      price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
-    });
-    setSearch("");
-    setOpen(false);
-  };
+const handleSelectProduct = (p: any) => {
+  if (pinnedIds.has(p.id)) return;
+  onAdd({
+    id: p.id,
+    title: p.name ?? p.title ?? p.id,
+    name: p.name ?? p.title, // Keep consistent with DB
+    imageUrl: p.image_url ?? p.imageUrl ?? undefined,
+    image_url: p.image_url ?? p.imageUrl ?? undefined, // Keep consistent with DB
+    description: p.description ?? undefined, // ADDED description
+    price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
+  });
+  setSearch("");
+  setOpen(false);
+};
+
+const handleSelectTag = async (tag: any) => {
+  setTagSearch("");
+  setTagOpen(false);
+  setIsAddingFromTag(true);
+
+  try {
+    // ADDED 'description' to the select string!
+    let selectString =
+      "id, name, description, image_url, price, tags!inner(id)";
+
+    if (storeId) {
+      selectString += ", store_products!inner(store_id)";
+    }
+
+    let query = supabase
+      .from("products")
+      .select(selectString)
+      .eq("tags.id", tag.id)
+      .limit(50);
+
+    if (storeId) {
+      query = query.eq("store_products.store_id", storeId);
+    }
+
+    const { data: fetchedProducts, error } = await query;
+
+    if (error) throw error;
+
+    if (fetchedProducts && fetchedProducts.length > 0) {
+      const newPinned = fetchedProducts
+        .filter((p: any) => !pinnedIds.has(p.id))
+        .map((p: any) => ({
+          id: p.id,
+          title: p.name ?? p.id,
+          name: p.name,
+          imageUrl: p.image_url ?? undefined,
+          image_url: p.image_url ?? undefined,
+          description: p.description ?? undefined, // ADDED description
+          price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
+        }));
+
+      if (newPinned.length > 0) {
+        onAddMultiple(newPinned);
+      }
+    }
+  } catch (error) {
+    console.error("Error fetching products by tag from Supabase:", error);
+  } finally {
+    setIsAddingFromTag(false);
+  }
+};
+  // --- Tag Logic (API Fetch) ---
+  const storeTags = useMemo(
+    () => (storeId ? tags.filter((t) => t.store_id === storeId) : tags),
+    [tags, storeId],
+  );
+
+  const filteredTags = useMemo(
+    () =>
+      storeTags.filter((t) =>
+        t.name.toLowerCase().includes(tagSearch.toLowerCase()),
+      ),
+    [storeTags, tagSearch],
+  );
+
+
 
   return (
     <div className="space-y-2">
+      {/* Product Search */}
       <div className="relative">
         <div
           className="flex items-center gap-1.5 px-2 py-1.5 h-8 rounded border border-primary/30 bg-primary/5 cursor-text focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary"
@@ -516,16 +606,18 @@ function DbProductPicker({
           />
         </div>
 
-        {open && filtered.length > 0 && (
+        {open && filteredProducts.length > 0 && (
           <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
-            {filtered.slice(0, 30).map((p: any) => {
+            {filteredProducts.slice(0, 30).map((p: any) => {
               const isPinned = pinnedIds.has(p.id);
               return (
                 <button
                   key={p.id}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => handleSelect(p)}
                   disabled={isPinned}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    if (!isPinned) handleSelectProduct(p);
+                  }}
                   className={`w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted ${
                     isPinned ? "opacity-40 cursor-not-allowed bg-muted/50" : ""
                   }`}
@@ -553,12 +645,71 @@ function DbProductPicker({
           </div>
         )}
         {open && (
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div
+            className="fixed inset-0 z-40"
+            onMouseDown={() => setOpen(false)}
+          />
         )}
       </div>
 
+      {/* Tag Search */}
+      <div className="relative">
+        <div
+          className={`flex items-center gap-1.5 px-2 py-1.5 h-8 rounded border border-border bg-muted/30 cursor-text focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary ${isAddingFromTag ? "opacity-50 pointer-events-none" : ""}`}
+          onClick={() => !isAddingFromTag && setTagOpen(true)}
+        >
+          {isAddingFromTag ? (
+            <Loader2 className="w-3.5 h-3.5 text-primary animate-spin shrink-0" />
+          ) : (
+            <Tag className="w-3.5 h-3.5 text-muted-foreground/50 shrink-0" />
+          )}
+          <input
+            type="text"
+            value={tagSearch}
+            onChange={(e) => {
+              setTagSearch(e.target.value);
+              setTagOpen(true);
+            }}
+            onFocus={() => setTagOpen(true)}
+            disabled={isAddingFromTag}
+            placeholder={
+              isAddingFromTag ? "Fetching products..." : "Bulk add by tag..."
+            }
+            className="flex-1 text-xs bg-transparent outline-none text-foreground placeholder:text-muted-foreground/50 min-w-0"
+          />
+        </div>
+
+        {tagOpen && filteredTags.length > 0 && (
+          <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
+            {filteredTags.map((t) => (
+              <button
+                key={t.id}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  handleSelectTag(t);
+                }}
+                className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted"
+              >
+                <Tag className="w-3 h-3 text-muted-foreground/40 shrink-0" />
+                <span className="flex-1 text-[11px] font-medium truncate">
+                  {t.name}
+                </span>
+                <Plus className="w-3 h-3 text-muted-foreground/40 shrink-0" />
+              </button>
+            ))}
+          </div>
+        )}
+        {tagOpen && (
+          <div
+            className="fixed inset-0 z-40"
+            onMouseDown={() => setTagOpen(false)}
+          />
+        )}
+      </div>
+
+      {/* Pinned Products List */}
       {pinnedProducts.length > 0 && (
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 pt-1">
           {pinnedProducts.map((p) => (
             <div
               key={p.id}
@@ -572,6 +723,7 @@ function DbProductPicker({
                   <img
                     src={p.imageUrl}
                     className="w-full h-full object-cover"
+                    alt=""
                   />
                 ) : (
                   <ShoppingBag className="w-3 h-3 text-muted-foreground/30" />
@@ -600,7 +752,6 @@ function DbProductPicker({
     </div>
   );
 }
-
 // ── Sortable Items (Select & Carousel) ────────────────────────────────────────
 
 function SortableCarouselItem({
@@ -778,7 +929,7 @@ function HeadingEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "h1" | "h2" | "h3" }>;
+  data: ExtractBlockData<"h1" | "h2" | "h3">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -814,7 +965,7 @@ function ParagraphEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "paragraph" }>;
+  data: ExtractBlockData<"paragraph">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -907,7 +1058,7 @@ function ImageEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "image" }>;
+  data: ExtractBlockData<"image">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -957,7 +1108,7 @@ function ImageEditor({
         <Field label="Image URL">
           <input
             type="url"
-            value={data.src?.startsWith("data:") ? "" : (data.src || "")}
+            value={data.src?.startsWith("data:") ? "" : data.src || ""}
             onChange={(e) => update({ src: e.target.value })}
             placeholder="https://..."
             className={inputCls}
@@ -1047,7 +1198,6 @@ function ImageEditor({
         max={48}
         onChange={(v) => update({ borderRadius: v })}
       />
-
     </div>
   );
 }
@@ -1056,7 +1206,7 @@ function CarouselEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "carousel" }>;
+  data: ExtractBlockData<"carousel">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -1192,7 +1342,7 @@ function SelectEditor({
   steps,
   storeId,
 }: {
-  data: Extract<BlockData, { type: "select" }>;
+  data: ExtractBlockData<"select">;
   onChange: (d: BlockData) => void;
   steps: { id: string; label: string }[];
   storeId?: string;
@@ -1313,7 +1463,7 @@ function ContactEditor({
   onChange,
   steps,
 }: {
-  data: Extract<BlockData, { type: "contact" }>;
+  data: ExtractBlockData<"contact">;
   onChange: (d: BlockData) => void;
   steps?: { id: string; label: string }[];
 }) {
@@ -1455,7 +1605,7 @@ function TextInputEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "text-input" }>;
+  data: ExtractBlockData<"text-input">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -1490,7 +1640,6 @@ function TextInputEditor({
           ]}
         />
       </Field>
-      
     </div>
   );
 }
@@ -1499,7 +1648,7 @@ function RatingEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "rating" }>;
+  data: ExtractBlockData<"rating">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -1566,7 +1715,7 @@ function ButtonEditor({
   onChange,
   steps,
 }: {
-  data: Extract<BlockData, { type: "button" }>;
+  data: ExtractBlockData<"button">;
   onChange: (d: BlockData) => void;
   steps: { id: string; label: string }[];
 }) {
@@ -1659,15 +1808,115 @@ function ProductsEditor({
   data,
   onChange,
   storeId,
+  allSteps,
+  formId,
+  blockId,
+  onSimProductsChange,
 }: {
-  data: Extract<BlockData, { type: "products" }>;
+  data: ExtractBlockData<"products">;
   onChange: (d: BlockData) => void;
   storeId?: string;
+  allSteps?: CanvasStep[];
+  formId?: string;
+  blockId?: string;
+  onSimProductsChange?: (blockId: string, products: any[]) => void;
 }) {
+  const { tags } = useStores();
   const update = (patch: object) =>
     onChange({ ...data, ...patch } as BlockData);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+  );
+
+  // ── Collect all unique tags across the whole flow for simulation ──
+  const simulatorTags = useMemo(() => {
+    if (!allSteps) return [];
+    const allTags = new Set<string>();
+    for (const step of allSteps) {
+      for (const block of step.blocks ?? []) {
+        const bd = block.data as any;
+        if (bd?.type === "select") {
+          for (const opt of bd.options ?? []) {
+            for (const tag of opt.tags ?? []) {
+              allTags.add(tag);
+            }
+          }
+        }
+      }
+    }
+    return Array.from(allTags);
+  }, [allSteps]);
+
+  // ── Simulation selection state — pre-select first 2 tags ──
+  const [simSelected, setSimSelected] = useState<string[]>(() =>
+    simulatorTags.slice(0, 2),
+  );
+
+  // Re-sync when user adds/maps tags in the flow
+  const tagsKey = simulatorTags.join(",");
+  useEffect(() => {
+    setSimSelected(simulatorTags.slice(0, 2));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tagsKey]);
+
+  // Simulated tags is just the selected tags
+  const simulatedTags = simSelected;
+
+  // ── Fetch products — send to canvas via callback ──
+  const [simLoading, setSimLoading] = useState(false);
+
+  useEffect(() => {
+    if (data.mode !== "tagged") return;
+    if (simulatedTags.length === 0) {
+      if (blockId) onSimProductsChange?.(blockId, []);
+      return;
+    }
+    if (!formId && !storeId) return;
+
+    const controller = new AbortController();
+    setSimLoading(true);
+
+    fetch("/api/products/by-tags", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        formId: formId ?? storeId,
+        tagIds: simulatedTags,
+        strategy: data.matchStrategy ?? "any",
+        limit: data.resultLimit ?? 15,
+      }),
+    })
+      .then((r) => r.json())
+      .then(({ products: fetched }) => {
+        if (blockId) onSimProductsChange?.(blockId, fetched ?? []);
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError" && blockId)
+          onSimProductsChange?.(blockId, []);
+      })
+      .finally(() => setSimLoading(false));
+
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    simulatedTags.join(","),
+    data.mode,
+    data.matchStrategy,
+    data.resultLimit,
+    formId,
+    storeId,
+  ]);
+
+  const toggleOption = (id: string) =>
+    setSimSelected((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+
   return (
     <div className="space-y-4">
+      {/* Mode */}
       <div className={sectionCls}>
         <Field label="Mode">
           <SegmentedControl
@@ -1680,49 +1929,126 @@ function ProductsEditor({
           />
         </Field>
       </div>
+
+      {/* Dynamic mode */}
       {data.mode === "tagged" && (
-        <div className={sectionCls}>
-          <Field label="Logic">
-            <SegmentedControl
-              value={data.matchStrategy ?? "any"}
-              onChange={(v) =>
-                update({ matchStrategy: v as "any" | "all" })
-              }
-              options={[
-                { label: "Any", value: "any" },
-                { label: "All", value: "all" },
-              ]}
+        <>
+          <div className={sectionCls}>
+            <SliderField
+              label="Limit"
+              value={data.resultLimit ?? 15}
+              min={1}
+              unit=""
+              max={30}
+              onChange={(v) => update({ resultLimit: v })}
             />
-          </Field>
-          <SliderField
-            label="Limit"
-            value={data.resultLimit ?? 15}
-            min={1}
-            unit=""
-            max={30}
-            onChange={(v) => update({ resultLimit: v })}
-          />
-          <Field label="Empty Msg">
-            <input
-              type="text"
-              value={data.fallbackMessage || ""}
-              onChange={(e) => update({ fallbackMessage: e.target.value })}
-              className={inputCls}
-            />
-          </Field>
-        </div>
+            <Field label="Empty Msg">
+              <input
+                type="text"
+                value={data.fallbackMessage ?? ""}
+                onChange={(e) => update({ fallbackMessage: e.target.value })}
+                className={inputCls}
+              />
+            </Field>
+          </div>
+
+          {/* ── Canvas Preview Simulator ── */}
+          <div className={sectionCls}>
+            <div className="flex items-center gap-1.5 mb-2">
+              <p className="text-[9px] font-bold text-muted-foreground/50 uppercase tracking-widest">
+                Canvas Preview
+              </p>
+              <span className="text-[9px] text-muted-foreground/30">
+                · editor only
+              </span>
+            </div>
+
+            {simulatorTags.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border/60 p-3 text-center space-y-1.5">
+                <ShoppingBag className="w-4 h-4 text-muted-foreground/30 mx-auto" />
+                <p className="text-[10px] text-muted-foreground/50 leading-relaxed">
+                  Add a{" "}
+                  <span className="font-semibold text-foreground/60">
+                    Selection block
+                  </span>{" "}
+                  and map tags to simulate products.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {simulatedTags.length > 0 && (
+                  <div className="bg-primary/[0.03] border border-primary/10 rounded-lg p-2.5 space-y-2">
+                    <p className="text-[9px] font-bold text-primary/60 uppercase tracking-tighter">
+                      Active Combination
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {[...new Set(simulatedTags)]
+                        .map((id) => tags.find((t) => t.id === id)?.name)
+                        .filter(Boolean)
+                        .map((name) => (
+                          <span
+                            key={name}
+                            className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-white border border-border/40 text-[9px] font-medium text-foreground/70"
+                          >
+                            {name}
+                          </span>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-[10px] text-muted-foreground/40 leading-relaxed pt-1">
+                  Toggle options to change the simulation output:
+                </p>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {simulatorTags.map((tagId) => {
+                    const isOn = simSelected.includes(tagId);
+                    const tagName =
+                      tags.find((t) => t.id === tagId)?.name || "Unknown Tag";
+
+                    return (
+                      <button
+                        key={tagId}
+                        onClick={() => toggleOption(tagId)}
+                        title={tagName}
+                        className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold border transition-all max-w-full ${
+                          isOn
+                            ? "bg-primary/10 border-primary/40 text-primary"
+                            : "bg-muted/40 border-border/50 text-muted-foreground/60 hover:border-primary/30 hover:text-foreground"
+                        }`}
+                      >
+                        {isOn && <Check className="w-2.5 h-2.5 shrink-0" />}
+                        <span className="truncate flex-1 min-w-0 text-left">
+                          {tagName}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {simLoading && (
+                  <div className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/40" />
+                    <span className="text-[9px] text-muted-foreground/40">
+                      Updating canvas...
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </>
       )}
+
+      {/* Manual mode */}
       {data.mode === "manual" && (
         <div className={sectionCls}>
           <label className={labelCls}>
-            Products ({(data.pinnedProducts ?? []).length})
+            Products {(data.pinnedProducts ?? []).length}
           </label>
           <DndContext
-            sensors={useSensors(
-              useSensor(PointerSensor, {
-                activationConstraint: { distance: 8 },
-              }),
-            )}
+            sensors={sensors}
             collisionDetection={closestCenter}
             onDragEnd={(e) => {
               const { active, over } = e;
@@ -1746,6 +2072,14 @@ function ProductsEditor({
                     pinnedProducts: [...(data.pinnedProducts ?? []), p],
                   })
                 }
+                onAddMultiple={(products) =>
+                  update({
+                    pinnedProducts: [
+                      ...(data.pinnedProducts ?? []),
+                      ...products,
+                    ],
+                  })
+                }
                 onRemove={(id) =>
                   update({
                     pinnedProducts: (data.pinnedProducts ?? []).filter(
@@ -1758,12 +2092,14 @@ function ProductsEditor({
           </DndContext>
         </div>
       )}
+
+      {/* Shared display settings */}
       <div className={sectionCls}>
         <Field label="Heading">
           <input
             type="text"
-            value={data.heading || ""}
-            onChange={(e) => update({ heading: e.target.value || undefined })}
+            value={data.heading ?? ""}
+            onChange={(e) => update({ heading: e.target.value })}
             className={inputCls}
           />
         </Field>
@@ -1777,18 +2113,6 @@ function ProductsEditor({
             ]}
           />
         </Field>
-        <div className="space-y-1.5 pt-1">
-          {/* <ToggleRow
-            label="Show Cart Btn"
-            value={!!data.showAddToCart}
-            onChange={(v) => update({ showAddToCart: v })}
-          /> */}
-          <ToggleRow
-            label="Show Tags"
-            value={!!data.showProductTags}
-            onChange={(v) => update({ showProductTags: v })}
-          />
-        </div>
       </div>
     </div>
   );
@@ -1798,7 +2122,7 @@ function DividerEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "divider" }>;
+  data: ExtractBlockData<"divider">;
   onChange: (d: BlockData) => void;
 }) {
   const update = (patch: object) =>
@@ -1839,7 +2163,7 @@ function SpacerEditor({
   data,
   onChange,
 }: {
-  data: Extract<BlockData, { type: "spacer" }>;
+  data: ExtractBlockData<"spacer">;
   onChange: (d: BlockData) => void;
 }) {
   return (
@@ -1880,16 +2204,23 @@ export type BlockInspectorProps = {
   onDelete: () => void;
   steps?: { id: string; label: string }[];
   storeId?: string;
+  allSteps?: CanvasStep[];
+  formId?: string;
+  onSimProductsChange?: (blockId: string, products: any[]) => void; // ← ADD
 };
 
 export function BlockInspector({
   block,
   onChange,
   onDelete,
-  steps = [],
+  steps,
   storeId,
+  allSteps,
+  formId,
+  onSimProductsChange, // ← ADD
 }: BlockInspectorProps) {
   const { data } = block;
+
   const renderEditor = () => {
     switch (data.type) {
       case "h1":
@@ -1907,7 +2238,7 @@ export function BlockInspector({
           <SelectEditor
             data={data}
             onChange={onChange}
-            steps={steps}
+            steps={steps ?? []}
             storeId={storeId}
           />
         );
@@ -1918,10 +2249,20 @@ export function BlockInspector({
       case "rating":
         return <RatingEditor data={data} onChange={onChange} />;
       case "button":
-        return <ButtonEditor data={data} onChange={onChange} steps={steps} />;
+        return (
+          <ButtonEditor data={data} onChange={onChange} steps={steps ?? []} />
+        );
       case "products":
         return (
-          <ProductsEditor data={data} onChange={onChange} storeId={storeId} />
+          <ProductsEditor
+            data={data}
+            onChange={onChange}
+            storeId={storeId}
+            allSteps={allSteps}
+            formId={formId}
+            blockId={block.id} // ← ADD
+            onSimProductsChange={onSimProductsChange} // ← ADD
+          />
         );
       case "divider":
         return <DividerEditor data={data} onChange={onChange} />;
@@ -2082,7 +2423,7 @@ function CarouselBlock({
   const isAuto = data.aspectRatio === "auto";
   const aspectClass = isAuto
     ? ""
-    : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+    : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
 
   return (
     <div
@@ -2149,7 +2490,7 @@ function CarouselBlock({
 
 // ── Select block ──────────────────────────────────────────────────────────────
 
-function SelectBlock({
+export function SelectBlock({
   data,
 }: {
   data: Extract<CanvasBlock["data"], { type: "select" }>;
@@ -2180,7 +2521,11 @@ function SelectBlock({
               <div
                 key={opt.id}
                 className={`w-full flex items-center gap-4 p-4 sm:p-5 rounded-2xl border transition-all duration-200 group
-                  ${isGrid ? "flex-col text-center justify-center min-h-[120px]" : "justify-between"}
+                  ${
+                    isGrid
+                      ? "flex-col text-center justify-center min-h-[120px]"
+                      : "justify-between"
+                  }
                   ${
                     isSel
                       ? "border-primary bg-primary/5 shadow-[0_4px_14px_rgba(0,0,0,0.03)]"
@@ -2188,7 +2533,9 @@ function SelectBlock({
                   }`}
               >
                 <div
-                  className={`flex items-center gap-4 ${isGrid ? "flex-col" : "w-full"}`}
+                  className={`flex items-center gap-4 ${
+                    isGrid ? "flex-col" : "w-full"
+                  }`}
                 >
                   {!isGrid && (
                     <div className="shrink-0">
@@ -2243,12 +2590,6 @@ function SelectBlock({
               </div>
             );
           })}
-        </div>
-      )}
-
-      {isMulti && (
-        <div className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base flex items-center justify-center opacity-40">
-          Continue
         </div>
       )}
     </div>
@@ -2428,8 +2769,6 @@ function RatingBlock({
   );
 }
 
-// ── Products block ────────────────────────────────────────────────────────────
-
 function ProductCardStatic({
   product,
   compact,
@@ -2439,14 +2778,25 @@ function ProductCardStatic({
   compact: boolean;
   showTags?: boolean;
 }) {
-  const title = product.name ?? product.title ?? "Product";
-  const imageUrl = product.imageurl ?? product.imageUrl ?? null;
-  const price = product.price ?? null;
-  const tags = product.tags ?? [];
+  console.log(product);
 
+  const title = product.name ?? product.title ?? "Product";
+  const imageUrl = product.image_url ?? product.imageUrl ?? null;
+  const price = product.price ?? null;
+  const tags = Array.isArray(product.tags) ? product.tags : [];
+  const desc = product.description ?? null;
+
+  // Logic to handle both Number (40) and String ("$ 30")
+  const getCleanPrice = (val: any) => {
+    if (val == null) return "";
+    // Convert to string and remove '$' and spaces
+    return String(val).replace(/[$\s]/g, "");
+  };
+
+  const priceWithoutDollar = getCleanPrice(price);
   if (compact) {
     return (
-      <div className="group rounded-2xl border border-border/50 bg-card overflow-hidden flex flex-col h-full">
+      <div className="rounded-2xl border border-border/50 bg-card overflow-hidden flex flex-col h-full">
         <div className="aspect-square w-full overflow-hidden bg-muted/30 relative">
           {imageUrl ? (
             <img
@@ -2460,28 +2810,29 @@ function ProductCardStatic({
             </div>
           )}
         </div>
-
-        <div className="p-3 flex flex-col gap-2 flex-1">
+        <div className="p-3 flex flex-col gap-1.5 flex-1">
           <p className="text-xs font-semibold text-foreground leading-tight line-clamp-2">
             {title}
           </p>
-          <p className="text-[10px] text-muted-foreground line-clamp-2">
-            {product.description}
-          </p>
-          <div className="mt-auto flex items-center justify-between">
-            {price && (
+          {product.description && (
+            <p className="text-[10px] text-muted-foreground line-clamp-2">
+              {product.description}
+            </p>
+          )}
+          {/* <div className="mt-auto pt-1 flex items-center justify-between">
+            {price != null && (
               <p className="text-sm font-bold text-foreground/80">
-                ${Number(price).toFixed(2)}
+                ${priceWithoutDollar}
               </p>
             )}
-          </div>
+          </div> */}
         </div>
       </div>
     );
   }
 
   return (
-    <div className="group flex gap-4 rounded-2xl border border-border/50 bg-card p-4 items-center">
+    <div className="flex gap-4 rounded-2xl border border-border/50 bg-card p-4 items-center">
       <div className="w-20 h-20 shrink-0 rounded-xl overflow-hidden bg-muted/30 relative">
         {imageUrl ? (
           <img
@@ -2495,16 +2846,15 @@ function ProductCardStatic({
           </div>
         )}
       </div>
-
       <div className="flex-1 min-w-0 space-y-1">
         <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
           {title}
         </p>
-        {price && (
+        {/* {price != null && (
           <p className="text-sm font-bold text-foreground/80">
             ${Number(price).toFixed(2)}
           </p>
-        )}
+        )} */}
         {showTags && tags.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2">
             {tags.slice(0, 3).map((t: any) => (
@@ -2524,67 +2874,97 @@ function ProductCardStatic({
 
 function ProductsBlock({
   data,
+  simProducts,
 }: {
   data: Extract<CanvasBlock["data"], { type: "products" }>;
+  simProducts?: any[];
 }) {
   const isGrid = data.layout === "grid";
   const isTagged = data.mode === "tagged";
   const pins = data.pinnedProducts ?? [];
   const limit = data.resultLimit ?? 12;
-  const skeletonCount = isTagged ? Math.min(limit, 4) : 0;
 
+  const showSkeletons = isTagged && simProducts === undefined;
+  const products = isTagged
+    ? (simProducts ?? [])
+    : (pins.slice(0, limit) as any[]);
+
+  // ── Loading skeleton ──────────────────────────────────────────────────────
+  if (showSkeletons) {
+    return (
+      <div className="w-full space-y-5 animate-in fade-in pointer-events-none">
+        {data.heading && (
+          <p className="text-xl font-bold text-foreground tracking-tight">
+            {data.heading}
+          </p>
+        )}
+        <div className={isGrid ? "grid grid-cols-2 gap-4" : "space-y-4"}>
+          {Array.from({ length: Math.min(limit, 4) }).map((_, i) => (
+            <div
+              key={i}
+              className={`rounded-2xl border border-border/40 bg-card overflow-hidden animate-pulse
+                ${isGrid ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
+            >
+              <div
+                className={`bg-muted/40 ${
+                  isGrid ? "h-2/3 w-full" : "w-20 h-20 rounded-xl shrink-0"
+                }`}
+              />
+              <div className={`flex-1 space-y-2.5 ${isGrid ? "p-4" : "py-2"}`}>
+                <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
+                <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
+                <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Empty state ───────────────────────────────────────────────────────────
+  if (products.length === 0) {
+    return (
+      <div className="w-full py-16 flex flex-col items-center gap-4 text-center bg-card rounded-3xl border border-border/40 border-dashed pointer-events-none">
+        <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mb-2">
+          <ShoppingBag className="w-8 h-8 text-muted-foreground/40" />
+        </div>
+        <p className="text-base font-medium text-muted-foreground/80 max-w-xs">
+          {isTagged
+            ? (data.fallbackMessage ??
+              "Select options in the sidebar to preview products")
+            : "No products pinned yet"}
+        </p>
+      </div>
+    );
+  }
+
+  // ── Products ──────────────────────────────────────────────────────────────
   return (
-    <div className="w-full space-y-5 pointer-events-none">
+    <div className="w-full space-y-5 animate-in fade-in duration-500 pointer-events-none">
       {data.heading && (
         <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
           {data.heading}
         </p>
       )}
-
-      {isTagged || pins.length === 0 ? (
-        <div
-          className={
-            isGrid
-              ? "grid grid-cols-2 gap-3 sm:gap-5"
-              : "space-y-3 sm:space-y-4"
-          }
-        >
-          {Array.from({ length: skeletonCount > 0 ? skeletonCount : 2 }).map(
-            (_, i) => (
-              <div
-                key={i}
-                className={`rounded-2xl border border-border/40 bg-card overflow-hidden
-                ${isGrid ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
-              >
-                <div
-                  className={`bg-muted/40 ${
-                    isGrid ? "h-2/3 w-full" : "w-20 h-20 rounded-xl shrink-0"
-                  }`}
-                />
-                <div
-                  className={`flex-1 space-y-2.5 ${isGrid ? "p-4" : "py-2"}`}
-                >
-                  <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
-                  <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
-                  <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
-                </div>
-              </div>
-            ),
-          )}
-        </div>
-      ) : (
-        <div
-          className={
-            isGrid
-              ? "grid grid-cols-2 gap-3 sm:gap-5"
-              : "space-y-3 sm:space-y-4"
-          }
-        >
-          {pins.slice(0, 4).map((p) => (
+      {isGrid ? (
+        <div className="grid grid-cols-2 gap-3 sm:gap-5">
+          {products.map((p: any) => (
             <ProductCardStatic
               key={p.id}
               product={p}
-              compact={isGrid}
+              compact
+              showTags={data.showProductTags}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3 sm:space-y-4">
+          {products.map((p: any) => (
+            <ProductCardStatic
+              key={p.id}
+              product={p}
+              compact={false}
               showTags={data.showProductTags}
             />
           ))}
@@ -2593,10 +2973,15 @@ function ProductsBlock({
     </div>
   );
 }
-
 // ── Main BlockRenderer ────────────────────────────────────────────────────────
 
-export function BlockRenderer({ block }: { block: CanvasBlock }) {
+export function BlockRenderer({
+  block,
+  simProducts,
+}: {
+  block: CanvasBlock;
+  simProducts?: any[]; // ← ADD
+}) {
   const { data } = block;
 
   switch (data.type) {
@@ -2672,7 +3057,7 @@ export function BlockRenderer({ block }: { block: CanvasBlock }) {
       const isAuto = data.aspectRatio === "auto";
       const aspectClass = isAuto
         ? ""
-        : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+        : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
 
       if (!data.src) {
         return (
@@ -2774,7 +3159,7 @@ export function BlockRenderer({ block }: { block: CanvasBlock }) {
 
     // ── Products ────────────────────────────────────────────────────────────────
     case "products":
-      return <ProductsBlock data={data} />;
+      return <ProductsBlock data={data} simProducts={simProducts} />;
 
     // ── Divider ────────────────────────────────────────────────────────────────
     case "divider":
@@ -2816,10 +3201,9 @@ export function BlockRenderer({ block }: { block: CanvasBlock }) {
 FILE: CanvasEditor.tsx
 ==================================================
 
-// components/canvas/CanvasEditor.tsx
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   DndContext,
   closestCenter,
@@ -2869,7 +3253,7 @@ import {
 import type {
   CanvasBlock,
   CanvasStep,
-  CanvasFlow, // ← ADD THIS IMPORT
+  CanvasFlow,
   BlockData,
   BlockType,
   DeviceView,
@@ -2921,6 +3305,7 @@ type SortableBlockRowProps = {
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  simProducts?: any[]; // ← ADD
 };
 
 function SortableBlockRow({
@@ -2928,6 +3313,7 @@ function SortableBlockRow({
   isSelected,
   onSelect,
   onDelete,
+  simProducts, // ← ADD
 }: SortableBlockRowProps) {
   const {
     attributes,
@@ -3000,7 +3386,8 @@ function SortableBlockRow({
             bg-primary rounded-full z-10"
           />
         )}
-        <BlockRenderer block={block} />
+        <BlockRenderer block={block} simProducts={simProducts} />{" "}
+        {/* ← FIXED */}
       </div>
     </div>
   );
@@ -3097,24 +3484,27 @@ const BOTTOM_QUICK_ADD: { type: BlockType; icon: React.ElementType }[] = [
 // ── Main CanvasEditor ─────────────────────────────────────────────────────────
 
 type CanvasEditorProps = {
-  flow?: CanvasFlow; // ← ADD: full flow object (needed by FlowPlayer in preview)
+  flow?: CanvasFlow;
   step: CanvasStep;
   allSteps: CanvasStep[];
-  storeId?: string; // ← ADD: active store ID (needed for tag/product pickers + preview)
+  storeId?: string;
   onChange: (updated: CanvasStep) => void;
 };
 
 export function CanvasEditor({
-  flow, // ← destructure
+  flow,
   step,
   allSteps,
-  storeId, // ← destructure
+  storeId,
   onChange,
 }: CanvasEditorProps) {
   const [device, setDevice] = useState<DeviceView>("mobile");
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [activeBlock, setActiveBlock] = useState<CanvasBlock | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  const [simProductsByBlock, setSimProductsByBlock] = useState<
+    Record<string, any[]>
+  >({}); // ← ADD
   const canvasRef = useRef<HTMLDivElement>(null);
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstMount = useRef(true);
@@ -3137,7 +3527,63 @@ export function CanvasEditor({
     .map((s) => ({ id: s.id, label: s.label }));
 
   // ── Block mutations ─────────────────────────────────────────────────────────
+  // Add this inside CanvasEditor, after the simProductsByBlock state declaration
 
+  useEffect(() => {
+    const taggedProductsBlocks = step.blocks.filter(
+      (b) => b.data.type === "products" && (b.data as any).mode === "tagged",
+    );
+    if (taggedProductsBlocks.length === 0) return;
+    if (!flow?.id && !storeId) return;
+
+    // Collect all tagged options across the whole flow
+    const allTaggedOptions: { id: string; tags: string[] }[] = [];
+    for (const s of allSteps) {
+      for (const block of s.blocks ?? []) {
+        const bd = block.data as any;
+        if (bd?.type === "select") {
+          for (const opt of bd.options ?? []) {
+            if ((opt.tags?.length ?? 0) > 0 && opt.label?.trim()) {
+              allTaggedOptions.push({ id: opt.id, tags: opt.tags });
+            }
+          }
+        }
+      }
+    }
+    if (allTaggedOptions.length === 0) return;
+
+    // Default simulation: first 2 tagged options
+    const defaultTags = [
+      ...new Set(allTaggedOptions.slice(0, 2).flatMap((o) => o.tags)),
+    ];
+    if (defaultTags.length === 0) return;
+
+    // Fetch for each tagged products block
+    for (const block of taggedProductsBlocks) {
+      const bd = block.data as any;
+      fetch("/api/products/by-tags", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          formId: flow?.id ?? storeId,
+          tagIds: defaultTags,
+          strategy: bd.matchStrategy ?? "any",
+          limit: bd.resultLimit ?? 15,
+        }),
+      })
+        .then((r) => r.json())
+        .then(({ products: fetched }) => {
+          setSimProductsByBlock((prev) => ({
+            ...prev,
+            [block.id]: fetched ?? [],
+          }));
+        })
+        .catch(() => {
+          setSimProductsByBlock((prev) => ({ ...prev, [block.id]: [] }));
+        });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step.id, allSteps.map((s) => s.id).join(","), flow?.id, storeId]);
   const addBlock = useCallback(
     (type: BlockType) => {
       const newBlock: CanvasBlock = {
@@ -3385,7 +3831,7 @@ export function CanvasEditor({
                     {showPreview ? (
                       flow ? (
                         <FlowPlayer
-                          key={`preview-${flow.id}`} // showPreview in key not needed — component only mounts when showPreview=true
+                          key={`preview-${flow.id}`}
                           flow={flow}
                           formId={flow.id}
                           storeId={storeId}
@@ -3395,7 +3841,6 @@ export function CanvasEditor({
                           isPreview={true}
                         />
                       ) : (
-                        // flow not ready yet — shouldn't normally be visible but safe fallback
                         <div className="flex flex-col items-center justify-center min-h-[400px] gap-3">
                           <div className="w-8 h-8 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
                           <p className="text-sm text-muted-foreground/50">
@@ -3405,7 +3850,7 @@ export function CanvasEditor({
                       )
                     ) : (
                       // ── Edit mode ──────────────────────────────────────────
-                      <div className="p-5 sm:p-7">
+                      <div className="">
                         <DndContext
                           sensors={sensors}
                           collisionDetection={closestCenter}
@@ -3424,6 +3869,7 @@ export function CanvasEditor({
                                   isSelected={selectedBlockId === block.id}
                                   onSelect={() => setSelectedBlockId(block.id)}
                                   onDelete={() => deleteBlock(block.id)}
+                                  simProducts={simProductsByBlock[block.id]} // ← ADD
                                 />
                               ))}
                             </div>
@@ -3497,7 +3943,18 @@ export function CanvasEditor({
               onChange={(data) => updateBlock(selectedBlock.id, data)}
               onDelete={() => deleteBlock(selectedBlock.id)}
               steps={routingSteps}
-              storeId={storeId} // ← pass storeId so tag/product pickers work in inspector too
+              storeId={storeId}
+              allSteps={allSteps}
+              formId={flow?.id}
+              onSimProductsChange={(
+                blockId,
+                prods, // ← renamed to avoid shadowing useStores `products`
+              ) =>
+                setSimProductsByBlock((prev) => ({
+                  ...prev,
+                  [blockId]: prods,
+                }))
+              }
             />
           )}
         </div>
@@ -3803,7 +4260,7 @@ interface SelectPlayerProps {
   onMultiSubmit: (optionIds: string[], tags: string[]) => void;
 }
 
-function SelectPlayer({
+export function SelectPlayer({
   data,
   onSingleSelect,
   onMultiSubmit,
@@ -3813,18 +4270,23 @@ function SelectPlayer({
   const isGrid = data.layout === "grid";
 
   const handleMultiToggle = (optId: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      next.has(optId) ? next.delete(optId) : next.add(optId);
-      return next;
-    });
-  };
+    // 1. Calculate the exact next state before updating React
+    const nextSelected = new Set(selected);
+    if (nextSelected.has(optId)) {
+      nextSelected.delete(optId);
+    } else {
+      nextSelected.add(optId);
+    }
 
-  const handleMultiSubmit = () => {
-    if (selected.size === 0) return;
-    const selectedOpts = data.options.filter((o) => selected.has(o.id));
+    // 2. Update the local UI state
+    setSelected(nextSelected);
+
+    // 3. Immediately process and submit the new data to the parent
+    const selectedOpts = data.options.filter((o) => nextSelected.has(o.id));
     const allTags = [...new Set(selectedOpts.flatMap((o) => o.tags))];
-    onMultiSubmit([...selected], allTags);
+
+    // Pass the newly calculated arrays instead of relying on the stale state
+    onMultiSubmit([...nextSelected], allTags);
   };
 
   return (
@@ -3834,6 +4296,7 @@ function SelectPlayer({
           {data.question}
         </p>
       )}
+
       <div className={isGrid ? "grid grid-cols-2 gap-3" : "space-y-3"}>
         {data.options.map((opt) => {
           const isSel = selected.has(opt.id);
@@ -3858,7 +4321,11 @@ function SelectPlayer({
                   <div className="shrink-0">
                     {isMulti ? (
                       <div
-                        className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${isSel ? "bg-primary border-primary" : "border-muted-foreground/30 bg-background group-hover:border-primary/50"}`}
+                        className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${
+                          isSel
+                            ? "bg-primary border-primary"
+                            : "border-muted-foreground/30 bg-background group-hover:border-primary/50"
+                        }`}
                       >
                         {isSel && (
                           <Check className="w-3.5 h-3.5 text-primary-foreground stroke-[3]" />
@@ -3867,7 +4334,11 @@ function SelectPlayer({
                     ) : (
                       <div
                         className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors
-                          ${isSel ? "border-primary" : "border-muted-foreground/30 group-hover:border-primary/50"}`}
+                          ${
+                            isSel
+                              ? "border-primary"
+                              : "border-muted-foreground/30 group-hover:border-primary/50"
+                          }`}
                       >
                         {isSel && (
                           <div className="w-2.5 h-2.5 rounded-full bg-primary animate-in zoom-in-50 duration-200" />
@@ -3881,7 +4352,9 @@ function SelectPlayer({
                   <img
                     src={opt.imageUrl}
                     alt=""
-                    className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${isGrid ? "w-14 h-14" : "w-10 h-10"}`}
+                    className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${
+                      isGrid ? "w-14 h-14" : "w-10 h-10"
+                    }`}
                   />
                 )}
 
@@ -3899,16 +4372,6 @@ function SelectPlayer({
           );
         })}
       </div>
-
-      {isMulti && (
-        <button
-          onClick={handleMultiSubmit}
-          disabled={selected.size === 0}
-          className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 hover:shadow-lg transition-all duration-200 active:scale-95 disabled:opacity-40 disabled:pointer-events-none disabled:hover:shadow-none"
-        >
-          Continue
-        </button>
-      )}
     </div>
   );
 }
@@ -4359,7 +4822,7 @@ function ProductCard({
   onToggleSave,
 }: ProductCardProps) {
   const title = product.name ?? product.title ?? "Product";
-  const imageUrl = product.image_url ?? product.image_Url ?? null;
+  const imageUrl = product.image_url ?? product.imageUrl ?? null;
   console.log(imageUrl);
   const price = product.price ?? null;
   const tags = product.tags ?? [];
@@ -4415,11 +4878,11 @@ function ProductCard({
             {product.description}
           </p>
           <div className="mt-auto flex items-center justify-between">
-            {price && (
+            {/* {price && (
               <p className="text-sm font-bold text-foreground/80">
                 ${Number(price).toFixed(2)}
               </p>
-            )}
+            )} */}
           </div>
           {/* {showAddToCart && (
             <button className="mt-2 w-full py-2.5 rounded-xl bg-primary/5 text-primary text-sm font-bold hover:bg-primary/10 transition-colors active:scale-95">
@@ -4452,11 +4915,11 @@ function ProductCard({
         <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
           {title}
         </p>
-        {price && (
+        {/* {price && (
           <p className="text-sm font-bold text-foreground/80">
             ${Number(price).toFixed(2)}
           </p>
-        )}
+        )} */}
         {showTags && tags.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2">
             {tags.slice(0, 3).map((t: any) => (
@@ -5532,10 +5995,11 @@ export function PageBuilder({
 
       {/* ── AI CHAT PANEL ── */}
       <AIChatPanel
-        isOpen={aiPanelOpen}
-        onClose={() => setAiPanelOpen(false)}
-        onApplyFlow={handleApplyAIFlow}
-      />
+  isOpen={aiPanelOpen}
+  onClose={() => setAiPanelOpen(false)}
+  onApplyFlow={handleApplyAIFlow}
+  storeId={storeId}
+/>
     </div>
   );
 }

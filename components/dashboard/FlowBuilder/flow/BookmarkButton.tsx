@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Bookmark, BookmarkCheck } from "lucide-react";
+import { Heart } from "lucide-react";
 
 interface BookmarkButtonProps {
   productId: string;
@@ -21,34 +21,36 @@ export function BookmarkButton({
   const handleClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
+
+    // Trigger visual animation immediately, independent of network speed
     setAnimating(true);
-    await onToggle(productId);
     setTimeout(() => setAnimating(false), 350);
+
+    try {
+      await onToggle(productId);
+    } catch (error) {
+      // If the toggle fails, the UI will revert on the next prop update from the parent
+      console.error("Failed to toggle favorite status:", error);
+    }
   };
 
-  const size = compact ? "w-7 h-7" : "w-9 h-9";
-  const iconSize = compact ? "w-3.5 h-3.5" : "w-4 h-4";
+  // Increased touch targets slightly for better mobile usability
+  const size = compact ? "w-8 h-8" : "w-10 h-10";
+  const iconSize = compact ? "w-4 h-4" : "w-5 h-5";
 
   return (
     <button
       onClick={handleClick}
-      aria-label={isSaved ? "Remove from saved" : "Save product"}
-      className={`
-        flex items-center justify-center rounded-full border transition-all duration-200
-        active:scale-90 ${size}
-        ${animating ? "scale-125" : "scale-100"}
-        ${
-          isSaved
-            ? "bg-primary text-primary-foreground border-primary shadow-sm"
-            : "bg-background/80 backdrop-blur-sm border-border/60 text-muted-foreground hover:border-primary/40 hover:text-primary hover:bg-primary/5"
-        }
-      `}
+      aria-label={isSaved ? "Remove from favorites" : "Add to favorites"}
+      className={`w-8 h-8 rounded-full flex items-center justify-center shadow-sm border transition-all active:scale-90 ${
+        isSaved
+          ? "bg-primary text-primary-foreground border-primary"
+          : "bg-background/90 text-muted-foreground border-border/60 hover:border-primary/40"
+      }`}
     >
-      {isSaved ? (
-        <BookmarkCheck className={iconSize} />
-      ) : (
-        <Bookmark className={iconSize} />
-      )}
+      {" "}
+      <Heart className={`w-3.5 h-3.5 ${isSaved ? "fill-current" : ""}`} />
     </button>
   );
 }
+

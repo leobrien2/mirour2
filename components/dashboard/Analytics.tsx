@@ -56,15 +56,52 @@ function fmtSecs(s: number): string {
 function nodeLabel(id: string, forms: DashboardForm[]): string {
   if (id === "Exit/Start") return "Start Screen";
   for (const f of forms) {
+    // 1. Check top-level nodes
     const n = (f.questions || []).find((q: any) => q.id === id) as any;
     if (n) {
-      const lbl = n.label || n.header || n.title;
+      const lbl = n.label || n.header || n.title || n.question;
       if (lbl && lbl !== id) return lbl;
     }
+    // 2. Check blocks (newer visual editor)
+    for (const q of f.questions || []) {
+      if ((q as any).blocks) {
+        for (const b of (q as any).blocks) {
+          if (b.id === id) {
+            const data = b.data || {};
+            const lbl = data.question || data.text || data.heading || b.label;
+            if (lbl) return lbl;
+          }
+        }
+      }
+    }
   }
+  // Try to beautify if not found
   return id
     .replace(/^node-/, "")
     .replace(/-/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function answerLabel(valStr: string, forms: DashboardForm[]): string {
+  if (!valStr || typeof valStr !== "string") return String(valStr);
+  
+  for (const f of forms) {
+    for (const q of f.questions || []) {
+      if ((q as any).blocks) {
+        for (const b of (q as any).blocks) {
+          if (b.data?.options && Array.isArray(b.data.options)) {
+             const opt = b.data.options.find((o: any) => o.id === valStr || o.value === valStr);
+             if (opt && opt.label) return opt.label;
+          }
+        }
+      }
+    }
+  }
+  // Fallback beautification
+  return valStr
+    .replace(/^opt_/, "")
+    .replace(/_/g, " ")
+    .replace(/^node-/, "")
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
@@ -463,7 +500,24 @@ export function Analytics({ forms }: { forms: DashboardForm[] }) {
               if (!a || typeof a !== "object") return;
               Object.entries(a).forEach(([qId, val]) => {
                 if (qId.startsWith("_")) return;
-                const str = Array.isArray(val) ? val.join(", ") : String(val);
+                
+                let str = "";
+                if (Array.isArray(val)) {
+                  str = val
+                    .map((v: any) => {
+                      if (typeof v === "object" && v !== null) {
+                        return answerLabel(v.value || v.id, forms) || v.label || v.name || JSON.stringify(v);
+                      }
+                      return answerLabel(String(v), forms);
+                    })
+                    .join(", ");
+                } else if (typeof val === "object" && val !== null) {
+                  const v = val as any;
+                  str = answerLabel(v.value || v.id, forms) || v.label || v.name || JSON.stringify(v);
+                } else {
+                  str = answerLabel(String(val), forms);
+                }
+
                 if (str.length >= 80) return;
                 if (!qm[qId]) qm[qId] = {};
                 qm[qId][str] = (qm[qId][str] || 0) + 1;

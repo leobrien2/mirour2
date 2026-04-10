@@ -11,6 +11,7 @@ import {
   Loader2,
   CheckCheck,
   Wand2,
+  Search,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -269,6 +270,13 @@ export function PageBuilder({
 
   // ── AI: apply generated flow ────────────────────────────────────────────────
 
+  const handleAiSearchToggle = useCallback(
+    (enabled: boolean) => {
+      updateFlow({ aiSearchEnabled: enabled });
+    },
+    [updateFlow],
+  );
+
   const handleApplyAIFlow = useCallback(
     (generatedFlow: CanvasFlow) => {
       // Preserve the DB row's id and createdAt so saves hit the correct record
@@ -398,6 +406,32 @@ export function PageBuilder({
           {/* Save indicator */}
           <SaveIndicator status={saveStatus} />
 
+          {/* ── AI Search switch ── */}
+          <button
+            onClick={() => handleAiSearchToggle(!flow.aiSearchEnabled)}
+            title={flow.aiSearchEnabled ? "Disable floating AI search" : "Enable floating AI search"}
+            className="flex items-center gap-2.5 px-2 py-1 rounded-lg hover:bg-muted/40 transition-colors group"
+          >
+            <Search className="w-3.5 h-3.5 text-muted-foreground group-hover:text-foreground transition-colors shrink-0" />
+            <span className="text-xs font-medium text-muted-foreground group-hover:text-foreground transition-colors whitespace-nowrap">
+              AI Search
+            </span>
+            {/* pill track */}
+            <div
+              className={`relative w-9 h-5 rounded-full transition-colors duration-200 shrink-0 ${
+                flow.aiSearchEnabled ? "bg-primary" : "bg-muted-foreground/25"
+              }`}
+            >
+              {/* thumb */}
+              <span
+                className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${
+                  flow.aiSearchEnabled ? "translate-x-4" : "translate-x-0"
+                }`}
+              />
+            </div>
+          </button>
+
+
           {/* ── AI Build button ── */}
           <button
             onClick={() => setAiPanelOpen(true)}
@@ -501,10 +535,11 @@ export function PageBuilder({
 
       {/* ── AI CHAT PANEL ── */}
       <AIChatPanel
-        isOpen={aiPanelOpen}
-        onClose={() => setAiPanelOpen(false)}
-        onApplyFlow={handleApplyAIFlow}
-      />
+  isOpen={aiPanelOpen}
+  onClose={() => setAiPanelOpen(false)}
+  onApplyFlow={handleApplyAIFlow}
+  storeId={storeId}
+/>
     </div>
   );
 }

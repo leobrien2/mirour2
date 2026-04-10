@@ -29,7 +29,7 @@ export default function InventoryPage() {
           </p>
         </div>
 
-        <div className="bg-card rounded-2xl border border-border p-6 shadow-sm">
+        <div className="">
           <ProductManager />
         </div>
       </div>

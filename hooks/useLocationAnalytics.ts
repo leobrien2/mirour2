@@ -2,13 +2,6 @@ import { useState, useEffect, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import type { LocationMetrics } from "@/types/analytics";
 
-/**
- * Fetches store-level rollup analytics from the
- * get_location_metrics() Postgres RPC.
- *
- * Usage:
- *   const { metrics, loading, error, refetch } = useLocationAnalytics(storeId);
- */
 export const useLocationAnalytics = (storeId: string | undefined) => {
   const [metrics, setMetrics] = useState<LocationMetrics | null>(null);
   const [loading, setLoading] = useState(false);

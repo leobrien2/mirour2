@@ -263,7 +263,7 @@ export function CreateFormSimple({
 
           {/* Template Toggle */}
 
-          <div className="flex items-center justify-between bg-secondary p-4 rounded-2xl border-2 border-primary/20">
+          {/* <div className="flex items-center justify-between bg-secondary p-4 rounded-2xl border-2 border-primary/20">
             <div>
               <p className="font-medium text-foreground">Show Start Page</p>
               <p className="text-sm text-muted-foreground">
@@ -282,7 +282,7 @@ export function CreateFormSimple({
               />
               <div className="w-11 h-6 bg-muted peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary"></div>
             </label>
-          </div>
+          </div> */}
 
           <div className="flex gap-3">
             <button

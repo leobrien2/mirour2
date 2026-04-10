@@ -30,6 +30,8 @@ import {
   ArrowRight,
   ExternalLink,
   Eye,
+  RotateCcw,
+  Search,
 } from "lucide-react";
 
 import type {
@@ -44,6 +46,7 @@ import type {
   RatingBlockData,
   ButtonBlockData,
   ProductsBlockData,
+  AiSearchBlockData,
   DividerBlockData,
   SpacerBlockData,
   CanvasFlow,
@@ -62,8 +65,11 @@ import {
   LocalCustomerProfile,
   saveCustomerLocally,
 } from "@/lib/customerSession";
+import { migrateSavedItemsBetweenCustomers } from "@/lib/savedItems";
 import { FloatingProfileBar } from "../flow/FloatingProfileBar";
 import { CustomerProfileDrawer } from "../flow/CustomerLoginModal";
+import { AiSearchPlayer } from "./AiSearchPlayer";
+import { AiSearchOverlay } from "../flow/AiSearchOverlay";
 
 // ── Props ─────────────────────────────────────────────────────────────────────
 
@@ -290,7 +296,7 @@ interface SelectPlayerProps {
   onMultiSubmit: (optionIds: string[], tags: string[]) => void;
 }
 
-function SelectPlayer({
+export function SelectPlayer({
   data,
   onSingleSelect,
   onMultiSubmit,
@@ -300,18 +306,23 @@ function SelectPlayer({
   const isGrid = data.layout === "grid";
 
   const handleMultiToggle = (optId: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      next.has(optId) ? next.delete(optId) : next.add(optId);
-      return next;
-    });
-  };
+    // 1. Calculate the exact next state before updating React
+    const nextSelected = new Set(selected);
+    if (nextSelected.has(optId)) {
+      nextSelected.delete(optId);
+    } else {
+      nextSelected.add(optId);
+    }
 
-  const handleMultiSubmit = () => {
-    if (selected.size === 0) return;
-    const selectedOpts = data.options.filter((o) => selected.has(o.id));
+    // 2. Update the local UI state
+    setSelected(nextSelected);
+
+    // 3. Immediately process and submit the new data to the parent
+    const selectedOpts = data.options.filter((o) => nextSelected.has(o.id));
     const allTags = [...new Set(selectedOpts.flatMap((o) => o.tags))];
-    onMultiSubmit([...selected], allTags);
+
+    // Pass the newly calculated arrays instead of relying on the stale state
+    onMultiSubmit([...nextSelected], allTags);
   };
 
   return (
@@ -321,6 +332,7 @@ function SelectPlayer({
           {data.question}
         </p>
       )}
+
       <div className={isGrid ? "grid grid-cols-2 gap-3" : "space-y-3"}>
         {data.options.map((opt) => {
           const isSel = selected.has(opt.id);
@@ -345,7 +357,11 @@ function SelectPlayer({
                   <div className="shrink-0">
                     {isMulti ? (
                       <div
-                        className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${isSel ? "bg-primary border-primary" : "border-muted-foreground/30 bg-background group-hover:border-primary/50"}`}
+                        className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${
+                          isSel
+                            ? "bg-primary border-primary"
+                            : "border-muted-foreground/30 bg-background group-hover:border-primary/50"
+                        }`}
                       >
                         {isSel && (
                           <Check className="w-3.5 h-3.5 text-primary-foreground stroke-[3]" />
@@ -354,7 +370,11 @@ function SelectPlayer({
                     ) : (
                       <div
                         className={`w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors
-                          ${isSel ? "border-primary" : "border-muted-foreground/30 group-hover:border-primary/50"}`}
+                          ${
+                            isSel
+                              ? "border-primary"
+                              : "border-muted-foreground/30 group-hover:border-primary/50"
+                          }`}
                       >
                         {isSel && (
                           <div className="w-2.5 h-2.5 rounded-full bg-primary animate-in zoom-in-50 duration-200" />
@@ -368,7 +388,9 @@ function SelectPlayer({
                   <img
                     src={opt.imageUrl}
                     alt=""
-                    className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${isGrid ? "w-14 h-14" : "w-10 h-10"}`}
+                    className={`object-cover rounded-xl shrink-0 shadow-sm border border-border/20 ${
+                      isGrid ? "w-14 h-14" : "w-10 h-10"
+                    }`}
                   />
                 )}
 
@@ -386,16 +408,6 @@ function SelectPlayer({
           );
         })}
       </div>
-
-      {isMulti && (
-        <button
-          onClick={handleMultiSubmit}
-          disabled={selected.size === 0}
-          className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 hover:shadow-lg transition-all duration-200 active:scale-95 disabled:opacity-40 disabled:pointer-events-none disabled:hover:shadow-none"
-        >
-          Continue
-        </button>
-      )}
     </div>
   );
 }
@@ -609,6 +621,7 @@ function ContactBlockPlayer({
   onSubmit,
   onSkip,
   onAdvance,
+  onSwitchUser,
   customerId,
   isSubmitting,
   isPreview,
@@ -617,6 +630,7 @@ function ContactBlockPlayer({
   onSubmit: (d: ContactData) => Promise<{ error: string | null }>;
   onSkip?: () => void;
   onAdvance?: () => void;
+  onSwitchUser?: () => void;
   customerId?: string | null;
   isSubmitting: boolean;
   isPreview?: boolean;
@@ -628,50 +642,12 @@ function ContactBlockPlayer({
     phone: "",
   });
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [commitStatus, setCommitStatus] = useState<"idle" | "saving" | "done">(
-    "idle",
-  );
-  const autoSubmittedRef = useRef(false);
+  const [confirmLoading, setConfirmLoading] = useState(false);
 
   const localCustomer = useMemo(() => getLocalCustomer(), [customerId]);
   const isKnownCustomer = !!customerId && !!localCustomer;
 
-  // ── Known customer — silent commit + auto-advance ─────────────────────────
-  useEffect(() => {
-    if (!isKnownCustomer) return;
-    if (autoSubmittedRef.current) return;
-    autoSubmittedRef.current = true;
-
-    const silentCommit = async () => {
-      setCommitStatus("saving");
-
-      const result = await onSubmit({
-        firstName: localCustomer!.firstname ?? undefined,
-        lastName:
-          localCustomer!.name?.split(" ").slice(1).join(" ") || undefined,
-        email: localCustomer!.email ?? undefined,
-        phone: localCustomer!.phone ?? undefined,
-      });
-
-      if (result.error) {
-        console.error(
-          "[ContactBlockPlayer] silent commit failed:",
-          result.error,
-        );
-      }
-
-      setCommitStatus("done");
-
-      // Small delay so user sees the ✅ before navigating
-      await new Promise((r) => setTimeout(r, 600));
-      onAdvance?.();
-    };
-
-    silentCommit();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isKnownCustomer]);
-
-  // ── Known customer — loading screen ──────────────────────────────────────
+  // ── Known customer — explicit confirmation screen ─────────────────────────
   if (isKnownCustomer) {
     const displayName =
       localCustomer!.firstname ??
@@ -679,11 +655,86 @@ function ContactBlockPlayer({
       localCustomer!.email?.split("@")[0] ??
       "there";
 
+    const fullDisplayName =
+      localCustomer!.name ??
+      localCustomer!.firstname ??
+      localCustomer!.email?.split("@")[0] ??
+      "there";
+
+    const handleConfirm = async () => {
+      setConfirmLoading(true);
+      setSubmitError(null);
+      const result = await onSubmit({
+        firstName: localCustomer!.firstname ?? undefined,
+        lastName:
+          localCustomer!.name?.split(" ").slice(1).join(" ") || undefined,
+        email: localCustomer!.email ?? undefined,
+        phone: localCustomer!.phone ?? undefined,
+      });
+      setConfirmLoading(false);
+      if (result.error) {
+        setSubmitError(result.error);
+        return;
+      }
+      onAdvance?.();
+    };
+
     return (
-      <div className="w-full flex flex-col items-center justify-center gap-4 py-12 animate-in fade-in duration-300">
-        {/* show loading */}
-        <Loader2Icon className="w-8 h-8 animate-spin text-muted-foreground/40 shrink-0" />
-        <p className="text-sm text-muted-foreground">Saving your results…</p>
+      <div className="w-full space-y-5 animate-in fade-in duration-300">
+        {/* Identity confirmation card */}
+        <div className="flex items-center gap-4 p-5 rounded-2xl border border-border/60 bg-card shadow-sm">
+          {/* Avatar */}
+          <div className="w-12 h-12 rounded-full bg-primary/10 flex items-center justify-center shrink-0 text-lg font-bold text-primary select-none">
+            {displayName.charAt(0).toUpperCase()}
+          </div>
+          <div className="flex-1 min-w-0">
+            <p className="font-bold text-foreground text-base leading-tight truncate">
+              {fullDisplayName}
+            </p>
+            {localCustomer!.email && (
+              <p className="text-sm text-muted-foreground truncate mt-0.5">
+                {localCustomer!.email}
+              </p>
+            )}
+            {localCustomer!.phone && !localCustomer!.email && (
+              <p className="text-sm text-muted-foreground mt-0.5">
+                {localCustomer!.phone}
+              </p>
+            )}
+          </div>
+          <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
+        </div>
+
+        {submitError && (
+          <div className="p-3 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive text-sm font-medium animate-in fade-in">
+            {submitError}
+          </div>
+        )}
+
+        <div className="space-y-3 pt-1">
+          <button
+            onClick={handleConfirm}
+            disabled={confirmLoading || isSubmitting}
+            className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 hover:shadow-lg transition-all duration-200 active:scale-95 disabled:opacity-60 flex items-center justify-center gap-2"
+          >
+            {(confirmLoading || isSubmitting) && (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            )}
+            {confirmLoading || isSubmitting
+              ? "Saving…"
+              : `Continue as ${displayName}`}
+          </button>
+
+          {onSwitchUser && (
+            <button
+              type="button"
+              onClick={onSwitchUser}
+              className="w-full py-3 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Not me? Enter info manually
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -837,21 +888,20 @@ interface ProductCardProps {
   onToggleSave?: (productId: string) => Promise<void>; // NEW
 }
 
-function ProductCard({
+
+export function ProductCard({
   product,
   compact,
   showAddToCart,
   showTags,
   isSaved = false,
   onToggleSave,
-}: ProductCardProps) {
+}: any) {
+  // Note: Replace 'any' with your actual ProductCardProps interface
   const title = product.name ?? product.title ?? "Product";
-  const imageUrl = product.image_url ?? product.image_Url ?? null;
-  console.log(imageUrl);
+  const imageUrl = product.image_url ?? product.imageUrl ?? null;
   const price = product.price ?? null;
   const tags = product.tags ?? [];
-
-  console.log(product);
 
   // ─── COMPACT card ────────────────────────────────────────────────────────
   if (compact) {
@@ -870,9 +920,10 @@ function ProductCard({
               <ShoppingBag className="w-8 h-8 text-muted-foreground/20" />
             </div>
           )}
-          {/* Bookmark button top-right overlay */}
-          {/* {onToggleSave && (
-            <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+
+          {/* Bookmark button top-right overlay - Fixed for Mobile */}
+          {onToggleSave && (
+            <div className="absolute top-2 right-2 z-10">
               <BookmarkButton
                 productId={product.id}
                 isSaved={isSaved}
@@ -880,18 +931,7 @@ function ProductCard({
                 compact
               />
             </div>
-          )} */}
-          {/* Always show when saved */}
-          {/* {isSaved && onToggleSave && (
-            <div className="absolute top-2 right-2">
-              <BookmarkButton
-                productId={product.id}
-                isSaved={isSaved}
-                onToggle={onToggleSave}
-                compact
-              />
-            </div>
-          )} */}
+          )}
         </div>
 
         <div className="p-3 flex flex-col gap-2 flex-1">
@@ -902,11 +942,11 @@ function ProductCard({
             {product.description}
           </p>
           <div className="mt-auto flex items-center justify-between">
-            {price && (
+            {/* {price && (
               <p className="text-sm font-bold text-foreground/80">
                 ${Number(price).toFixed(2)}
               </p>
-            )}
+            )} */}
           </div>
           {/* {showAddToCart && (
             <button className="mt-2 w-full py-2.5 rounded-xl bg-primary/5 text-primary text-sm font-bold hover:bg-primary/10 transition-colors active:scale-95">
@@ -939,11 +979,11 @@ function ProductCard({
         <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
           {title}
         </p>
-        {price && (
+        {/* {price && (
           <p className="text-sm font-bold text-foreground/80">
             ${Number(price).toFixed(2)}
           </p>
-        )}
+        )} */}
         {showTags && tags.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2">
             {tags.slice(0, 3).map((t: any) => (
@@ -958,7 +998,7 @@ function ProductCard({
         )}
       </div>
 
-      {/* Bookmark on right side of list card */}
+      {/* Bookmark on right side of list card (Commented out in your original code) */}
       {/* {onToggleSave && (
         <BookmarkButton
           productId={product.id}
@@ -1132,7 +1172,8 @@ function StepRenderer({
   formId,
   savedProductIds,
   onToggleSave,
-  effectiveCustomerId, // ← ADD
+  effectiveCustomerId,
+  onContactSwitch,
 }: {
   step: CanvasStep;
   session: Session;
@@ -1140,7 +1181,8 @@ function StepRenderer({
   formId: string;
   savedProductIds?: Set<string>;
   onToggleSave?: (id: string) => Promise<void>;
-  effectiveCustomerId?: string | null; // ← ADD
+  effectiveCustomerId?: string | null;
+  onContactSwitch?: () => void;
 }) {
   const {
     selectOption,
@@ -1242,16 +1284,17 @@ function StepRenderer({
                 isPreview={isPreview}
                 customerId={effectiveCustomerId ?? null}
                 onSubmit={async (contactData) => {
-                  // ✅ ONLY commits data — never advances
+                  // ONLY commits data — never advances
                   const result = await submitContact(contactData);
                   return result;
                 }}
-                onAdvance={() => advance(data.nextStepId ?? step.nextStepId)} // ← user triggers this
+                onAdvance={() => advance(data.nextStepId ?? step.nextStepId)}
                 onSkip={
                   data.showSkip
                     ? () => advance(data.skipNextStepId ?? step.nextStepId)
                     : undefined
                 }
+                onSwitchUser={onContactSwitch}
                 isSubmitting={isSubmitting}
               />
             );
@@ -1265,6 +1308,16 @@ function StepRenderer({
                 formId={formId}
                 savedProductIds={savedProductIds} // NEW
                 onToggleSave={onToggleSave} // NEW
+              />
+            );
+
+          case "ai-search":
+            return (
+              <AiSearchPlayer
+                key={block.id}
+                data={data as AiSearchBlockData}
+                savedProductIds={savedProductIds}
+                onToggleSave={onToggleSave}
               />
             );
 
@@ -1333,10 +1386,15 @@ export function FlowPlayer({
 
   const [profileDrawerOpen, setProfileDrawerOpen] = useState(false);
   const [loginCustomerId, setLoginCustomerId] = useState<string | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);  // floating AI search overlay
 
   // Hydrate local customer from localStorage on mount
   const [localCustomer, setLocalCustomer] =
     useState<LocalCustomerProfile | null>(null);
+
+  // When true, ContactBlockPlayer shows the manual form even if a customer token
+  // exists — used after the user clicks "Not me?"
+  const [forceManualForm, setForceManualForm] = useState(false);
 
   // Sync customer from localStorage on mount (SSR safe)
   useEffect(() => {
@@ -1351,6 +1409,10 @@ export function FlowPlayer({
   const rawCustomerId = session.customerId ?? loginCustomerId;
   if (rawCustomerId) lastKnownCustomerIdRef.current = rawCustomerId;
   const effectiveCustomerId = rawCustomerId ?? lastKnownCustomerIdRef.current;
+
+  // resolvedCustomerId: null when user clicks "Not me?" so the contact block
+  // renders the manual form instead of the confirmation card.
+  const resolvedCustomerId = forceManualForm ? null : effectiveCustomerId;
 
   // ── Saved Items ────────────────────────────────────────────────────────────
 
@@ -1369,6 +1431,51 @@ export function FlowPlayer({
     if (existing?.id === session.customerId) {
       setLocalCustomer(existing);
     }
+  }, [session.customerId]);
+
+  // ── Saved items migration on identity switch ──────────────────────────────
+  // Tracks the previous session.customerId. If the user switches identity at
+  // the contact step ("Not me?" + new credentials), we move their saved items
+  // from the old customer to the newly confirmed one.
+  const prevSessionCustomerIdRef = useRef<string | null>(null);
+  // Stores the customer that was displaced by "Not me?" — survives the ref clear
+  // in handleSwitchUser so the migration effect can still read the "from" id.
+  const switchedFromCustomerIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const prev = prevSessionCustomerIdRef.current;
+    const current = session.customerId;
+
+    if (current && session.sessionId) {
+      // Case 1: normal customer-id change within the same session (non-switch)
+      const migrateFrom = prev && prev !== current ? prev : null;
+      // Case 2: user switched identity — switchedFromCustomerIdRef has the old id
+      const switchFrom =
+        switchedFromCustomerIdRef.current &&
+        switchedFromCustomerIdRef.current !== current
+          ? switchedFromCustomerIdRef.current
+          : null;
+
+      const fromId = migrateFrom ?? switchFrom;
+      if (fromId) {
+        flowLog("SAVED_ITEMS_MIGRATION_START", { from: fromId, to: current });
+        migrateSavedItemsBetweenCustomers(session.sessionId, fromId, current)
+          .then((ok) => {
+            flowLog("SAVED_ITEMS_MIGRATION_DONE", { ok });
+            savedItemsHook.refetch();
+          })
+          .catch(console.error);
+      }
+      // Clear the switch ref after consuming it
+      switchedFromCustomerIdRef.current = null;
+    }
+
+    // After any successful identification, clear the forced manual form flag
+    if (current && forceManualForm) {
+      setForceManualForm(false);
+    }
+
+    prevSessionCustomerIdRef.current = current;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.customerId]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
@@ -1404,6 +1511,27 @@ export function FlowPlayer({
     // Just the identity is cleared, next contact step will show the form again
   }, []);
 
+  // "Not me?" clicked inside the contact block — clear identity, show manual form
+  const handleSwitchUser = useCallback(() => {
+    handleLogout();
+    setForceManualForm(true);
+    // Capture the outgoing customer id BEFORE clearing everything.
+    // The migration useEffect reads switchedFromCustomerIdRef when the new
+    // customer is confirmed — prevSessionCustomerIdRef would be null by then.
+    const outgoingId =
+      session.customerId ?? lastKnownCustomerIdRef.current ?? null;
+    if (outgoingId) {
+      switchedFromCustomerIdRef.current = outgoingId;
+    }
+    // Also clear the hook's internal customerIdRef so the next submitContact
+    // goes through the full phone/email lookup (Path 2/3) instead of Path 1.
+    session.clearCustomerId();
+    // Reset tracking refs — the migration will use switchedFromCustomerIdRef instead.
+    prevSessionCustomerIdRef.current = null;
+    lastKnownCustomerIdRef.current = null;
+    flowLog("IDENTITY_SWITCH_INITIATED", { from: outgoingId }, "warn");
+  }, [handleLogout, session]);
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -1423,11 +1551,23 @@ export function FlowPlayer({
 
         {/* ── Main Card ─────────────────────────────────────────────────── */}
         <div className="w-full bg-card sm:rounded-[2rem] sm:shadow-[0_8px_30px_rgb(0,0,0,0.04)] sm:border border-border/40 overflow-hidden flex-1 flex flex-col">
-          {/* Progress & Back header */}
+          {/* Progress & Back / Start Over header */}
           {phase === "quiz" && totalSteps > 1 && (
             <div className="px-6 sm:px-10 my-4 sticky top-0 bg-card/80 backdrop-blur-xl z-20 border-b border-border/10 sm:border-none">
               <div className="flex items-center gap-4">
-                {canGoBack ? (
+                {/* Last step → replace Back with Start Over */}
+                {stepIndex === totalSteps - 1 ? (
+                  <button
+                    onClick={handleReset}
+                    aria-label="Start over"
+                    className="flex items-center gap-2 pr-3 rounded-full text-muted-foreground/50 hover:text-foreground hover:bg-muted transition-all active:scale-90"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                    <p className="text-sm font-medium text-muted-foreground/50 tracking-wide">
+                      Start Over
+                    </p>
+                  </button>
+                ) : canGoBack ? (
                   <button
                     onClick={goBack}
                     aria-label="Go back"
@@ -1458,7 +1598,8 @@ export function FlowPlayer({
                   formId={formId}
                   savedProductIds={savedItemsHook.savedProductIds}
                   onToggleSave={savedItemsHook.toggleSave}
-                  effectiveCustomerId={effectiveCustomerId} // ← ADD
+                  effectiveCustomerId={resolvedCustomerId}
+                  onContactSwitch={handleSwitchUser}
                 />
               </div>
             )}
@@ -1486,15 +1627,13 @@ export function FlowPlayer({
       </div>
       {/* ── End container ─────────────────────────────────────────────────── */}
 
-      {/* ── Floating bar + drawer — outside card, outside container ────────── */}
-      {/* {!isPreview && phase !== "done" && (
+      {!isPreview && (
         <>
           <FloatingProfileBar
             onClick={() => setProfileDrawerOpen(true)}
             savedCount={savedItemsHook.savedItems.length}
             customer={localCustomer}
           />
-
           <CustomerProfileDrawer
             open={profileDrawerOpen}
             onClose={() => setProfileDrawerOpen(false)}
@@ -1506,7 +1645,32 @@ export function FlowPlayer({
             allProducts={allProducts}
           />
         </>
-      )} */}
+      )}
+
+      {/* ── Floating AI Search FAB — visible in both editor preview and live form ── */}
+      {flow.aiSearchEnabled && (
+        <>
+          <button
+            onClick={() => setSearchOpen(true)}
+            aria-label="Search products"
+            className="fixed bottom-28 right-4 z-30 w-14 h-14 rounded-full
+              bg-primary text-primary-foreground shadow-xl flex items-center justify-center
+              hover:shadow-2xl hover:scale-105 active:scale-95 transition-all duration-200
+              ring-4 ring-primary/10"
+          >
+            <Search className="w-6 h-6" />
+          </button>
+
+          {/* Overlay only on live form — no-op in editor preview since savedItems aren't wired */}
+          <AiSearchOverlay
+            open={searchOpen}
+            onClose={() => setSearchOpen(false)}
+            formId={formId}
+            savedProductIds={savedItemsHook.savedProductIds}
+            onToggleSave={savedItemsHook.toggleSave}
+          />
+        </>
+      )}
     </div>
   );
 }

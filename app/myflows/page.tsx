@@ -13,7 +13,11 @@ import { useForms } from "@/hooks/useForms";
 import { useResponses } from "@/hooks/useResponses";
 import { useAuth } from "@/hooks/useAuth";
 import { useStores } from "@/hooks/useStores";
-import { DashboardForm, toDashboardForm, RawDbResponse } from "@/types/dashboard";
+import {
+  DashboardForm,
+  toDashboardForm,
+  RawDbResponse,
+} from "@/types/dashboard";
 import type { CanvasFlow } from "@/types/canvas";
 import { PageBuilder } from "@/components/dashboard/FlowBuilder/canvas/PageBuilder";
 
@@ -51,6 +55,7 @@ function formToCanvasFlow(form: any): CanvasFlow {
           blocks: [],
           createdAt: new Date().toISOString(),
         })),
+    aiSearchEnabled: form.ai_search_enabled ?? false,
     createdAt: form.created_at ?? new Date().toISOString(),
     updatedAt: form.updated_at ?? new Date().toISOString(),
   };
@@ -163,19 +168,23 @@ function MyFlowsContent() {
   // Sync property changes (active, name, etc.) instantly without re-fetching responses
   useEffect(() => {
     if (dashboardForms.length === 0 || forms.length === 0) return;
-    
-    setDashboardForms(prev => {
+
+    setDashboardForms((prev) => {
       // If the lengths don't match, let the main load effect handle it to stay safe
       if (prev.length !== forms.length) return prev;
-      
+
       let changed = false;
       const next = prev.map((df) => {
         // Find corresponding form by ID (safer than index)
-        const f = forms.find(x => x.id === df.id);
+        const f = forms.find((x) => x.id === df.id);
         if (!f) return df;
 
         // Check for property changes that should be synced
-        if (df.active !== f.active || df.name !== f.name || df.perk !== f.perk) {
+        if (
+          df.active !== f.active ||
+          df.name !== f.name ||
+          df.perk !== f.perk
+        ) {
           changed = true;
           return { ...df, ...f };
         }
@@ -223,7 +232,8 @@ function MyFlowsContent() {
       const { error } = await updateForm(flow.id, {
         name: flow.name,
         questions: flow.steps as any,
-      });
+        ai_search_enabled: flow.aiSearchEnabled ?? false,
+      } as any);
       if (error) throw error;
       setIsDirty(false);
       await handleFormUpdateSuccess();
@@ -280,7 +290,10 @@ function MyFlowsContent() {
               const enriched = await Promise.all(
                 forms.map(async (form) => {
                   const responses = await fetchResponses(form.id);
-                  return toDashboardForm(form, responses as unknown as RawDbResponse[]);
+                  return toDashboardForm(
+                    form,
+                    responses as unknown as RawDbResponse[],
+                  );
                 }),
               );
               setDashboardForms(enriched);
@@ -316,7 +329,6 @@ function MyFlowsContent() {
         </div>
       ) : (
         <div>
-         
           <FormsList
             forms={dashboardForms}
             onCreateForm={() => safeSetView({ type: "create" })}

@@ -14,7 +14,7 @@ export const saveItem = async (
         .select(
           `
           id, store_id, customer_id, session_id, product_id, created_at, purchased_at,
-          products ( id, name, price, imageurl, description, sku )
+          products ( id, name, price, image_url, description, sku )
         `,
         )
         .eq("customer_id", customerId)
@@ -34,7 +34,7 @@ export const saveItem = async (
       .select(
         `
         id, store_id, customer_id, session_id, product_id, created_at, purchased_at,
-        products ( id, name, price, imageurl, description, sku )
+        products ( id, name, price, image_url, description, sku )
       `,
       )
       .single();
@@ -46,7 +46,7 @@ export const saveItem = async (
           ? await supabase
               .from("saved_items")
               .select(
-                "*, products(id, name, price, imageurl, description, sku)",
+                "*, products(id, name, price, image_url, description, sku)",
               )
               .eq("customer_id", customerId)
               .eq("product_id", productId)
@@ -54,7 +54,7 @@ export const saveItem = async (
           : await supabase
               .from("saved_items")
               .select(
-                "*, products(id, name, price, imageurl, description, sku)",
+                "*, products(id, name, price, image_url, description, sku)",
               )
               .eq("session_id", sessionId)
               .eq("product_id", productId)
@@ -132,6 +132,56 @@ export const getSavedItems = async (
   } catch (error) {
     console.error("Error in getSavedItems:", error);
     return [];
+  }
+};
+
+/**
+ * Re-attributes session saved items from one customer to another.
+ * Used when a user switches identity at the contact step ("Not me?").
+ * Items that the new customer already has saved are deleted first to avoid
+ * unique-constraint violations, then the rest are moved over.
+ */
+export const migrateSavedItemsBetweenCustomers = async (
+  sessionId: string,
+  fromCustomerId: string, // who was logged in when items were saved
+  toCustomerId: string,   // who just identified themselves
+): Promise<boolean> => {
+  try {
+    // 1. Find what the new customer already has saved (dedup guard)
+    const { data: alreadySaved } = await supabase
+      .from("saved_items")
+      .select("product_id")
+      .eq("customer_id", toCustomerId);
+
+    const alreadySavedIds = new Set<string>(
+      (alreadySaved ?? []).map((r: any) => r.product_id),
+    );
+
+    // 2. Delete session rows that would create duplicates for the target customer
+    if (alreadySavedIds.size > 0) {
+      await supabase
+        .from("saved_items")
+        .delete()
+        .eq("session_id", sessionId)
+        .eq("customer_id", fromCustomerId)
+        .in("product_id", Array.from(alreadySavedIds));
+    }
+
+    // 3. Move the rest: old customer → new customer (same session)
+    const { error } = await supabase
+      .from("saved_items")
+      .update({ customer_id: toCustomerId } as any)
+      .eq("session_id", sessionId)
+      .eq("customer_id", fromCustomerId);
+
+    if (error) {
+      console.error("[migrateSavedItemsBetweenCustomers] error:", error);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("[migrateSavedItemsBetweenCustomers] unexpected error:", e);
+    return false;
   }
 };
 

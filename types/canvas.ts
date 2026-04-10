@@ -116,8 +116,6 @@ export type ContactBlockData = {
   skipNextStepId?: string; // undefined = next step in sequence
 };
 
-
-
 // ── Input — Text input ────────────────────────────────────────────────────────
 
 export type TextInputBlockData = {
@@ -164,7 +162,10 @@ export type ButtonBlockData = {
 export type PinnedProduct = {
   id: string;
   title: string; // cached for inspector display
+  name: string; // ADDED: For consistency with DB
+  description?: string; // ADDED: For display in product cards
   imageUrl?: string; // cached thumbnail
+  image_url?: string; // ADDED: For consistency with DB
   price?: string; // cached price string e.g. "$24.99"
 };
 
@@ -185,6 +186,17 @@ export type ProductsBlockData = {
   layout: "grid" | "list";
   showAddToCart: boolean;
   showProductTags?: boolean; // show tag chips on each product card
+};
+
+// ── AI Search ─────────────────────────────────────────────────────────────────
+
+export type AiSearchBlockData = {
+  type: "ai-search";
+  heading: string;        // e.g. "Search our catalog"
+  description?: string;   // e.g. "Describe what you're looking for"
+  placeholder?: string;   // search input placeholder
+  resultLimit?: number;   // default 6
+  showPrices?: boolean;   // show price on result cards
 };
 
 // ── Layout ────────────────────────────────────────────────────────────────────
@@ -214,6 +226,7 @@ export type BlockData =
   | RatingBlockData
   | ButtonBlockData
   | ProductsBlockData
+  | AiSearchBlockData
   | DividerBlockData
   | SpacerBlockData;
 
@@ -238,6 +251,7 @@ export type CanvasFlow = {
   id: string;
   name: string;
   steps: CanvasStep[];
+  aiSearchEnabled?: boolean; // form-level floating search toggle
   createdAt?: string;
   updatedAt?: string;
 };
@@ -398,6 +412,16 @@ export function createDefaultBlock(type: BlockType): BlockData {
         showProductTags: false,
       };
 
+    case "ai-search":
+      return {
+        type: "ai-search",
+        heading: "Search our products",
+        description: "Describe what you're looking for in any words",
+        placeholder: "e.g. something relaxing to wear…",
+        resultLimit: 6,
+        showPrices: false,
+      };
+
     // ── Layout ────────────────────────────────────────────────────────────────
     case "divider":
       return { type: "divider", thickness: 1, style: "solid" };
@@ -514,6 +538,12 @@ export const BLOCK_PALETTE: PaletteGroup[] = [
         label: "Products",
         description: "Tag-filtered or pinned",
         iconName: "ShoppingBag",
+      },
+      {
+        type: "ai-search",
+        label: "AI Search",
+        description: "Semantic product search",
+        iconName: "Search",
       },
     ],
   },

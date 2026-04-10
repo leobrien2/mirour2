@@ -212,7 +212,10 @@ export function FormsList({
                     </button>
                   )}
                   {onToggleFormActive && (
-                    <div className="flex items-center" title={form.active ? "Deactivate" : "Activate"}>
+                    <div
+                      className="flex items-center"
+                      title={form.active ? "Deactivate" : "Activate"}
+                    >
                       <Switch
                         checked={form.active}
                         onCheckedChange={() => onToggleFormActive(form.id)}
@@ -360,10 +363,15 @@ export function FormsList({
                           </button>
                         )}
                         {onToggleFormActive && (
-                          <div className="px-1.5" title={form.active ? "Deactivate" : "Activate"}>
+                          <div
+                            className="px-1.5"
+                            title={form.active ? "Deactivate" : "Activate"}
+                          >
                             <Switch
                               checked={form.active}
-                              onCheckedChange={() => onToggleFormActive(form.id)}
+                              onCheckedChange={() =>
+                                onToggleFormActive(form.id)
+                              }
                               className="scale-75"
                             />
                           </div>

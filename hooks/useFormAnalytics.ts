@@ -278,7 +278,15 @@ export const useFormAnalytics = (
                 .from("flow_sessions")
                 .update(locUpdate)
                 .eq("id", sessionId)
-                .then();
+                .then(({ error: geoErr }: { error: any }) => {
+                  if (geoErr) {
+                    flowLog(
+                      "GEO_UPDATE_ERROR",
+                      { sessionId, error: geoErr.message },
+                      "error",
+                    );
+                  }
+                });
             }
           })
           .catch(() => {});

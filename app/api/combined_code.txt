@@ -1,0 +1,2306 @@
+
+================================================================================
+FILE: qr/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@/utils/supabase/server";
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const code = searchParams.get("code");
+  const target = searchParams.get("target");
+  const locationParam = searchParams.get("location");
+
+  if (target) {
+    return NextResponse.redirect(
+      new URL(
+        `${target}${locationParam ? `?location=${locationParam}` : ""}`,
+        request.url,
+      ),
+    );
+  }
+
+  if (!code) {
+    return NextResponse.redirect(new URL("/start", request.url));
+  }
+
+  try {
+    const supabase = await createClient();
+
+    // Check if it's a location entry code
+    const { data: location } = await supabase
+      .from("locations")
+      .select("id")
+      .eq("qr_entry_code", code)
+      .single();
+
+    if (location) {
+      return NextResponse.redirect(
+        new URL(`/start?location=${location.id}`, request.url),
+      );
+    }
+
+    // Can be extended to fetch short codes for specific zones
+  } catch (error) {
+    console.error("QR code lookup error:", error);
+  }
+
+  // Fallback
+  return NextResponse.redirect(new URL("/start", request.url));
+}
+
+
+
+
+================================================================================
+FILE: analytics/journeys/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+/**
+ * GET /api/analytics/journeys
+ *
+ * Returns cross-location visitor journey data for a store.
+ * Groups by visitor_id — shows same person visiting multiple touchpoints.
+ *
+ * Query params:
+ *   store_id    — required
+ *   visitor_id  — optional: filter to a single visitor
+ *   limit       — optional: default 50
+ *
+ * Auth: store owner JWT in Authorization header.
+ */
+
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function GET(req: NextRequest) {
+  // ── Auth: verify the caller owns the store ─────────────────────────────────
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const token = authHeader.split(" ")[1];
+  const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
+  if (authError || !user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(req.url);
+  const storeId   = searchParams.get("store_id");
+  const visitorId = searchParams.get("visitor_id");
+  const limit     = parseInt(searchParams.get("limit") || "50", 10);
+
+  if (!storeId) {
+    return NextResponse.json({ error: "store_id is required" }, { status: 400 });
+  }
+
+  // Verify ownership
+  const { data: store, error: storeErr } = await supabaseAdmin
+    .from("stores")
+    .select("id, owner_id")
+    .eq("id", storeId)
+    .single();
+
+  if (storeErr || !store) {
+    return NextResponse.json({ error: "Store not found" }, { status: 404 });
+  }
+  if (store.owner_id !== user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // ── Single visitor: use the get_visitor_sessions RPC ─────────────────────
+  if (visitorId) {
+    const { data, error } = await supabaseAdmin.rpc("get_visitor_sessions", {
+      p_store_id:   storeId,
+      p_visitor_id: visitorId,
+    });
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    return NextResponse.json({ visitor_id: visitorId, sessions: data });
+  }
+
+  // ── All cross-location visitors for this store ────────────────────────────
+  const { data, error } = await (supabaseAdmin as any)
+    .from("cross_location_visitors")
+    .select("*")
+    .eq("store_id", storeId)  // Note: view may not expose store_id directly
+    .limit(limit);
+
+  // Fallback: join via visitor_location_journeys if view doesn't filter by store
+  if (error || !data?.length) {
+    const { data: journeys, error: jErr } = await (supabaseAdmin as any)
+      .from("visitor_location_journeys")
+      .select("visitor_id, customer_id, store_id, session_id, visited_at")
+      .eq("store_id", storeId)
+      .order("visited_at", { ascending: false })
+      .limit(limit * 5); // fetch more rows to group
+
+    if (jErr) {
+      return NextResponse.json({ error: jErr.message }, { status: 500 });
+    }
+
+    // Group by visitor_id in JS (simple aggregation)
+    const grouped: Record<string, any> = {};
+    for (const j of (journeys ?? []) as any[]) {
+      if (!grouped[j.visitor_id]) {
+        grouped[j.visitor_id] = {
+          visitor_id:  j.visitor_id,
+          customer_id: j.customer_id,
+          stores:      new Set<string>(),
+          journey:     [],
+        };
+      }
+      grouped[j.visitor_id].stores.add(j.store_id);
+      grouped[j.visitor_id].journey.push({
+        store_id:   j.store_id,
+        visited_at: j.visited_at,
+        session_id: j.session_id,
+      });
+    }
+
+    const result = Object.values(grouped)
+      .map((v: any) => ({ ...v, stores_visited: v.stores.size, stores: undefined }))
+      .filter((v: any) => v.stores_visited > 0)
+      .slice(0, limit);
+
+    return NextResponse.json({ store_id: storeId, count: result.length, data: result });
+  }
+
+  return NextResponse.json({ store_id: storeId, count: data.length, data });
+}
+
+
+
+
+================================================================================
+FILE: ai/generate-flow/route.ts
+TYPE: .ts
+================================================================================
+
+// app/api/ai/generate-flow/route.ts
+import { Mistral } from "@mistralai/mistralai";
+import { NextResponse } from "next/server";
+import { v4 as uuidv4 } from "uuid";
+import { createClient } from "@supabase/supabase-js";
+import { supabase } from "@/integrations/supabase/client";
+import { flowLog } from "@/lib/flowLogger";
+
+const client = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
+
+// ── Types ────────────────────────────────────────────────────────────────────
+interface StoreTag {
+  id: string;
+  name: string;
+}
+
+// ── Dynamic system prompt builder ────────────────────────────────────────────
+function buildSystemPrompt(storeTags: StoreTag[]): string {
+  const hasStoreTags = storeTags.length > 0;
+
+  const tagsSection = hasStoreTags
+    ? `━━━ AVAILABLE PRODUCT TAGS (use these to tag SELECT options) ━━━
+These tags exist in the store's product catalog. Your job is to match them
+semantically to SELECT option labels and assign the correct tag IDs.
+
+Available tags:
+${storeTags.map((t) => `  • "${t.name}"  →  id: "${t.id}"`).join("\n")}
+
+TAGGING RULES:
+- Only use tag IDs from the list above. Never invent tag IDs.
+- Assign tags to SELECT options when the option semantically represents a product category.
+  Example: option "Dry Skin" → tags: ["${storeTags[0]?.id ?? "tag_id"}"]
+- Multiple tags per option are allowed if multiple tags match.
+- If no tag clearly matches an option, use: "tags": []
+- Do NOT assign tags on outcome/terminal step options — only on question steps.
+- COVERAGE RULE: Every semantically meaningful option should attempt tag assignment.
+  Do NOT leave options with tags:[] if a tag plausibly matches. Be liberal with matching.
+  Example: "Social, energetic" → look for tags like "social", "energy", "uplifting", "sparkling"
+
+`
+    : `━━━ PRODUCT TAGS ━━━
+No store tags available. Always use: "tags": []
+
+`;
+
+  return `You are an AI Flow Architect for "Mirour" — a retail quiz and form builder.
+Users describe a customer quiz, branching form, or lead capture flow in plain English
+OR as a structured outline. You generate a CanvasFlow JSON.
+
+━━━ OUTPUT FORMAT ━━━
+Output ONLY valid JSON. No markdown. No code fences. No explanation.
+
+→ Ask for clarification:  { "type": "question", "content": "One focused question here." }
+→ Generate a flow:        { "type": "flow", "data": { ...CanvasFlow } }
+
+━━━ WHEN TO ASK A CLARIFYING QUESTION ━━━
+Ask ONE question (not multiple) when:
+1. The goal/outcome of the flow is completely unclear (what should happen at the end?)
+2. The branching logic is ambiguous (do all options go to the same place, or diverge?)
+3. You don't know the CTA URL/destination for outcome steps
+4. The number of outcome paths is genuinely unclear
+
+If you have enough to make reasonable assumptions, GENERATE the flow and note assumptions.
+Never ask more than one question per turn.
+
+━━━ INPUT HANDLING ━━━
+Handle all of these seamlessly:
+1. Plain English: "Create a skincare quiz that recommends products by skin type"
+2. Structured outline:
+   Title: ...
+   Q1: ...  · Option A → outcome X  · Option B → Q2
+3. Existing JSON flow (modification/fixing)
+4. Hybrid: partial description + extra instructions
+
+Preserve the user's exact wording for questions, options, and outcome messages.
+
+${tagsSection}━━━ CANVASFLOW SCHEMA ━━━
+
+CanvasFlow:
+{
+  "id": "flow_<8-char-slug>",
+  "name": "Short descriptive name",
+  "steps": [ ...CanvasStep[] ]
+}
+
+CanvasStep:
+{
+  "id": "step_<descriptive_slug>",
+  "label": "Short readable label (sidebar)",
+  "blocks": [ ...CanvasBlock[] ],
+  "nextStepId": "step_id"   ← OMIT on terminal steps; OMIT when ALL routing is via option.nextStepId
+}
+
+CanvasBlock:
+{
+  "id": "block_<descriptive_slug>",
+  "data": BlockData
+}
+
+━━━ BLOCK TYPES ━━━
+
+HEADING:
+{ "type": "h1"|"h2"|"h3", "text": string, "align": "left"|"center"|"right" }
+
+PARAGRAPH:
+{ "type": "paragraph", "text": string, "align": "left"|"center"|"right", "fontSize": 14 }
+
+IMAGE:
+{ "type": "image", "src": "", "alt": "", "fit": "cover", "aspectRatio": "16:9", "borderRadius": 8 }
+
+SELECT ← primary branching + tagging block:
+{
+  "type": "select",
+  "question": "",            ← SEE "SELECT QUESTION RULE" BELOW — set "" when h1/h2/h3 is on the same step
+  "selectionMode": "single" | "multi",
+  "layout": "list" | "grid",
+  "options": [
+    {
+      "id": "opt_<slug>",
+      "label": string,
+      "tags": [],              ← populate from AVAILABLE TAGS list above (or [] if none match)
+      "nextStepId": "step_id" ← ONLY set when THIS option routes differently from the default
+                               ← OMIT ENTIRELY when not needed — never set to null
+    }
+  ]
+}
+
+CONTACT ← ALWAYS use this for any user identity / data capture:
+{
+  "type": "contact",
+  "heading": string,
+  "fields": {
+    "firstName": { "enabled": true,  "required": true  },
+    "lastName":  { "enabled": true,  "required": false },
+    "email":     { "enabled": true,  "required": true  },
+    "phone":     { "enabled": false, "required": false }
+  },
+  "submitLabel": "Continue",
+  "nextStepId": "step_id",   ← SET THIS when a results/products step follows after contact submit
+                              ← OMIT ONLY when this is the very last step in the entire flow
+  "showSkip": false,
+  "skipLabel": "Skip"
+}
+
+TEXT INPUT ← ONLY for open-ended freeform answers (NOT for email/name/phone):
+{ "type": "text-input", "question": string, "placeholder": string, "required": false, "multiline": false, "submitLabel": "Next" }
+
+RATING:
+{ "type": "rating", "question": string, "ratingType": "stars"|"thumbs", "maxStars": 5, "minLabel": "", "maxLabel": "", "required": false }
+
+BUTTON:
+{
+  "type": "button",
+  "label": string,
+  "action": "link" | "next-step",
+  "href": "",
+  "nextStepId": "...",
+  "variant": "filled" | "outline" | "ghost",
+  "align": "left" | "center" | "right",
+  "borderRadius": 8,
+  "fullWidth": true | false
+}
+
+PRODUCTS ← for recommendation / result steps:
+{
+  "type": "products",
+  "mode": "tagged",
+  "layout": "grid" | "list",
+  "heading": "",
+  "resultLimit": 6,
+  "matchStrategy": "any",
+  "showAddToCart": true,
+  "showProductTags": false,
+  "fallbackMessage": "We couldn't find exact matches — explore our full range below."
+}
+
+DIVIDER: { "type": "divider", "thickness": 1, "style": "solid" }
+SPACER:  { "type": "spacer", "height": 24 }
+
+━━━ SELECT QUESTION RULE — NO DUPLICATE RENDERING ━━━
+
+The select block's "question" field renders as a visible sub-label ABOVE the options.
+An h1/h2/h3 block on the same step ALSO renders visibly above the options.
+
+RULE: If the step already has an h1/h2/h3 block with the question text → set select.question = ""
+      If there is NO heading block on the step → put the question in select.question.
+      Same rule applies to text-input.question and rating.question.
+
+✅ CORRECT — heading carries the text:
+  blocks: [
+    { "data": { "type": "h2", "text": "What is your skin type?" } },
+    { "data": { "type": "select", "question": "", "options": [...] } }
+  ]
+
+❌ WRONG — question appears twice:
+  blocks: [
+    { "data": { "type": "h2", "text": "What is your skin type?" } },
+    { "data": { "type": "select", "question": "What is your skin type?", "options": [...] } }
+  ]
+
+✅ CORRECT — no heading, so question lives in select:
+  blocks: [
+    { "data": { "type": "select", "question": "What is your skin type?", "options": [...] } }
+  ]
+
+━━━ CONTACT vs TEXT-INPUT — CRITICAL DISTINCTION ━━━
+
+CONTACT block — use when collecting ANY user identity data:
+  ✅ Email address (alone or combined) / Name / Phone number
+  ✅ Lead capture, newsletter signup, discount delivery, results delivery
+  Enable only the fields you need; set contact.nextStepId when a step follows.
+
+TEXT-INPUT block — ONLY for qualitative / freeform answers:
+  ✅ "What's on your mind?" / open-ended questions / feedback
+  ❌ NEVER use for email, name, or phone — use contact block instead
+
+━━━ ROUTING RULES (CRITICAL — READ ALL 8) ━━━
+
+RULE 1 — Linear (all options → same next step):
+  step.nextStepId = "step_q2"
+  options: NO nextStepId on any option — omit it entirely on every option
+
+RULE 2 — Full branch (every option diverges):
+  step.nextStepId = OMIT entirely
+  Every option MUST have nextStepId pointing to its correct target
+
+RULE 3 — Mixed branch (most options share a target, one diverges):
+  step.nextStepId = "step_common"       ← fallback for options WITHOUT nextStepId
+  Only the diverging option has nextStepId = "step_special"
+
+RULE 4 — Terminal steps (outcomes / end screens):
+  OMIT step.nextStepId entirely
+  ONLY "link" buttons allowed — no "next-step" buttons whatsoever
+
+RULE 5 — No dangling references:
+  Every nextStepId (step OR option OR block) MUST match an existing step.id in this flow
+
+RULE 6 — No "Start Over" buttons:
+  Never generate buttons with label containing: "start over", "restart", "try again", "reset", "begin again"
+
+RULE 7 — Button nextStepId on welcome/intro steps:
+  button.nextStepId must exactly match step.nextStepId
+
+RULE 8 — Contact block routing (CRITICAL):
+  The contact block's onAdvance fires as: contact.nextStepId ?? step.nextStepId
+  → If a results/products step follows contact capture, you MUST set EITHER:
+      (a) contact block's "nextStepId": "step_results"   ← preferred
+      OR (b) step-level "nextStepId": "step_results"
+  → NEVER leave both undefined when another step must follow contact submission.
+  → Contact is terminal ONLY when it is the last step in the entire flow.
+  → NEVER set nextStepId to null — OMIT the key entirely if not needed.
+
+━━━ STEP LAYOUT GUIDE ━━━
+
+Welcome / intro step:
+  h1 → paragraph → button (action:"next-step", variant:"filled", fullWidth:true)
+  step.nextStepId = first question step
+
+Question step (single-select):
+  h2 → select block (select.question = "" since h2 carries the text)
+  NO submit button — single-select auto-advances on pick
+
+Question step (multi-select):
+  h2 → select block (select.question = "") → button (label:"Continue", action:"next-step", variant:"filled")
+
+Recommendation / result step:
+  h2 → paragraph → spacer → products block (mode:"tagged")
+  step.nextStepId = contact capture step (if present) OR OMIT if terminal
+  ALWAYS add a products block on any step whose purpose is to show recommendations.
+  NEVER use mode:"manual" unless the user explicitly requests specific products.
+  Outcome heading: use GENERIC language ("Here are your matches 🎉") — never hardcode
+  a profile name like "The Socialite" unless the flow explicitly branches to different
+  named outcomes per path.
+
+Contact capture step:
+  h2 → paragraph → spacer → contact block
+  contact.nextStepId = next step id (results, thank-you, etc.) if one exists
+  step.nextStepId = same as contact.nextStepId (set both for safety)
+  ONLY omit both when this is the absolute last step in the flow.
+  submitLabel drives the primary CTA ("Reveal My Matches", "Get My Discount", etc.)
+
+Outcome / terminal step (non-product):
+  h2 → paragraph → spacer → button (action:"link", variant:"filled", fullWidth:true)
+  NO step.nextStepId. NO next-step buttons.
+
+━━━ NO TEMPLATE / PLACEHOLDER SYNTAX ━━━
+NEVER use {variable}, {{variable}}, [variable], [placeholder], or ANY bracket/brace syntax.
+The platform has NO template engine — everything renders as literal text.
+
+WRONG: "You're a {profile_name} 🌿"   WRONG: "/collections/{category}"
+WRONG: "Your vibe: [Vibe Name]"        WRONG: "Feel [energy] today"
+RIGHT: "Here's what we picked for you 🌿"   RIGHT: "/collections/all"
+
+━━━ NO INTERACTIVE CHECKBOX BLOCK ━━━
+There is NO checkbox block type in this platform.
+For opt-in consent text or newsletter disclaimers, use a PARAGRAPH block.
+
+━━━ DYNAMIC PRODUCTS EXPLAINED ━━━
+The products block with mode:"tagged" works as follows at runtime:
+  1. User picks options throughout the quiz
+  2. All tags from every picked option are collected into accumulatedTags[]
+  3. The products block queries /api/products/by-tags with those accumulated tags
+  4. Matching products are shown automatically
+
+This is the ENTIRE point of tagging SELECT options — the tags flow through to the
+products block. You do NOT need to hardcode products or use placeholder URLs.
+
+━━━ SELF-CHECK BEFORE OUTPUT ━━━
+Verify ALL of these before returning:
+[ ] Every non-terminal step has: step.nextStepId OR every option has option.nextStepId
+[ ] Every nextStepId (step + option + button + contact block) matches a real step.id
+[ ] Tags only contain IDs from AVAILABLE TAGS (or [] if none match)
+[ ] Zero "Start Over / Restart / Reset" buttons exist
+[ ] Terminal steps have no step.nextStepId and no next-step buttons
+[ ] Single-select steps have no submit button
+[ ] Welcome step button.nextStepId === step.nextStepId
+[ ] No {variable}, {{variable}}, [variable] or any placeholder syntax in any text/href/label
+[ ] Any recommendation/result step has a products block with mode:"tagged"
+[ ] Every step (except steps[0]) is pointed to by at least one nextStepId — no unreachable steps
+[ ] No option has nextStepId set to null — either a real step id or the key is OMITTED
+[ ] Linear steps (RULE 1): options have NO nextStepId — only step.nextStepId is set
+[ ] If a contact step is followed by another step, contact.nextStepId is set on the contact block
+[ ] All semantically meaningful SELECT options have attempted tag assignment
+[ ] Outcome headings use generic language unless the flow explicitly branches to named outcomes
+[ ] select.question = "" when an h1/h2/h3 on the same step already shows the question text
+`;
+}
+
+// ── Routing validator ────────────────────────────────────────────────────────
+function validateAndRepairRouting(steps: any[]): any[] {
+  const validStepIds = new Set(steps.map((s: any) => s.id));
+
+  return steps.map((step: any, stepIndex: number) => {
+    const selectBlocks = (step.blocks ?? []).filter(
+      (b: any) => b.data?.type === "select",
+    );
+    const hasSelectBlock = selectBlocks.length > 0;
+    const hasContactBlock = (step.blocks ?? []).some(
+      (b: any) => b.data?.type === "contact",
+    );
+
+    const isTerminal = !step.nextStepId && !hasSelectBlock && !hasContactBlock;
+
+    if (!isTerminal && hasSelectBlock) {
+      for (const block of selectBlocks) {
+        const options: any[] = block.data?.options ?? [];
+        const allHaveNext = options.every((o) => o.nextStepId);
+        const noneHaveNext = options.every((o) => !o.nextStepId);
+
+        // Mixed routing with no step-level fallback → auto-assign most common target
+        if (!allHaveNext && !noneHaveNext && !step.nextStepId) {
+          const targets = options
+            .filter((o) => o.nextStepId)
+            .map((o) => o.nextStepId);
+          const frequency: Record<string, number> = {};
+          for (const t of targets) frequency[t] = (frequency[t] ?? 0) + 1;
+          const mostCommon = Object.entries(frequency).sort(
+            (a, b) => b[1] - a[1],
+          )[0]?.[0];
+          if (mostCommon && validStepIds.has(mostCommon)) {
+            step.nextStepId = mostCommon;
+            flowLog(
+              "ROUTING_REPAIR_ASSIGNED_FALLBACK",
+              { stepId: step.id, mostCommon },
+              "warn",
+            );
+          }
+        }
+
+        // RULE 1 enforcement: if step.nextStepId is set AND every option
+        // points to the same target as step.nextStepId → strip option-level
+        // nextStepIds (they are redundant noise that can confuse the player)
+        if (step.nextStepId && allHaveNext) {
+          const allSameAsStep = options.every(
+            (o) => o.nextStepId === step.nextStepId,
+          );
+          if (allSameAsStep) {
+            block.data.options = options.map((o: any) => {
+              const cleaned = { ...o };
+              delete cleaned.nextStepId;
+              return cleaned;
+            });
+            flowLog(
+              "ROUTING_REPAIR_STRIPPED_REDUNDANT_OPTION_ROUTES",
+              { stepId: step.id, target: step.nextStepId },
+              "warn",
+            );
+          }
+        }
+      }
+    }
+
+    // ── Contact block routing repair ──────────────────────────────────────────
+    if (hasContactBlock) {
+      const contactBlocks = (step.blocks ?? []).filter(
+        (b: any) => b.data?.type === "contact",
+      );
+      for (const block of contactBlocks) {
+        const blockHasRoute =
+          block.data?.nextStepId && validStepIds.has(block.data.nextStepId);
+        const stepHasRoute =
+          step.nextStepId && validStepIds.has(step.nextStepId);
+
+        if (!blockHasRoute && !stepHasRoute) {
+          const nextStep = steps[stepIndex + 1];
+          if (nextStep?.id && validStepIds.has(nextStep.id)) {
+            step.nextStepId = nextStep.id;
+            block.data.nextStepId = nextStep.id;
+            flowLog(
+              "ROUTING_REPAIR_CONTACT_ASSIGNED_NEXT",
+              { stepId: step.id, assignedNextStepId: nextStep.id },
+              "warn",
+            );
+          }
+        }
+
+        if (
+          block.data?.nextStepId &&
+          !validStepIds.has(block.data.nextStepId)
+        ) {
+          flowLog(
+            "ROUTING_REPAIR_REMOVED_DANGLING_CONTACT_ROUTE",
+            { stepId: step.id, danglingId: block.data.nextStepId },
+            "warn",
+          );
+          delete block.data.nextStepId;
+        }
+      }
+    }
+
+    // Remove dangling step.nextStepId
+    if (step.nextStepId && !validStepIds.has(step.nextStepId)) {
+      flowLog(
+        "ROUTING_REPAIR_REMOVED_DANGLING",
+        { stepId: step.id, danglingId: step.nextStepId },
+        "warn",
+      );
+      delete step.nextStepId;
+    }
+
+    return step;
+  });
+}
+
+// ── Template placeholder scrubber ─────────────────────────────────────────────
+function stripTemplateSyntax(value: string): string {
+  return value
+    .replace(/\{\{[^}]*\}\}/g, "") // {{variable}}
+    .replace(/\{[^}]+\}/g, "") // {variable}
+    .replace(/\[[^\]]+\]/g, "") // [variable] / [placeholder]
+    .replace(/\s{2,}/g, " ") // collapse double spaces left by removal
+    .trim();
+}
+
+function deduplicateStepQuestions(steps: any[]): any[] {
+  const HEADING_TYPES = new Set(["h1", "h2", "h3"]);
+  const QUESTION_BLOCK_TYPES = new Set(["select", "text-input", "rating"]);
+
+  return steps.map((step: any) => {
+    const blocks: any[] = step.blocks ?? [];
+
+    // Collect all heading texts on this step (normalised)
+    const headingTexts = new Set<string>(
+      blocks
+        .map((b: any) => b.data)
+        .filter((d: any) => d && HEADING_TYPES.has(d.type) && d.text)
+        .map((d: any) => (d.text as string).trim().toLowerCase()),
+    );
+
+    if (headingTexts.size === 0) return step;
+
+    const newBlocks = blocks.map((block: any) => {
+      const data = block.data;
+      if (!data || !QUESTION_BLOCK_TYPES.has(data.type)) return block;
+
+      const q: string = (data.question ?? "").trim().toLowerCase();
+      if (q && headingTexts.has(q)) {
+        flowLog(
+          "DEDUP_QUESTION_CLEARED",
+          {
+            stepId: step.id,
+            blockType: data.type,
+            duplicatedText: data.question,
+          },
+          "warn",
+        );
+        return { ...block, data: { ...data, question: "" } };
+      }
+
+      return block;
+    });
+
+    return { ...step, blocks: newBlocks };
+  });
+}
+
+// ── Block scrubber ────────────────────────────────────────────────────────────
+function scrubBlocks(
+  blocks: any[],
+  validStepIds: Set<string>,
+  validTagIds: Set<string>,
+): any[] {
+  return blocks
+    .map((block: any) => {
+      const data = block.data;
+      if (!data) return block;
+
+      // HEADINGS + PARAGRAPH: strip template syntax from text
+      if (
+        ["h1", "h2", "h3", "paragraph"].includes(data.type) &&
+        typeof data.text === "string"
+      ) {
+        data.text = stripTemplateSyntax(data.text);
+      }
+
+      // SELECT: sanitize tags + validate option routing
+      if (data.type === "select" && Array.isArray(data.options)) {
+        data.options = data.options.map((opt: any) => {
+          // Strip null/undefined nextStepId — must be omitted, never null
+          if (opt.nextStepId === null || opt.nextStepId === undefined) {
+            delete opt.nextStepId;
+          }
+
+          // Strip invalid tag IDs
+          if (validTagIds.size === 0) {
+            opt.tags = [];
+          } else {
+            opt.tags = Array.isArray(opt.tags)
+              ? opt.tags.filter((tid: string) => validTagIds.has(tid))
+              : [];
+          }
+
+          // Remove dangling option routes
+          if (opt.nextStepId && !validStepIds.has(opt.nextStepId)) {
+            flowLog(
+              "BLOCK_SCRUB_REMOVED_DANGLING_OPTION_ROUTE",
+              { optionId: opt.id, danglingId: opt.nextStepId },
+              "warn",
+            );
+            delete opt.nextStepId;
+          }
+
+          return opt;
+        });
+
+        // Also scrub template syntax from select.question
+        if (typeof data.question === "string") {
+          data.question = stripTemplateSyntax(data.question);
+        }
+      }
+
+      // TEXT-INPUT + RATING: scrub question field too
+      if (
+        (data.type === "text-input" || data.type === "rating") &&
+        typeof data.question === "string"
+      ) {
+        data.question = stripTemplateSyntax(data.question);
+      }
+
+      // CONTACT: strip null nextStepId + validate route
+      if (data.type === "contact") {
+        if (data.nextStepId === null || data.nextStepId === undefined) {
+          delete data.nextStepId;
+        } else if (data.nextStepId && !validStepIds.has(data.nextStepId)) {
+          flowLog(
+            "BLOCK_SCRUB_REMOVED_DANGLING_CONTACT_ROUTE",
+            { danglingId: data.nextStepId },
+            "warn",
+          );
+          delete data.nextStepId;
+        }
+
+        if (data.skipNextStepId && !validStepIds.has(data.skipNextStepId)) {
+          flowLog(
+            "BLOCK_SCRUB_REMOVED_DANGLING_SKIP_ROUTE",
+            { danglingId: data.skipNextStepId },
+            "warn",
+          );
+          delete data.skipNextStepId;
+        }
+      }
+
+      // BUTTON: strip restart buttons + fix dangling routes + strip template hrefs
+      if (data.type === "button") {
+        const label: string = (data.label ?? "").toLowerCase();
+        const RESTART_PATTERNS = [
+          "start over",
+          "restart",
+          "try again",
+          "begin again",
+          "reset",
+        ];
+        if (RESTART_PATTERNS.some((p) => label.includes(p))) {
+          flowLog(
+            "BLOCK_SCRUB_REMOVED_RESTART_BUTTON",
+            { label: data.label },
+            "warn",
+          );
+          return null;
+        }
+
+        if (
+          data.action === "next-step" &&
+          data.nextStepId &&
+          !validStepIds.has(data.nextStepId)
+        ) {
+          flowLog(
+            "BLOCK_SCRUB_REMOVED_DANGLING_BUTTON_ROUTE",
+            { label: data.label, danglingId: data.nextStepId },
+            "warn",
+          );
+          delete data.nextStepId;
+        }
+
+        // Strip ALL template placeholder patterns from href
+        if (typeof data.href === "string") {
+          const scrubbed = stripTemplateSyntax(data.href);
+          if (scrubbed !== data.href) {
+            flowLog(
+              "BLOCK_SCRUB_STRIPPED_HREF_TEMPLATE",
+              { oldHref: data.href, newHref: scrubbed || "/" },
+              "warn",
+            );
+            data.href = scrubbed || "/";
+          }
+        }
+
+        // Strip template syntax from button label too
+        if (typeof data.label === "string") {
+          data.label = stripTemplateSyntax(data.label);
+        }
+      }
+
+      return block;
+    })
+    .filter(Boolean);
+}
+
+// ── POST handler ─────────────────────────────────────────────────────────────
+export async function POST(req: Request) {
+  try {
+    const { messages, storeId, owner_id } = await req.json();
+    flowLog("AI_GENERATE_FLOW_START", { storeId, messages }, "info");
+
+    if (!process.env.MISTRAL_API_KEY) {
+      flowLog("MISTRAL_API_KEY_MISSING", null, "error");
+      return NextResponse.json(
+        { error: "API key not configured" },
+        { status: 500 },
+      );
+    }
+
+    console.log("storeId", storeId);
+    console.log("messages", messages);
+
+    // ── Fetch store tags ──────────────────────────────────────────────────────
+    let storeTags: StoreTag[] = [];
+
+    flowLog("OWNER_ID_FETCHED", { owner_id }, "info");
+    console.log("owner_id", owner_id);
+
+    if (owner_id) {
+      try {
+        let query = supabase
+          .from("tags")
+          .select("id, name")
+          .order("name", { ascending: true });
+
+        if (owner_id) {
+          query = query.eq("owner_id", owner_id);
+        } else if (storeId) {
+          query = query.eq("store_id", storeId);
+        }
+
+        flowLog("STORE_TAGS_QUERY", { owner_id, storeId }, "db_read", "tags");
+
+        const { data, error } = await query;
+        console.log("data", data);
+
+        if (!error && data) storeTags = data as StoreTag[];
+
+        if (error) {
+          flowLog(
+            "STORE_TAGS_ERROR",
+            { error, owner_id, storeId },
+            "error",
+            "tags",
+          );
+        } else {
+          flowLog(
+            "STORE_TAGS_FETCHED",
+            { count: storeTags.length, tags: storeTags },
+            "db_read",
+            "tags",
+          );
+        }
+
+        console.log(
+          `[generate-flow] Fetched ${storeTags.length} tags for`,
+          owner_id ? `owner ${owner_id}` : `store ${storeId}`,
+        );
+      } catch (e) {
+        console.warn("[generate-flow] Tag fetch failed (non-fatal):", e);
+      }
+    } else {
+      console.warn(
+        "[generate-flow] No owner_id or storeId — skipping tag fetch",
+      );
+      flowLog("NO_OWNER_OR_STORE_ID", { owner_id, storeId }, "warn");
+    }
+
+    console.log("storeTags", storeTags);
+    const systemPrompt = buildSystemPrompt(storeTags);
+    const validTagIds = new Set(storeTags.map((t) => t.id));
+    console.log("validTagIds", validTagIds);
+
+    const chatResponse = await client.chat.complete({
+      model: "mistral-large-latest",
+      messages: [{ role: "system", content: systemPrompt }, ...messages],
+      responseFormat: { type: "json_object" },
+    });
+
+    const content = chatResponse.choices[0].message.content as string;
+
+    let result: any;
+    try {
+      result = JSON.parse(content);
+    } catch (e) {
+      return NextResponse.json(
+        { error: "Invalid AI response — could not parse JSON" },
+        { status: 500 },
+      );
+    }
+
+    // ── Post-processing safety pass ───────────────────────────────────────────
+    if (result.type === "flow" && Array.isArray(result.data?.steps)) {
+      // 1. Hydrate missing IDs + enforce global uniqueness
+      result.data.id = result.data.id || `flow_${uuidv4().slice(0, 8)}`;
+
+      const usedIds = new Set<string>();
+
+      result.data.steps = (result.data.steps as any[]).map((step: any) => {
+        if (!step.id || usedIds.has(step.id)) {
+          step.id = `step_${uuidv4().slice(0, 8)}`;
+        }
+        usedIds.add(step.id);
+
+        step.blocks = (step.blocks ?? []).map((block: any) => {
+          let blockId = block.id;
+          if (!blockId || usedIds.has(blockId)) {
+            blockId = `block_${uuidv4().slice(0, 8)}`;
+          }
+          usedIds.add(blockId);
+
+          if (
+            block.data?.type === "select" &&
+            Array.isArray(block.data?.options)
+          ) {
+            block.data.options = block.data.options.map((opt: any) => {
+              let optId = opt.id;
+              if (!optId || usedIds.has(optId)) {
+                optId = `opt_${uuidv4().slice(0, 8)}`;
+              }
+              usedIds.add(optId);
+              return { ...opt, id: optId };
+            });
+          }
+
+          return { ...block, id: blockId };
+        });
+
+        return step;
+      });
+
+      const validStepIds = new Set(
+        (result.data.steps as any[]).map((s: any) => s.id),
+      );
+
+      // 2. Validate + repair routing (contact repair + redundant option route cleanup)
+      result.data.steps = validateAndRepairRouting(result.data.steps);
+
+      // 3. Deduplicate heading text vs select/text-input/rating .question field
+      result.data.steps = deduplicateStepQuestions(result.data.steps);
+
+      // 4. Scrub blocks (template syntax + tags + buttons + dangling refs + null nextStepIds)
+      result.data.steps = (result.data.steps as any[]).map((step: any) => ({
+        ...step,
+        blocks: scrubBlocks(step.blocks ?? [], validStepIds, validTagIds),
+      }));
+
+      // 5. Tag summary for the chat preview card
+      result.tagsSummary =
+        storeTags.length > 0
+          ? `${storeTags.length} store tags available`
+          : "No store tags — product filtering disabled";
+    }
+
+    flowLog("AI_GENERATE_FLOW_SUCCESS", result, "info");
+    return NextResponse.json(result);
+  } catch (error) {
+    console.error("[generate-flow] Error:", error);
+    flowLog("AI_GENERATE_FLOW_ERROR", { error }, "error");
+    return NextResponse.json(
+      { error: "Failed to generate flow" },
+      { status: 500 },
+    );
+  }
+}
+
+
+
+
+================================================================================
+FILE: sessions/complete/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function POST(req: Request) {
+  try {
+    const {
+      sessionId,
+      responseId,
+      customerId,
+      totalTimeSec,
+      lastNodeId,
+      nodeTimeSec,
+      enteredAt,
+    } = await req.json();
+
+    if (!sessionId || !responseId) {
+      return NextResponse.json(
+        { ok: false, error: "missing fields" },
+        { status: 400 },
+      );
+    }
+
+    if (lastNodeId && nodeTimeSec != null) {
+      await supabase.from("flow_session_nodes").insert({
+        session_id: sessionId,
+        node_id: lastNodeId,
+        time_spent_seconds: nodeTimeSec,
+        entered_at: enteredAt || null,
+        exited_at: new Date().toISOString(),
+        is_dropoff: false,
+      });
+    }
+
+    const { error } = await supabase
+      .from("flow_sessions")
+      .update({
+        status: "completed",
+        completed_at: new Date().toISOString(),
+        last_activity_at: new Date().toISOString(),
+        response_id: responseId,
+        customer_id: customerId ?? null,
+        total_time_seconds:
+          typeof totalTimeSec === "number" ? totalTimeSec : null,
+      })
+      .eq("id", sessionId);
+
+    if (error) {
+      console.error("[complete] error:", error.message);
+      return NextResponse.json(
+        { ok: false, error: error.message },
+        { status: 500 },
+      );
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    console.error("[complete] error:", err);
+    return NextResponse.json({ ok: false }, { status: 500 });
+  }
+}
+
+
+
+
+================================================================================
+FILE: sessions/abandon/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+// Service-role client so we can UPDATE any session regardless of RLS
+// (the visitor is anonymous and has no auth token at page-close time)
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function POST(req: Request) {
+  try {
+    // sendBeacon sends Content-Type: text/plain but body is valid JSON
+    const text = await req.text();
+    const { sessionId, dropOffNode, totalTimeSec } = JSON.parse(text);
+
+    if (!sessionId || typeof sessionId !== "string") {
+      return NextResponse.json({ ok: false, error: "missing sessionId" }, { status: 400 });
+    }
+
+    // .eq("status", "in_progress") makes this idempotent —
+    // calling it twice (e.g. visibilitychange + beforeunload) is safe.
+    const { error } = await supabase
+      .from("flow_sessions")
+      .update({
+        status:             "abandoned",
+        drop_off_node_id:   dropOffNode ?? null,
+        total_time_seconds: typeof totalTimeSec === "number" ? totalTimeSec : null,
+        last_activity_at:   new Date().toISOString(),
+      })
+      .eq("id", sessionId)
+      .eq("status", "in_progress");
+
+    if (error) {
+      console.error("[abandon] supabase error:", error.message);
+      return NextResponse.json({ ok: false }, { status: 500 });
+    }
+
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    console.error("[abandon] parse error:", err);
+    return NextResponse.json({ ok: false }, { status: 500 });
+  }
+}
+
+
+
+
+================================================================================
+FILE: business/profile/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+// Force Node.js runtime instead of Edge to fix Next.js API build issues with Edge
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic"; // Bypass Next.js static caching
+
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const formId = searchParams.get("formId");
+    const locationId = searchParams.get("locationId");
+
+    console.log("formId", formId);
+    console.log("locationId", locationId);
+
+    if (!formId && !locationId) {
+      return NextResponse.json(
+        { error: "Provide formId or locationId" },
+        { status: 400 },
+      );
+    }
+
+    // Initialize supabase with SERVICE ROLE KEY to bypass RLS securely on the server
+    const supabaseOptions = {
+      auth: { persistSession: false },
+    };
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      supabaseOptions,
+    );
+
+    let storeId = null;
+    let ownerId = null;
+    let diagnostics: any = {};
+
+    if (formId) {
+      console.log("formId", formId);
+      const { data: formData, error: formError } = await supabase
+        .from("forms")
+        .select("owner_id, show_start_page")
+        .eq("id", formId)
+        .single();
+
+      console.log("formData", formData);
+      console.log("formError", formError);
+
+      if (formError) {
+        console.error("formError:", formError);
+        diagnostics.formError = formError;
+      }
+
+      if (formData) {
+        if (formData.owner_id) ownerId = formData.owner_id;
+        if (formData.show_start_page !== undefined)
+          diagnostics.showStartPage = formData.show_start_page;
+      }
+    } else if (locationId) {
+      console.log("locationId", locationId);
+      const { data: locationData, error: locationError } = await supabase
+        .from("locations")
+        .select("store_id, owner_id") // Changed to also select owner_id
+        .eq("id", locationId)
+        .single();
+
+      console.log("locationData", locationData);
+      console.log("locationError", locationError);
+
+      if (locationError) {
+        console.error("locationError:", locationError);
+        diagnostics.locationError = locationError;
+      }
+
+      if (locationData?.store_id) storeId = locationData.store_id;
+      if (locationData?.owner_id) ownerId = locationData.owner_id; // Assign ownerId if found
+    }
+
+    // if forms didn't have owner_id, but had store_id, try to get owner_id from stores
+    if (!ownerId && storeId) {
+      console.log("storeId", storeId);
+      const { data: storeData, error: storeError } = await supabase
+        .from("stores")
+        .select("user_id")
+        .eq("id", storeId)
+        .single();
+
+      console.log("storeData", storeData);
+      console.log("storeError", storeError);
+
+      if (storeError) {
+        console.error("storeError:", storeError);
+        diagnostics.storeError = storeError;
+      }
+
+      if (storeData?.user_id) {
+        ownerId = storeData.user_id;
+
+        console.log("ownerId", ownerId);
+      }
+    }
+
+    if (!ownerId) {
+      return NextResponse.json(
+        {
+          error: `No owner linked for form ${formId} location ${locationId} store ${storeId}`,
+          diagnostics,
+        },
+        { status: 404 },
+      );
+    }
+
+    console.log("ownerId", ownerId);
+
+    const { data: profileData, error: profileError } = await supabase
+      .from("admin_users")
+      .select("business_name, business_logo")
+      .eq("id", ownerId)
+      .single();
+
+    console.log("profileData", profileData);
+    console.log("profileError", profileError);
+
+    if (profileError) {
+      console.error("profileError:", profileError);
+      diagnostics.profileError = profileError;
+    }
+
+    if (!profileData) {
+      return NextResponse.json(
+        { error: `Profile not found for owner ${ownerId}`, diagnostics },
+        { status: 404 },
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      profile: profileData,
+      show_start_page: diagnostics.showStartPage ?? true,
+    });
+  } catch (error: any) {
+    console.error("API error fetching business profile:", error);
+    return NextResponse.json(
+      { error: "Internal server error" },
+      { status: 500 },
+    );
+  }
+}
+
+
+
+
+================================================================================
+FILE: remarketing/export/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+/**
+ * GET /api/remarketing/export
+ *
+ * Query params:
+ *   store_id  — required
+ *   segment   — optional: all_opted_in | vip | lapsed | saves_without_purchase | completed_flow
+ *   format    — optional: json (default) | csv
+ *
+ * Returns the remarketing contact list for the store, filtered by segment.
+ * Only the authenticated store owner can access their own store's data.
+ */
+
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+);
+
+export async function GET(req: NextRequest) {
+  // ── Auth: verify the caller owns the store ─────────────────────────────────
+  const authHeader = req.headers.get("authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  const token = authHeader.split(" ")[1];
+  const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(token);
+  if (authError || !user) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const { searchParams } = new URL(req.url);
+  const storeId = searchParams.get("store_id");
+  const segment = searchParams.get("segment") || "all_opted_in";
+  const format  = searchParams.get("format") || "json";
+
+  if (!storeId) {
+    return NextResponse.json({ error: "store_id is required" }, { status: 400 });
+  }
+
+  // Verify ownership
+  const { data: store, error: storeErr } = await supabaseAdmin
+    .from("stores")
+    .select("id, owner_id")
+    .eq("id", storeId)
+    .single();
+
+  if (storeErr || !store) {
+    return NextResponse.json({ error: "Store not found" }, { status: 404 });
+  }
+  if (store.owner_id !== user.id) {
+    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+
+  // ── Query the remarketing_contacts view ───────────────────────────────────
+
+  let query = supabaseAdmin
+    .from("remarketing_contacts" as any)
+    .select("*")
+    .eq("store_id", storeId);
+
+  // Apply segment filters
+  switch (segment) {
+    case "vip":
+      query = query.eq("is_vip", true);
+      break;
+    case "lapsed":
+      // Use separate lapsed_visitors view for richer data
+      {
+        const { data: lapsed, error: lapsedErr } = await supabaseAdmin
+          .from("lapsed_visitors" as any)
+          .select("*")
+          .eq("store_id", storeId);
+
+        if (lapsedErr) {
+          return NextResponse.json({ error: lapsedErr.message }, { status: 500 });
+        }
+        return buildResponse(lapsed ?? [], format, segment);
+      }
+
+    case "saves_without_purchase":
+      {
+        const { data: saves, error: savesErr } = await supabaseAdmin
+          .from("saves_without_purchase" as any)
+          .select("*")
+          .eq("store_id", storeId);
+
+        if (savesErr) {
+          return NextResponse.json({ error: savesErr.message }, { status: 500 });
+        }
+        return buildResponse(saves ?? [], format, segment);
+      }
+
+    case "completed_flow":
+      query = query.eq("completed_flow", true);
+      break;
+
+    case "all_opted_in":
+    default:
+      // No extra filter — returns all contacts with phone or email
+      break;
+  }
+
+  const { data, error } = await query;
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+
+  return buildResponse(data ?? [], format, segment);
+}
+
+// ── Response formatter ────────────────────────────────────────────────────────
+
+function buildResponse(rows: any[], format: string, segment: string) {
+  if (format === "csv") {
+    if (rows.length === 0) {
+      return new NextResponse("", {
+        headers: {
+          "Content-Type": "text/csv",
+          "Content-Disposition": `attachment; filename="remarketing_${segment}.csv"`,
+        },
+      });
+    }
+
+    const headers = Object.keys(rows[0]).join(",");
+    const csvRows = rows.map((r) =>
+      Object.values(r)
+        .map((v) => (typeof v === "string" ? `"${v.replace(/"/g, '""')}"` : v ?? ""))
+        .join(","),
+    );
+    const csv = [headers, ...csvRows].join("\n");
+
+    return new NextResponse(csv, {
+      headers: {
+        "Content-Type": "text/csv",
+        "Content-Disposition": `attachment; filename="remarketing_${segment}.csv"`,
+      },
+    });
+  }
+
+  return NextResponse.json({
+    segment,
+    count: rows.length,
+    data:  rows,
+  });
+}
+
+
+
+
+================================================================================
+FILE: squarespace/products/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextRequest, NextResponse } from "next/server";
+
+const SQUARESPACE_BASE_URL = "https://api.squarespace.com/1.0";
+
+/**
+ * Strip HTML tags and decode common entities from a Squarespace HTML description.
+ * e.g. '<p style="...">Text here.</p>' → 'Text here.'
+ */
+function stripHtml(html: string): string {
+  if (!html) return "";
+  return (
+    html
+      // Replace block-level tags with newlines for readability
+      .replace(/<\/(p|div|br|li|h[1-6]|blockquote|tr)[^>]*>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      // Remove all remaining HTML tags
+      .replace(/<[^>]+>/g, "")
+      // Decode common HTML entities
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&nbsp;/g, " ")
+      .replace(/&ndash;/g, "–")
+      .replace(/&mdash;/g, "—")
+      // Collapse 3+ newlines to 2, trim leading/trailing whitespace
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
+}
+
+/**
+ * Server-side proxy for Squarespace Commerce Products API.
+ * Fetches all pages of products, flattens variants into individual rows,
+ * and returns them as a JSON array.
+ *
+ * POST /api/squarespace/products
+ * Body: { apiKey: string }
+ */
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { apiKey } = body;
+
+    if (!apiKey || typeof apiKey !== "string") {
+      return NextResponse.json(
+        { error: "apiKey is required" },
+        { status: 400 },
+      );
+    }
+
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Squarespace-Version": "2023-01-01",
+      "Content-Type": "application/json",
+      "User-Agent": "MirourImportProxy/1.0",
+    };
+
+    // Fetch all pages
+    const allProducts: any[] = [];
+    let cursor: string | null = null;
+    let hasNextPage = true;
+    let pageCount = 0;
+    const MAX_PAGES = 50; // Safety limit
+
+    while (hasNextPage && pageCount < MAX_PAGES) {
+      const url = new URL(`${SQUARESPACE_BASE_URL}/commerce/products`);
+      if (cursor) url.searchParams.set("cursor", cursor);
+
+      const response = await fetch(url.toString(), { headers });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return NextResponse.json(
+          {
+            error: `Squarespace API error: ${response.status} ${response.statusText}. ${errorText}`,
+          },
+          { status: response.status === 401 ? 401 : 502 },
+        );
+      }
+
+      const data = await response.json();
+      const pageProducts: any[] = data.products || [];
+      allProducts.push(...pageProducts);
+
+      const pagination = data.pagination || {};
+      hasNextPage = pagination.hasNextPage === true;
+      cursor = pagination.nextPageCursor || null;
+      pageCount++;
+    }
+
+    // Flatten variants into individual product rows
+    const flatProducts: any[] = [];
+
+    for (const product of allProducts) {
+      const baseName: string = product.name || "Unnamed Product";
+      const baseDescription: string = stripHtml(product.description || "");
+      const baseUrl: string = product.url || "";
+
+      const variants: any[] = product.variants || [];
+
+      if (variants.length === 0) {
+        // No variants — add as single product
+        flatProducts.push({
+          name: baseName,
+          description: baseDescription,
+          url: baseUrl,
+          sku: null,
+          price: null,
+          image_url: null,
+          in_stock: true,
+        });
+        continue;
+      }
+
+      for (const variant of variants) {
+        const attributes: Record<string, string> = variant.attributes || {};
+        const attrStr = Object.entries(attributes)
+          .map(([k, v]) => `${k}:${v}`)
+          .join(", ");
+
+        // Build variant name: "Base Name – Attr1:Val1, Attr2:Val2"
+        const variantName = attrStr ? `${baseName} – ${attrStr}` : baseName;
+
+        const pricing = variant.pricing || {};
+        const priceObj = variant.price || {};
+        const inventory = variant.inventory || {};
+        const imageObj = variant.image || {};
+
+        // Price: try variant.price.value first, then pricing.basePrice.value
+        const price = priceObj.value ?? pricing.basePrice?.value ?? null;
+
+        // In stock: unlimited OR quantity > 0
+        const inStock =
+          inventory.unlimited === true ||
+          (typeof inventory.quantity === "number" && inventory.quantity > 0);
+
+        flatProducts.push({
+          name: variantName,
+          description: baseDescription,
+          url: baseUrl,
+          sku: variant.sku || null,
+          price: price !== null ? String(price) : null,
+          image_url: imageObj.url || null,
+          in_stock: inStock,
+        });
+      }
+    }
+
+    return NextResponse.json({
+      products: flatProducts,
+      total: flatProducts.length,
+    });
+  } catch (err: any) {
+    console.error("[squarespace/products] Error:", err);
+    return NextResponse.json(
+      { error: err.message || "Internal server error" },
+      { status: 500 },
+    );
+  }
+}
+
+
+
+
+================================================================================
+FILE: products/by-tags/route.ts
+TYPE: .ts
+================================================================================
+
+import { createClient } from "@/utils/supabase/server";
+import { NextRequest } from "next/server";
+
+async function fetchProducts(
+  formId: string,
+  tagIds: string[],
+  strategy: "any" | "all",
+  limit: number,
+) {
+  const supabase = await createClient();
+
+  // Resolve owner_id from formId
+  const { data: form, error: formError } = await (supabase as any)
+    .from("forms")
+    .select("owner_id")
+    .eq("id", formId)
+    .eq("active", true)
+    .single();
+
+  if (formError || !form?.owner_id) return [];
+
+  if (strategy === "any") {
+    const { data, error } = await (supabase as any)
+      .from("products")
+      .select("id, name, price, image_url,description, tags!inner(id, name)")
+      .eq("owner_id", form.owner_id)
+      .in("tags.id", tagIds)
+      .limit(limit);
+
+    return error ? [] : (data ?? []);
+  }
+
+  if (strategy === "all") {
+    const { data, error } = await (supabase as any)
+      .from("products")
+      .select("id, name, price,description, image_url, tags!inner(id, name)")
+      .eq("owner_id", form.owner_id)
+      .in("tags.id", tagIds)
+      .limit(limit * 5);
+
+    if (error) return [];
+
+    return (data ?? [])
+      .filter((p: any) => {
+        const productTagIds: string[] = (p.tags ?? []).map((t: any) => t.id);
+        return tagIds.every((tid) => productTagIds.includes(tid));
+      })
+      .slice(0, limit);
+  }
+
+  return [];
+}
+
+// GET /api/products/by-tags?formId=...&tagIds=a,b&strategy=any&limit=12
+export async function GET(req: NextRequest) {
+  const { searchParams } = new URL(req.url);
+  const formId   = searchParams.get("formId");
+  const tagIds   = searchParams.get("tagIds")?.split(",").filter(Boolean) ?? [];
+  const strategy = (searchParams.get("strategy") ?? "any") as "any" | "all";
+  const limit    = Math.min(parseInt(searchParams.get("limit") ?? "12"), 50);
+
+  if (!formId || tagIds.length === 0) return Response.json({ products: [] });
+
+  const products = await fetchProducts(formId, tagIds, strategy, limit);
+  return Response.json({ products });
+}
+
+// POST /api/products/by-tags  { formId, tagIds: string[], strategy, limit }
+export async function POST(req: NextRequest) {
+  const body     = await req.json().catch(() => ({}));
+  const formId   = body.formId as string | undefined;
+  const tagIds   = (body.tagIds as string[] | undefined)?.filter(Boolean) ?? [];
+  const strategy = (body.strategy ?? "any") as "any" | "all";
+  const limit    = Math.min(parseInt(String(body.limit ?? 12)), 50);
+
+  if (!formId || tagIds.length === 0) return Response.json({ products: [] });
+
+  const products = await fetchProducts(formId, tagIds, strategy, limit);
+  return Response.json({ products });
+}
+
+
+
+
+================================================================================
+FILE: customers/lookup/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@/utils/supabase/server";
+
+export async function POST(request: Request) {
+  try {
+    const { phone, token, email } = await request.json();
+    const supabase = await createClient();
+
+    console.log("phone", phone);
+    console.log("token", token);
+    console.log("email", email);
+
+    if (token) {
+      // Lookup by token (customer ID)
+      const { data: customer, error } = await supabase
+        .from("customers")
+        .select("*")
+        .eq("id", token)
+        .single();
+
+      if (error || !customer) {
+        return NextResponse.json(
+          { error: "Profile not found" },
+          { status: 404 },
+        );
+      }
+      return NextResponse.json({
+        success: true,
+        profile: customer,
+        token: customer.id,
+      });
+    }
+
+    if (email) {
+      // Lookup by email (Checks primary email OR secondary_emails array)
+      const normalizedEmail = email.trim().toLowerCase();
+      console.log("normalizedEmail", normalizedEmail);
+
+      const { data: customers, error } = await supabase
+        .from("customers")
+        .select("*")
+        // Use Supabase OR syntax to check the array. 'cs' means "contains"
+        .or(
+          `email.eq.${normalizedEmail},secondary_emails.cs.{"${normalizedEmail}"}`,
+        )
+        .limit(1);
+
+      const customer = customers?.[0];
+      console.log("customer", customer);
+
+      if (error || !customer) {
+        return NextResponse.json(
+          { error: "Profile not found" },
+          { status: 404 },
+        );
+      }
+      return NextResponse.json({
+        success: true,
+        profile: customer,
+        token: customer.id,
+      });
+    }
+
+    if (phone) {
+      // Search for various phone formats
+      const digits = phone.replace(/\D/g, "");
+      const phoneVariations = new Set([phone, phone.trim()]);
+
+      if (digits.length === 10) {
+        phoneVariations.add(digits);
+        phoneVariations.add(`1${digits}`);
+        phoneVariations.add(`+1${digits}`);
+        phoneVariations.add(
+          `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`,
+        );
+        phoneVariations.add(
+          `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`,
+        );
+      } else if (digits.length === 11 && digits.startsWith("1")) {
+        const local = digits.slice(1);
+        phoneVariations.add(digits);
+        phoneVariations.add(`+${digits}`);
+        phoneVariations.add(local);
+        phoneVariations.add(
+          `${local.slice(0, 3)}-${local.slice(3, 6)}-${local.slice(6)}`,
+        );
+        phoneVariations.add(
+          `(${local.slice(0, 3)}) ${local.slice(3, 6)}-${local.slice(6)}`,
+        );
+      } else if (digits.length > 0) {
+        phoneVariations.add(digits);
+        phoneVariations.add(`+${digits}`);
+      }
+
+      // Lookup by phone variations
+      const { data: customers, error } = await supabase
+        .from("customers")
+        .select("*")
+        .in("phone", Array.from(phoneVariations))
+        .limit(1); // Added limit(1) for safety/performance
+
+      const customer = customers?.[0];
+      console.log("customer", customer);
+
+      if (error || !customer) {
+        return NextResponse.json(
+          { error: "Profile not found" },
+          { status: 404 },
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        profile: customer,
+        token: customer.id,
+      });
+    }
+
+    return NextResponse.json(
+      { error: "Provide phone, email or token" },
+      { status: 400 },
+    );
+  } catch (error) {
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}
+
+
+
+
+================================================================================
+FILE: customers/visit/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@/utils/supabase/server";
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const {
+      customer_id,
+      location_id,
+      profile_at_visit,
+      skus_shown,
+      zones_scanned,
+    } = body;
+
+    if (!customer_id)
+      return NextResponse.json(
+        { error: "customer_id required" },
+        { status: 400 },
+      );
+
+    const supabase = await createClient();
+
+    // Log the visit
+    const { error: visitError } = await supabase
+      .from("customer_visits")
+      .insert({
+        customer_id,
+        location_id,
+        profile_at_visit,
+        skus_shown: skus_shown || [],
+        zones_scanned: zones_scanned || [],
+      });
+
+    if (visitError) {
+      console.error("Visit log error:", visitError);
+      return NextResponse.json(
+        { error: "Failed to log visit" },
+        { status: 500 },
+      );
+    }
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}
+
+
+
+
+================================================================================
+FILE: customers/profile/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { persistSession: false } },
+);
+
+export async function POST(request: Request) {
+  try {
+    const { customerId } = await request.json();
+
+    if (!customerId) {
+      return NextResponse.json(
+        { error: "customerId is required" },
+        { status: 400 },
+      );
+    }
+
+    // 1. Fetch customer basic info
+    const { data: customer, error: customerError } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("id", customerId)
+      .single();
+console.log(customer)
+    if (customerError || !customer) {
+      return NextResponse.json(
+        { error: "Customer not found" },
+        { status: 404 },
+      );
+    }
+
+    console.log("customer found")
+
+    // 2. Fetch saved items with product details
+    let savedItemsQuery = supabase
+      .from("saved_items")
+      .select(
+        `
+        id,
+        product_id,
+        created_at,
+        purchased_at,
+        products:product_id (
+          id,
+          name,
+          description,
+          image_url,
+          price,
+          in_stock
+        )
+      `,
+      )
+      .eq("customer_id", customerId)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+      console.log("savedItemsQuery", (await savedItemsQuery).data)
+
+  
+
+    const { data: savedItems } = await savedItemsQuery;
+
+    // 3. Fetch flow sessions
+    const { data: flowSessions } = await supabase
+      .from("flow_sessions")
+      .select(
+        `
+        id,
+        form_id,
+        status,
+        visited_nodes,
+        partial_answers,
+        total_time_seconds,
+        started_at,
+        completed_at,
+        drop_off_node_id,
+        device_type,
+        browser,
+        city,
+        country
+      `,
+      )
+      .eq("customer_id", customerId)
+      .order("started_at", { ascending: false })
+      .limit(20);
+
+    // 4. Fetch past responses (quiz answers)
+    const { data: responses } = await supabase
+      .from("responses")
+      .select(
+        `
+        id,
+        form_id,
+        answers,
+        submitted_at,
+        redemption_code,
+        perk_redeemed
+      `,
+      )
+      .eq("customer_id", customerId)
+      .order("submitted_at", { ascending: false })
+      .limit(10);
+
+    // 5. Fetch submission answers (denormalized per-question answers)
+    const { data: submissionAnswers } = await supabase
+      .from("submission_answers")
+      .select("*")
+      .eq("customer_id", customerId)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    // 6. Fetch customer visits
+    const { data: customerVisits } = await supabase
+      .from("customer_visits")
+      .select("*")
+      .eq("customer_id", customerId)
+      .order("visited_at", { ascending: false })
+      .limit(20);
+
+    // 7. Fetch form questions for label resolution
+    // Collect unique form_ids from responses + flowSessions
+    const formIds = new Set<string>();
+    responses?.forEach((r) => {
+      if (r.form_id) formIds.add(r.form_id);
+    });
+    flowSessions?.forEach((s) => {
+      if (s.form_id) formIds.add(s.form_id);
+    });
+
+    let questionMap: Record<string, string> = {};
+
+    if (formIds.size > 0) {
+      const { data: forms } = await supabase
+        .from("forms")
+        .select("id, questions")
+        .in("id", Array.from(formIds));
+
+      if (forms) {
+        for (const form of forms) {
+          if (Array.isArray(form.questions)) {
+            for (const q of form.questions) {
+              if (q.id && q.label) {
+                questionMap[q.id] = q.label;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      customer,
+      savedItems: savedItems || [],
+      flowSessions: flowSessions || [],
+      responses: responses || [],
+      submissionAnswers: submissionAnswers || [],
+      customerVisits: customerVisits || [],
+      questionMap,
+    });
+  } catch (error) {
+    console.error("Customer profile API error:", error);
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}
+
+
+
+
+================================================================================
+FILE: customers/create/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function formatPhone(phone: string): string | null {
+  if (!phone) return null;
+  const cleaned = phone.replace(/(?!^\+)[^\d]/g, "");
+  return cleaned || null;
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!,
+      { auth: { persistSession: false } },
+    );
+
+    const formattedPhone = formatPhone(body.phone);
+    const incomingEmail = body.email ? body.email.trim().toLowerCase() : null;
+
+    console.log(
+      "API CALL: create customer - formatted phone:",
+      formattedPhone,
+      "email:",
+      incomingEmail,
+    );
+
+    // ==========================================
+    // HELPER 1: Two-Pass Lookup Logic
+    // ==========================================
+    async function findCustomer() {
+      // Pass 1: Try Phone
+      if (formattedPhone) {
+        const { data } = await supabase
+          .from("customers")
+          .select("*")
+          .eq("phone", formattedPhone)
+          .limit(1); // Use limit(1) instead of single() to prevent crashes on edge-case duplicates
+
+        if (data && data.length > 0) return data[0];
+      }
+
+      // Pass 2: Try Email (check primary OR secondary array)
+      if (incomingEmail) {
+        const { data } = await supabase
+          .from("customers")
+          .select("*")
+          .or(
+            `email.eq.${incomingEmail},secondary_emails.cs.{"${incomingEmail}"}`,
+          )
+          .limit(1);
+
+        if (data && data.length > 0) return data[0];
+      }
+
+      return null;
+    }
+
+    // ==========================================
+    // HELPER 2: Safe Merge Logic
+    // ==========================================
+    async function mergeAndUpdate(existing: any) {
+      const currentEmail = existing.email
+        ? existing.email.trim().toLowerCase()
+        : null;
+
+      const updatePayload: any = {
+        last_active: new Date().toISOString(),
+        name: existing.name || body.name || null,
+        // Keep their current email if they have one, otherwise set the incoming one
+        email: currentEmail || incomingEmail,
+        // Backfill phone if it was missing
+        phone: existing.phone || formattedPhone || null,
+      };
+
+      // Handle Secondary Emails Append
+      if (incomingEmail && currentEmail && incomingEmail !== currentEmail) {
+        // Use Set to prevent duplicates in the array
+        const pastEmails = new Set(existing.secondary_emails || []);
+        pastEmails.add(incomingEmail);
+        updatePayload.secondary_emails = Array.from(pastEmails);
+      }
+
+      // Handle Tags Append (Merge with existing traits.tags)
+      if (body.tags && Array.isArray(body.tags)) {
+        let updatedTraits = { ...(existing.traits || {}) };
+        const existingTags = new Set(updatedTraits.tags || []);
+        body.tags.forEach((tag: string) => existingTags.add(tag));
+        updatedTraits.tags = Array.from(existingTags);
+        updatePayload.traits = updatedTraits;
+      }
+
+      const { data: updated } = await supabase
+        .from("customers")
+        .update(updatePayload)
+        .eq("id", existing.id)
+        .select()
+        .single();
+
+      return updated ?? existing;
+    }
+
+    // ==========================================
+    // EXECUTION FLOW
+    // ==========================================
+
+    // 1. Initial Lookup
+    let existing = await findCustomer();
+
+    // 2. If Exists -> Merge & Return
+    if (existing) {
+      const updatedProfile = await mergeAndUpdate(existing);
+      return NextResponse.json({
+        success: true,
+        token: existing.id,
+        profile: updatedProfile,
+        isExisting: true,
+      });
+    }
+
+    // 3. If Brand New -> Insert
+    const insertPayload = {
+      name: body.name || null,
+      first_name: body.first_name || body.firstName || null, // Handle both standard and camelCase
+      last_name: body.last_name || body.lastName || null,
+      phone: formattedPhone,
+      email: incomingEmail,
+      store_id: body.store_id || null,
+      traits: body.tags ? { tags: body.tags } : {},
+      last_active: new Date().toISOString(),
+    };
+
+    const { data: result, error } = await supabase
+      .from("customers")
+      .insert([insertPayload])
+      .select()
+      .single();
+
+    // 4. Handle Insert Errors / Race Conditions
+    if (error) {
+      console.error("Customer save error:", error);
+
+      // Race condition (23505): Another simultaneous request created the customer fractions of a second ago
+      if (error.code === "23505") {
+        const raceExisting = await findCustomer();
+
+        if (raceExisting) {
+          // Gracefully merge data into the newly created profile
+          const updatedProfile = await mergeAndUpdate(raceExisting);
+          return NextResponse.json({
+            success: true,
+            token: raceExisting.id,
+            profile: updatedProfile,
+            isExisting: true,
+          });
+        }
+      }
+
+      return NextResponse.json(
+        { success: false, error: "Save failed" },
+        { status: 500 },
+      );
+    }
+
+    // 5. Success on Brand New Profile
+    return NextResponse.json({
+      success: true,
+      token: result.id,
+      profile: result,
+    });
+  } catch (error) {
+    console.error("API CALL: create customer - error", error);
+    return NextResponse.json(
+      { success: false, error: "Server error" },
+      { status: 500 },
+    );
+  }
+}
+
+
+
+
+================================================================================
+FILE: customers/zones/save/route.ts
+TYPE: .ts
+================================================================================
+
+import { NextResponse } from "next/server";
+import { createClient } from "@/utils/supabase/server";
+
+export async function POST(request: Request) {
+  try {
+    const { customer_id, zone_id } = await request.json();
+
+    if (!customer_id || !zone_id)
+      return NextResponse.json({ error: "Missing data" }, { status: 400 });
+
+    const supabase = await createClient();
+
+    const { data: customer } = await supabase
+      .from("customers")
+      .select("zones_saved")
+      .eq("id", customer_id)
+      .single();
+
+    const currentZones = customer?.zones_saved || [];
+    if (!currentZones.includes(zone_id)) {
+      const newZones = [...currentZones, zone_id];
+      await supabase
+        .from("customers")
+        .update({ zones_saved: newZones })
+        .eq("id", customer_id);
+    }
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
+  }
+}
+

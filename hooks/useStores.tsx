@@ -9,7 +9,6 @@ import {
 } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
-import { queueProductDelete } from "@/lib/product-delete-sync";
 import {
   Store,
   Zone,
@@ -18,35 +17,53 @@ import {
   StoreIntegration,
   IntegrationPlatform,
 } from "@/types/mirour";
+import { flowLog } from "@/lib/flowLogger";
 
-/**
- * Strips HTML tags from a string and decodes common HTML entities.
- * Used to sanitize product descriptions imported from CSVs or external systems.
- */
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+const PRODUCT_PAGE_SIZE = 8;
+const DELETE_CHUNK_SIZE = 100;
+const IMPORT_BATCH_SIZE = 500;
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
 function stripHtml(html: string | null | undefined): string | null {
   if (!html) return null;
   return (
     html
-      // Replace block-level closing tags with a newline so paragraphs separate properly
       .replace(/<\/(p|div|h[1-6]|li|br|section|article|blockquote)>/gi, "\n")
-      // Replace <br /> and <br> with a newline
       .replace(/<br\s*\/?>/gi, "\n")
-      // Strip all remaining HTML tags
       .replace(/<[^>]+>/g, "")
-      // Decode common HTML entities
       .replace(/&amp;/g, "&")
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
       .replace(/&nbsp;/g, " ")
-      // Collapse multiple blank lines into one
       .replace(/\n{3,}/g, "\n\n")
       .trim() || null
   );
 }
 
-// ─── Context ──────────────────────────────────────────────────────────────
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// ─── Filter Interfaces ─────────────────────────────────────────────────────
+
+export interface ProductFilters {
+  search?: string;
+  zoneId?: string;
+  tagId?: string;
+  storeId?: string;
+  page?: number; // Added for robust pagination
+}
+
+// ─── Context ───────────────────────────────────────────────────────────────
 
 type StoresContextType = ReturnType<typeof useStoresInternal>;
 const StoresContext = createContext<StoresContextType | undefined>(undefined);
@@ -68,15 +85,60 @@ export function useStores() {
 
 function useStoresInternal() {
   const { user } = useAuth();
+
   const [stores, setStores] = useState<Store[]>([]);
   const [zones, setZones] = useState<Zone[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [tags, setTags] = useState<Tag[]>([]);
   const [integrations, setIntegrations] = useState<StoreIntegration[]>([]);
+
+  // ── Counts ───────────────────────────────────────────────────────────────
+  const [productCount, setProductCount] = useState<number>(0);
+  const [tagCount, setTagCount] = useState<number>(0);
+
+  // ── Loading state ────────────────────────────────────────────────────────
   const [isLoading, setIsLoading] = useState(true);
+  const [isProductsLoading, setIsProductsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // --- Fetching ---
+  // ─── Query Builder Helper ────────────────────────────────────────────────
+  const applyProductFilters = (query: any, filters: ProductFilters) => {
+    let q = query;
+    if (filters.search) {
+      q = q.or(
+        `name.ilike.%${filters.search}%,sku.ilike.%${filters.search}%,description.ilike.%${filters.search}%`,
+      );
+    }
+    if (filters.zoneId && filters.zoneId !== "all") {
+      if (filters.zoneId === "none") q = q.is("zone_id", null);
+      else q = q.eq("zone_id", filters.zoneId);
+    }
+    if (filters.tagId && filters.tagId !== "all" && filters.tagId !== "none") {
+      q = q.eq("tags.id", filters.tagId);
+    }
+    if (
+      filters.storeId &&
+      filters.storeId !== "all" &&
+      filters.storeId !== "none"
+    ) {
+      q = q.eq("store_products.store_id", filters.storeId);
+    }
+    return q;
+  };
+
+  const getSelectQuery = (filters: ProductFilters) => {
+    const tagJoin =
+      filters.tagId && filters.tagId !== "all" && filters.tagId !== "none"
+        ? "tags!inner(*)"
+        : "tags(*)";
+    const storeJoin =
+      filters.storeId && filters.storeId !== "all" && filters.storeId !== "none"
+        ? "store_products!inner(store_id)"
+        : "store_products(store_id)";
+    return `*, ${tagJoin}, zones(*), ${storeJoin}`;
+  };
+
+  // ─── Fetch: Stores ────────────────────────────────────────────────────────
 
   const fetchStores = useCallback(async () => {
     if (!user) return;
@@ -86,7 +148,6 @@ function useStoresInternal() {
         .select("*")
         .eq("owner_id", user.id)
         .order("created_at", { ascending: false });
-
       if (error) throw error;
       setStores((data as unknown as Store[]) || []);
     } catch (err: any) {
@@ -95,24 +156,20 @@ function useStoresInternal() {
     }
   }, [user]);
 
+  // ─── Fetch: Zones ─────────────────────────────────────────────────────────
+
   const fetchZones = useCallback(
     async (storeId?: string) => {
       if (!user) return;
       try {
-        // Fetch zones with their associated tags via zone_tags junction
         let query = supabase.from("zones" as any).select("*, tags(*)");
-
-        if (storeId) {
-          query = query.eq("store_id", storeId);
-        }
-
+        if (storeId) query = query.eq("store_id", storeId);
         const { data, error } = await query;
         if (error) throw error;
-
         if (storeId) {
           setZones((prev) => {
-            const otherZones = prev.filter((z) => z.store_id !== storeId);
-            return [...otherZones, ...((data as unknown as Zone[]) || [])];
+            const others = prev.filter((z) => z.store_id !== storeId);
+            return [...others, ...((data as unknown as Zone[]) || [])];
           });
         } else {
           setZones((data as unknown as Zone[]) || []);
@@ -124,71 +181,119 @@ function useStoresInternal() {
     [user],
   );
 
-  const fetchProducts = useCallback(async () => {
-    if (!user) return;
-    try {
-      // Supabase defaults to a maximum of 1,000 rows per query.
-      // We paginate using .range() to fetch all products beyond that limit.
-      const PAGE_SIZE = 1000;
-      let allData: any[] = [];
-      let from = 0;
-      let hasMore = true;
+  // ─── Fetch: Product Count (Server-Side Filtered) ─────────────────────────
 
-      while (hasMore) {
-        const { data, error } = await supabase
+  const fetchProductCount = useCallback(
+    async (filters: ProductFilters = {}) => {
+      if (!user) return;
+      try {
+        const selectQuery = getSelectQuery(filters);
+        let query = supabase
           .from("products" as any)
-          .select("*, tags(*), zones(*), store_products(store_id)")
-          .eq("owner_id", user.id)
-          .range(from, from + PAGE_SIZE - 1);
+          .select(selectQuery, { count: "exact", head: true })
+          .eq("owner_id", user.id);
 
+        query = applyProductFilters(query, filters);
+
+        const { count, error } = await query;
         if (error) throw error;
-
-        const page = (data as any[]) || [];
-        allData = [...allData, ...page];
-
-        // If we got fewer rows than PAGE_SIZE, we've reached the last page.
-        hasMore = page.length === PAGE_SIZE;
-        from += PAGE_SIZE;
+        setProductCount(count ?? 0);
+      } catch (err: any) {
+        console.error("Error fetching product count:", err);
       }
+    },
+    [user],
+  );
 
-      // Transform the data to include an array of connected store_ids
-      const formattedProducts = allData.map((p) => ({
-        ...p,
-        store_ids: p.store_products
-          ? p.store_products.map((sp: any) => sp.store_id)
-          : [],
-        // Retain store_id as the primary store for legacy support until fully migrated
-        store_id:
-          p.store_products && p.store_products.length > 0
-            ? p.store_products[0].store_id
-            : p.store_id,
-      }));
-
-      setProducts(formattedProducts as unknown as Product[]);
-    } catch (err: any) {
-      console.error("Error fetching products:", err);
-    }
-  }, [user]);
-
-  const fetchTags = useCallback(
+  const fetchTagCount = useCallback(
     async (storeId?: string) => {
       if (!user) return;
       try {
         let query = supabase
           .from("tags" as any)
-          .select("*")
+          .select("*", { count: "exact", head: true })
           .eq("owner_id", user.id);
+        if (storeId) query = query.eq("store_id", storeId);
+        const { count, error } = await query;
+        if (error) throw error;
+        setTagCount(count ?? 0);
+      } catch (err: any) {
+        console.error("Error fetching tag count:", err);
+      }
+    },
+    [user],
+  );
 
-        if (storeId) {
-          query = query.eq("store_id", storeId);
-        }
+  // ─── Fetch: Products (Server-Side Filtered + Paginated) ──────────────────
+
+  const fetchProducts = useCallback(
+    async (filters: ProductFilters = {}) => {
+      if (!user) return;
+      setIsProductsLoading(true);
+      try {
+        const page = filters.page || 1;
+        const from = (page - 1) * PRODUCT_PAGE_SIZE;
+        const to = from + PRODUCT_PAGE_SIZE - 1;
+
+        const selectQuery = getSelectQuery(filters);
+        let query = supabase
+          .from("products" as any)
+          .select(selectQuery)
+          .eq("owner_id", user.id)
+          .order("created_at", { ascending: false })
+          .range(from, to);
+
+        query = applyProductFilters(query, filters);
 
         const { data, error } = await query;
         if (error) throw error;
-        const fetched = (data as unknown as Tag[]) || [];
 
+        const pageData = (data as any[]) || [];
+        const formatted = pageData.map((p) => ({
+          ...p,
+          store_ids: p.store_products?.map((sp: any) => sp.store_id) ?? [],
+          store_id: p.store_products?.[0]?.store_id ?? p.store_id,
+        }));
+
+        setProducts(formatted as unknown as Product[]);
+      } catch (err: any) {
+        console.error("Error fetching products:", err);
+      } finally {
+        setIsProductsLoading(false);
+      }
+    },
+    [user],
+  );
+
+  // ─── Fetch: Tags ─────────────────────────────────────────────────────────
+
+  const fetchTags = useCallback(
+    async (storeId?: string) => {
+      if (!user) return;
+      try {
+        const PAGE_SIZE = 1000;
+        let allData: any[] = [];
+        let from = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+          let query = supabase
+            .from("tags" as any)
+            .select("*")
+            .eq("owner_id", user.id)
+            .order("name", { ascending: true })
+            .range(from, from + PAGE_SIZE - 1);
+          if (storeId) query = query.eq("store_id", storeId);
+          const { data, error } = await query;
+          if (error) throw error;
+          const page = (data as any[]) || [];
+          allData = [...allData, ...page];
+          hasMore = page.length === PAGE_SIZE;
+          from += PAGE_SIZE;
+        }
+
+        const fetched = (allData as unknown as Tag[]) || [];
         if (storeId) {
-          // Merge: replace only this store's tags, keep all others
           setTags((prev) => [
             ...prev.filter((t) => t.store_id !== storeId),
             ...fetched,
@@ -203,37 +308,8 @@ function useStoresInternal() {
     [user],
   );
 
-  const createTag = async (
-    storeId: string,
-    name: string,
-    category?: string,
-    isHardConstraint?: boolean,
-  ) => {
-    try {
-      const { data, error } = await supabase
-        .from("tags" as any)
-        .insert([
-          {
-            store_id: storeId || null,
-            owner_id: user?.id, // ✅ set owner on create
-            name,
-            category,
-            is_hard_constraint: isHardConstraint || false,
-          },
-        ])
-        .select()
-        .single();
-      if (error) throw error;
-      const newTag = data as unknown as Tag;
-      setTags((prev) => [...prev, newTag]);
-      return { data: newTag, error: null };
-    } catch (err: any) {
-      return { error: err.message };
-    }
-  };
+  // ─── Init ────────────────────────────────────────────────────────────────
 
-  // Initialize — depend only on user?.id (stable string) so that auth token
-  // refreshes (which recreate the user object) don't trigger a full re-fetch.
   const userId = user?.id;
   useEffect(() => {
     if (userId) {
@@ -241,21 +317,24 @@ function useStoresInternal() {
       Promise.all([
         fetchStores(),
         fetchZones(),
-        fetchProducts(),
+        fetchProducts({ page: 1 }),
         fetchTags(),
+        fetchProductCount({}),
+        fetchTagCount(),
+        fetchIntegrations(),
       ]).finally(() => setIsLoading(false));
     } else {
-      // User signed out – clear all state
       setStores([]);
       setZones([]);
       setProducts([]);
       setTags([]);
       setIntegrations([]);
+      setProductCount(0);
+      setTagCount(0);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 
-  // --- Mutations ---
+  // ─── Mutations: Stores ────────────────────────────────────────────────────
 
   const createStore = async (name: string, location?: string) => {
     if (!user) return { error: "Not authenticated" };
@@ -265,7 +344,6 @@ function useStoresInternal() {
         .insert([{ owner_id: user.id, name, location }])
         .select()
         .single();
-
       if (error) throw error;
       const newStore = data as unknown as Store;
       setStores((prev) => [newStore, ...prev]);
@@ -283,11 +361,10 @@ function useStoresInternal() {
         .eq("id", id)
         .select()
         .single();
-
       if (error) throw error;
-      const updatedStore = data as unknown as Store;
-      setStores((prev) => prev.map((s) => (s.id === id ? updatedStore : s)));
-      return { data: updatedStore, error: null };
+      const updated = data as unknown as Store;
+      setStores((prev) => prev.map((s) => (s.id === id ? updated : s)));
+      return { data: updated, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
@@ -302,14 +379,19 @@ function useStoresInternal() {
       if (error) throw error;
       setStores((prev) => prev.filter((s) => s.id !== id));
       setZones((prev) => prev.filter((z) => z.store_id !== id));
-      setProducts((prev) => prev.filter((p) => p.store_id !== id));
+      setProducts((prev) => {
+        const removed = prev.filter((p) => p.store_id === id).length;
+        setProductCount((c) => Math.max(0, c - removed));
+        return prev.filter((p) => p.store_id !== id);
+      });
       return { error: null };
     } catch (err: any) {
       return { error: err.message };
     }
   };
 
-  // Zones
+  // ─── Mutations: Zones ─────────────────────────────────────────────────────
+
   const createZone = async (
     storeId: string,
     name: string,
@@ -351,9 +433,9 @@ function useStoresInternal() {
         .select()
         .single();
       if (error) throw error;
-      const updatedZone = data as unknown as Zone;
-      setZones((prev) => prev.map((z) => (z.id === id ? updatedZone : z)));
-      return { data: updatedZone, error: null };
+      const updated = data as unknown as Zone;
+      setZones((prev) => prev.map((z) => (z.id === id ? updated : z)));
+      return { data: updated, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
@@ -373,7 +455,8 @@ function useStoresInternal() {
     }
   };
 
-  // Products
+  // ─── Mutations: Products ──────────────────────────────────────────────────
+
   const createProduct = async (
     storeId: string | null,
     product: Partial<Product>,
@@ -385,7 +468,6 @@ function useStoresInternal() {
         .select()
         .single();
       if (error) throw error;
-
       const newProduct = data as unknown as Product;
 
       if (storeId) {
@@ -399,12 +481,16 @@ function useStoresInternal() {
           );
       }
 
-      const productWithStores = {
-        ...newProduct,
-        store_ids: storeId ? [storeId] : [],
-      };
-      setProducts((prev) => [...prev, productWithStores]);
-      return { data: productWithStores, error: null };
+      const withStores = { ...newProduct, store_ids: storeId ? [storeId] : [] };
+      setProducts((prev) => {
+        if (prev.length < PRODUCT_PAGE_SIZE) return [withStores, ...prev];
+        return prev;
+      });
+      setProductCount((c) => c + 1);
+
+      triggerEmbedding(newProduct.id);
+
+      return { data: withStores, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
@@ -419,26 +505,18 @@ function useStoresInternal() {
         .select("*, tags(*), zones(*), store_products(store_id)")
         .single();
       if (error) throw error;
-
       const dt = data as any;
-
-      // Transform incoming data to map store_products to store_ids
-      const mappedData = {
+      const mapped = {
         ...dt,
-        store_ids: dt.store_products
-          ? dt.store_products.map((sp: any) => sp.store_id)
-          : [],
-        store_id:
-          dt.store_products && dt.store_products.length > 0
-            ? dt.store_products[0].store_id
-            : dt.store_id,
-      };
+        store_ids: dt.store_products?.map((sp: any) => sp.store_id) ?? [],
+        store_id: dt.store_products?.[0]?.store_id ?? dt.store_id,
+      } as unknown as Product;
+      setProducts((prev) => prev.map((p) => (p.id === id ? mapped : p)));
 
-      const updatedProduct = mappedData as unknown as Product;
-      setProducts((prev) =>
-        prev.map((p) => (p.id === id ? updatedProduct : p)),
-      );
-      return { data: updatedProduct, error: null };
+      const needsReEmbed = "name" in updates || "description" in updates;
+      if (needsReEmbed) triggerEmbedding(id);
+
+      return { data: mapped, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
@@ -447,33 +525,19 @@ function useStoresInternal() {
   const deleteProduct = async (id: string) => {
     if (!user?.id) return { error: "Not authenticated" };
 
-    // ── Optimistic UI update ──────────────────────────────────────────────
-    // Remove from local state immediately so the UI feels instant.
-    // The actual DB delete happens in the background service worker.
     setProducts((prev) => prev.filter((p) => p.id !== id));
+    setProductCount((c) => Math.max(0, c - 1));
 
-    // ── Background Sync delete ────────────────────────────────────────────
-    // Gets the current session token to authenticate the REST call in the SW.
-    const { data: { session } } = await supabase.auth.getSession();
-    const authToken = session?.access_token ?? "";
-
-    const supabaseUrl =
-      process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co";
-    const supabaseAnonKey =
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
-
-    const { error } = await queueProductDelete(
-      id,
-      supabaseUrl,
-      supabaseAnonKey,
-      authToken,
-      user.id,
-    );
-
-    if (error) {
-      // Rollback: restore the product from the server so UI stays consistent
-      console.error("[deleteProduct] Background queue failed:", error);
-      // Re-fetch just this product to restore it
+    try {
+      const { error } = await supabase
+        .from("products" as any)
+        .delete()
+        .eq("id", id)
+        .eq("owner_id", user.id);
+      if (error) throw error;
+      return { error: null };
+    } catch (err: any) {
+      console.error("[deleteProduct] failed:", err);
       try {
         const { data } = await supabase
           .from("products" as any)
@@ -487,15 +551,57 @@ function useStoresInternal() {
             store_ids: d.store_products?.map((sp: any) => sp.store_id) ?? [],
             store_id: d.store_products?.[0]?.store_id ?? d.store_id,
           };
-          setProducts((prev) => [...prev, restored]);
+          setProducts((prev) => [restored, ...prev]);
+          setProductCount((c) => c + 1);
         }
-      } catch {
-        // ignore restore error
-      }
-      return { error };
+      } catch {}
+      return { error: err.message };
     }
+  };
 
-    return { error: null };
+  const deleteAllProductsByOwner = async (storeId?: string) => {
+    if (!user?.id) return { error: "Not authenticated" };
+    try {
+      if (storeId) {
+        const { data: spRows, error: spErr } = await supabase
+          .from("store_products" as any)
+          .select("product_id")
+          .eq("store_id", storeId);
+        if (spErr) throw spErr;
+
+        const ids = ((spRows as any[]) || []).map((r: any) => r.product_id);
+        if (ids.length > 0) {
+          const chunks = chunkArray(ids, DELETE_CHUNK_SIZE);
+          const results = await Promise.all(
+            chunks.map((chunk) =>
+              supabase
+                .from("products" as any)
+                .delete()
+                .in("id", chunk)
+                .eq("owner_id", user.id),
+            ),
+          );
+          const failed = results.find((r) => r.error);
+          if (failed?.error) throw failed.error;
+        }
+        setProducts((prev) =>
+          prev.filter((p) => !p.store_ids?.includes(storeId)),
+        );
+        await fetchProductCount();
+      } else {
+        const { error } = await supabase
+          .from("products" as any)
+          .delete()
+          .eq("owner_id", user.id);
+        if (error) throw error;
+        setProducts([]);
+        setProductCount(0);
+      }
+      return { error: null };
+    } catch (err: any) {
+      console.error("[deleteAllProducts] failed:", err);
+      return { error: err.message };
+    }
   };
 
   const linkProductToStore = async (productId: string, storeId: string) => {
@@ -504,20 +610,16 @@ function useStoresInternal() {
         .from("store_products" as any)
         .insert([{ store_id: storeId, product_id: productId }]);
       if (error) throw error;
-
-      // Update local state
       setProducts((prev) =>
-        prev.map((p) => {
-          if (p.id === productId) {
-            const currentStoreIds = p.store_ids || [];
-            return { ...p, store_ids: [...currentStoreIds, storeId] };
-          }
-          return p;
-        }),
+        prev.map((p) =>
+          p.id === productId
+            ? { ...p, store_ids: [...(p.store_ids || []), storeId] }
+            : p,
+        ),
       );
       return { error: null };
     } catch (err: any) {
-      if (err.code === "23505") return { error: null }; // Ignore duplicates
+      if (err.code === "23505") return { error: null };
       return { error: err.message };
     }
   };
@@ -530,19 +632,15 @@ function useStoresInternal() {
         .eq("product_id", productId)
         .eq("store_id", storeId);
       if (error) throw error;
-
-      // Update local state
       setProducts((prev) =>
-        prev.map((p) => {
-          if (p.id === productId) {
-            const currentStoreIds = p.store_ids || [];
-            return {
-              ...p,
-              store_ids: currentStoreIds.filter((id) => id !== storeId),
-            };
-          }
-          return p;
-        }),
+        prev.map((p) =>
+          p.id === productId
+            ? {
+                ...p,
+                store_ids: (p.store_ids || []).filter((id) => id !== storeId),
+              }
+            : p,
+        ),
       );
       return { error: null };
     } catch (err: any) {
@@ -550,7 +648,60 @@ function useStoresInternal() {
     }
   };
 
-  // Tags
+  const refreshProduct = async (productId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from("products" as any)
+        .select("*, tags(*), zones(*), store_products(store_id)")
+        .eq("id", productId)
+        .single();
+      if (error) throw error;
+      const dt = data as any;
+      const refreshed = {
+        ...dt,
+        store_ids: dt.store_products?.map((sp: any) => sp.store_id) ?? [],
+        store_id: dt.store_products?.[0]?.store_id ?? dt.store_id,
+      } as unknown as Product;
+      setProducts((prev) =>
+        prev.map((p) => (p.id === productId ? refreshed : p)),
+      );
+      return { data: refreshed, error: null };
+    } catch (err: any) {
+      return { data: null, error: err.message };
+    }
+  };
+
+  // ─── Mutations: Tags ──────────────────────────────────────────────────────
+
+  const createTag = async (
+    storeId: string,
+    name: string,
+    category?: string,
+    isHardConstraint?: boolean,
+  ) => {
+    try {
+      const { data, error } = await supabase
+        .from("tags" as any)
+        .insert([
+          {
+            store_id: storeId || null,
+            owner_id: user?.id,
+            name,
+            category,
+            is_hard_constraint: isHardConstraint || false,
+          },
+        ])
+        .select()
+        .single();
+      if (error) throw error;
+      const newTag = data as unknown as Tag;
+      setTags((prev) => [...prev, newTag]);
+      setTagCount((c) => c + 1);
+      return { data: newTag, error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
 
   const updateTag = async (tagId: string, updates: Partial<Tag>) => {
     try {
@@ -561,9 +712,9 @@ function useStoresInternal() {
         .select()
         .single();
       if (error) throw error;
-      const updatedTag = data as unknown as Tag;
-      setTags((prev) => prev.map((t) => (t.id === tagId ? updatedTag : t)));
-      return { data: updatedTag, error: null };
+      const updated = data as unknown as Tag;
+      setTags((prev) => prev.map((t) => (t.id === tagId ? updated : t)));
+      return { data: updated, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
@@ -577,6 +728,71 @@ function useStoresInternal() {
         .eq("id", tagId);
       if (error) throw error;
       setTags((prev) => prev.filter((t) => t.id !== tagId));
+      setTagCount((c) => Math.max(0, c - 1));
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const bulkDeleteTags = async (tagIds: string[]) => {
+    if (tagIds.length === 0) return { error: null };
+    try {
+      const chunks = chunkArray(tagIds, DELETE_CHUNK_SIZE);
+      const results = await Promise.all(
+        chunks.map((chunk) =>
+          supabase
+            .from("tags" as any)
+            .delete()
+            .in("id", chunk),
+        ),
+      );
+      const failed = results.find((r) => r.error);
+      if (failed?.error) throw failed.error;
+      setTags((prev) => prev.filter((t) => !tagIds.includes(t.id)));
+      setTagCount((c) => Math.max(0, c - tagIds.length));
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const deleteAllTagsByOwner = async (storeId?: string) => {
+    if (!user) return { error: "Not authenticated" };
+    try {
+      let query = supabase
+        .from("tags" as any)
+        .delete()
+        .eq("owner_id", user.id);
+      if (storeId) query = query.eq("store_id", storeId);
+      const { error } = await query;
+      if (error) throw error;
+
+      if (storeId) {
+        setTags((prev) => prev.filter((t) => t.store_id !== storeId));
+        await fetchTagCount();
+      } else {
+        setTags([]);
+        setTagCount(0);
+      }
+      return { error: null };
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  };
+
+  const clearAllOrphanTags = async () => {
+    if (!user) return { error: "Not authenticated" };
+    try {
+      const { error } = await supabase
+        .from("tags" as any)
+        .delete()
+        .is("store_id", null)
+        .eq("owner_id", user.id);
+      if (error) throw error;
+      const orphanCount = tags.filter((t) => t.store_id === null).length;
+      setTags((prev) => prev.filter((t) => t.store_id !== null));
+      setTagCount((c) => Math.max(0, c - orphanCount));
       return { error: null };
     } catch (err: any) {
       return { error: err.message };
@@ -591,7 +807,6 @@ function useStoresInternal() {
       if (error) throw error;
       return { error: null };
     } catch (err: any) {
-      // Ignore duplicate key errors if already linked
       if (err.code === "23505") return { error: null };
       return { error: err.message };
     }
@@ -611,51 +826,17 @@ function useStoresInternal() {
     }
   };
 
-  /**
-   * Re-fetches a single product by ID from the DB and updates local state.
-   * Call this after tag link/unlink operations to ensure local state stays
-   * in sync with the database (fixing the "product disappears after edit" bug).
-   */
-  const refreshProduct = async (productId: string) => {
-    try {
-      const { data, error } = await supabase
-        .from("products" as any)
-        .select("*, tags(*), zones(*), store_products(store_id)")
-        .eq("id", productId)
-        .single();
-      if (error) throw error;
-      const dt = data as any;
-      const refreshed = {
-        ...dt,
-        store_ids: dt.store_products
-          ? dt.store_products.map((sp: any) => sp.store_id)
-          : [],
-        store_id:
-          dt.store_products && dt.store_products.length > 0
-            ? dt.store_products[0].store_id
-            : dt.store_id,
-      } as unknown as Product;
-      setProducts((prev) =>
-        prev.map((p) => (p.id === productId ? refreshed : p)),
-      );
-      return { data: refreshed, error: null };
-    } catch (err: any) {
-      return { data: null, error: err.message };
-    }
-  };
+  // ─── Zone-Tag Management ──────────────────────────────────────────────────
 
-  // Zone-Tag Management (NEW for Sprint 1B)
   const linkTagToZone = async (zoneId: string, tagId: string) => {
     try {
       const { error } = await supabase
         .from("zone_tags" as any)
         .insert([{ zone_id: zoneId, tag_id: tagId }]);
       if (error) throw error;
-      // Refresh zones to show updated tags
       await fetchZones();
       return { error: null };
     } catch (err: any) {
-      // Ignore duplicate key errors if already linked
       if (err.code === "23505") return { error: null };
       return { error: err.message };
     }
@@ -669,7 +850,6 @@ function useStoresInternal() {
         .eq("zone_id", zoneId)
         .eq("tag_id", tagId);
       if (error) throw error;
-      // Refresh zones to show updated tags
       await fetchZones();
       return { error: null };
     } catch (err: any) {
@@ -677,105 +857,162 @@ function useStoresInternal() {
     }
   };
 
-  // --- Integrations ---
 
-  const fetchIntegrations = useCallback(
-    async (storeId: string) => {
-      if (!user) return;
-      try {
-        const { data, error } = await supabase
-          .from("store_integrations" as any)
-          .select("*")
-          .eq("store_id", storeId);
-        if (error) throw error;
-        setIntegrations((prev) => {
-          const otherIntegrations = prev.filter((i) => i.store_id !== storeId);
-          return [
-            ...otherIntegrations,
-            ...((data as unknown as StoreIntegration[]) || []),
-          ];
-        });
-      } catch (err: any) {
-        console.error("Error fetching integrations:", err);
-      }
-    },
-    [user],
-  );
-
-  const saveIntegration = async (
-    storeId: string,
-    platform: IntegrationPlatform,
-    apiKey: string,
-  ) => {
+  const fetchIntegrations = useCallback(async () => {
+    if (!user) return;
     try {
       const { data, error } = await supabase
         .from("store_integrations" as any)
-        .upsert([{ store_id: storeId, platform, api_key: apiKey }], {
-          onConflict: "store_id,platform",
+        .select("*")
+        .eq("owner_id", user.id);
+
+      if (error) throw error;
+
+      setIntegrations((data as unknown as StoreIntegration[]) || []);
+    } catch (err: any) {
+      console.error("Error fetching integrations:", err);
+    }
+  }, [user]);
+
+  const connectNango = async (
+    storeId: string | undefined, // Make optional
+    platform: "shopify" | "squarespace" | "lightspeed-retail",
+    shopDomain?: string,
+  ): Promise<{ error: string | null }> => {
+    if (!user) return { error: "Not authenticated" };
+
+    try {
+      const connectionId = `${user.id}-${platform}`;
+
+      const sessionRes = await fetch("/api/nango/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectionId }),
+      });
+
+      const sessionData = await sessionRes.json();
+      if (sessionData.error) throw new Error(sessionData.error);
+
+      const { connectSessionToken } = sessionData;
+
+      const NangoFrontend = (await import("@nangohq/frontend")).default;
+      const nangoClient = new NangoFrontend({ connectSessionToken });
+
+      let authParams = undefined;
+
+      if (platform === "shopify" && shopDomain) {
+        let cleanDomain = shopDomain
+          .replace(/^https?:\/\//, "")
+          .replace(/\/$/, "");
+        let subdomain = cleanDomain;
+        if (cleanDomain.includes(".myshopify.com")) {
+          subdomain = cleanDomain.split(".myshopify.com")[0];
+        }
+        authParams = { params: { subdomain: subdomain } };
+      }
+
+      let authResult: any;
+      try {
+        authResult = await nangoClient.auth(platform, authParams as any);
+      } catch (authErr: any) {
+        return { error: authErr.message || "OAuth was cancelled or failed" };
+      }
+
+      const generatedConnectionId = authResult.connectionId;
+
+      const result = await saveIntegration(
+        storeId,
+        platform as IntegrationPlatform,
+        generatedConnectionId,
+      );
+
+      return { error: result.error ?? null };
+    } catch (err: any) {
+      return { error: err.message || "OAuth connection failed" };
+    }
+  };
+
+  const saveIntegration = async (
+    storeId: string | undefined, // Make optional
+    platform: IntegrationPlatform,
+    apiKey: string,
+  ) => {
+    if (!user) return { error: "Not authenticated" };
+
+    try {
+      const payload = {
+        owner_id: user.id,
+        platform,
+        api_key: apiKey,
+        store_id: storeId || null, // Pass null instead of "global"
+      };
+
+      const { data, error } = await supabase
+        .from("store_integrations" as any)
+        .upsert([payload], {
+          onConflict: "owner_id, platform",
         })
         .select()
         .single();
+
       if (error) throw error;
+
       const saved = data as unknown as StoreIntegration;
+
       setIntegrations((prev) => {
-        const others = prev.filter(
-          (i) => !(i.store_id === storeId && i.platform === platform),
-        );
+        const others = prev.filter((i) => i.platform !== platform);
         return [...others, saved];
       });
+
       return { data: saved, error: null };
     } catch (err: any) {
       return { error: err.message };
     }
   };
 
+  const saveWebhookUrl = async (storeId: string | undefined, url: string) => {
+    return await saveIntegration(
+      storeId,
+      "webhook" as IntegrationPlatform,
+      url,
+    );
+  };
+
+  // ─── Import: Squarespace ──────────────────────────────────────────────────
+
   const importSquarespaceProducts = async (
     storeId: string,
     apiKey: string,
   ): Promise<{ imported: number; skipped: number; error: string | null }> => {
     try {
-      // Call our server-side proxy to avoid CORS and keep key server-side
       const res = await fetch("/api/squarespace/products", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ apiKey }),
       });
-
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `HTTP ${res.status}`);
       }
-
       const { products: sqProducts } = await res.json();
-
       if (!sqProducts || sqProducts.length === 0) {
         return { imported: 0, skipped: 0, error: null };
       }
 
-      // Fetch existing SKUs for this store to deduplicate
-      const { data: existingProducts } = await supabase
+      const { data: existing } = await supabase
         .from("products" as any)
         .select("sku")
         .eq("store_id", storeId);
-
       const existingSkus = new Set(
-        ((existingProducts as any[]) || [])
-          .map((p: any) => p.sku)
-          .filter(Boolean),
+        ((existing as any[]) || []).map((p: any) => p.sku).filter(Boolean),
       );
 
-      // Filter out products that already exist
       const toInsert = sqProducts.filter(
         (p: any) => !p.sku || !existingSkus.has(p.sku),
       );
-
       const skipped = sqProducts.length - toInsert.length;
+      if (toInsert.length === 0) return { imported: 0, skipped, error: null };
 
-      if (toInsert.length === 0) {
-        return { imported: 0, skipped, error: null };
-      }
-
-      // Bulk insert
       const rows = toInsert.map((p: any) => ({
         store_id: storeId,
         name: p.name,
@@ -790,17 +1027,17 @@ function useStoresInternal() {
         .from("products" as any)
         .insert(rows)
         .select();
-
       if (insertError) throw insertError;
 
       const newProducts = (inserted as unknown as Product[]) || [];
-      setProducts((prev) => [...prev, ...newProducts]);
-
+      setProductCount((c) => c + newProducts.length);
       return { imported: newProducts.length, skipped, error: null };
     } catch (err: any) {
       return { imported: 0, skipped: 0, error: err.message };
     }
   };
+
+  // ─── Import: File (CSV / Shopify / Lightspeed) — HIGH SPEED BATCHING ──────
 
   const importProductsFromFile = async (
     parsedData: any[],
@@ -808,109 +1045,149 @@ function useStoresInternal() {
     imageIndex: number = 0,
   ): Promise<{ imported: number; skipped: number; error: string | null }> => {
     try {
-      console.log(
-        "[import] ▶ START — storeId:",
-        storeId,
-        "| userId:",
-        user?.id,
-        "| rows:",
-        parsedData?.length,
+      flowLog(
+        "IMPORT_START",
+        { storeId, parsedRows: parsedData?.length },
+        "info",
       );
 
       if (!user?.id) {
-        console.log("[import] ✖ Not authenticated — aborting");
+        flowLog("IMPORT_FAILED", { reason: "Not authenticated" }, "error");
         return { imported: 0, skipped: 0, error: "Not authenticated." };
       }
       if (!parsedData || parsedData.length === 0) {
-        console.log("[import] ✖ No parsed data — aborting");
+        flowLog("IMPORT_SKIPPED", { reason: "Empty parsed data" }, "info");
         return { imported: 0, skipped: 0, error: null };
       }
 
-      // Helper function to dynamically find the tag column, regardless of case
-      const extractTagsFromRow = (row: any): string => {
-        if (!row || typeof row !== "object") return "";
-        const tagKey = Object.keys(row).find((key) => {
-          const lowerKey = key.toLowerCase().trim();
-          return lowerKey === "tag" || lowerKey === "tags";
+      const extractTagsFromRow = (row: any): string[] => {
+        if (!row || typeof row !== "object") return [];
+        const tagKeys = Object.keys(row).filter((key) => {
+          const lk = key.toLowerCase().trim();
+          return lk === "tag" || lk === "tags" || lk === "generated_tags";
         });
-        return tagKey ? String(row[tagKey] || "") : "";
+        if (tagKeys.length === 0) return [];
+
+        const allTags: string[] = [];
+        tagKeys.forEach((tagKey) => {
+          const rawValue = row[tagKey];
+          if (rawValue === undefined || rawValue === null) return;
+          if (Array.isArray(rawValue)) {
+            rawValue.forEach((t) => {
+              const s = String(t).trim();
+              if (s) allTags.push(s);
+            });
+            return;
+          }
+          const rawTags = String(rawValue).trim();
+          if (!rawTags) return;
+          if (rawTags.startsWith("[") && rawTags.endsWith("]")) {
+            try {
+              const parsed = JSON.parse(rawTags);
+              if (Array.isArray(parsed)) {
+                parsed.forEach((t) => {
+                  const s = String(t).trim();
+                  if (s) allTags.push(s);
+                });
+                return;
+              }
+            } catch (e) {}
+          }
+          const cleanedString = rawTags.replace(/[\[\]"']/g, "");
+          cleanedString
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean)
+            .forEach((t) => allTags.push(t));
+        });
+        return Array.from(new Set(allTags));
       };
 
-      let existingProductRows: { sku: string | null; name: string }[] = [];
+      flowLog("FETCH_EXISTING_PRODUCTS", { storeId }, "db_read", "products");
+      const existingSkus = new Set<string>();
+      const existingNames = new Set<string>();
 
-      if (storeId) {
-        console.log(
-          "[import] 🔍 DEDUP MODE: by storeId:",
-          storeId,
-          "+ owner_id:",
-          user.id,
-        );
+      let pFetchFrom = 0;
+      let pFetching = true;
 
-        const { data: byStoreId, error: e1 } = await supabase
+      while (pFetching) {
+        const { data, error } = await supabase
           .from("products" as any)
-          .select("sku, name")
-          .eq("store_id", storeId)
-          .eq("owner_id", user.id);
+          .select("sku, name, store_id, store_products(store_id)")
+          .eq("owner_id", user.id)
+          .range(pFetchFrom, pFetchFrom + 999);
 
-        const { data: byJunction, error: e2 } = await supabase
-          .from("store_products" as any)
-          .select("products!inner(sku, name, owner_id)")
-          .eq("store_id", storeId)
-          .eq("products.owner_id", user.id);
+        if (error || !data || data.length === 0) break;
 
-        const junctionRows = ((byJunction as any[]) || [])
-          .map((r: any) => r.products)
-          .filter(Boolean);
-
-        const merged = new Map<string, { sku: string | null; name: string }>();
-        [...((byStoreId as any[]) || []), ...junctionRows].forEach((p: any) => {
-          if (p?.name) merged.set(p.name, p);
-        });
-        existingProductRows = Array.from(merged.values());
-      } else {
-        console.log("[import] 🔍 DEDUP MODE: global — owner_id:", user.id);
-        const { data, error: e3 } = await supabase
-          .from("products" as any)
-          .select("sku, name")
-          .eq("owner_id", user.id);
-        existingProductRows = (data as any[]) || [];
+        for (const p of data as any[]) {
+          const sIds = [
+            p.store_id,
+            ...(p.store_products || []).map((sp: any) => sp.store_id),
+          ];
+          if (!storeId || sIds.includes(storeId)) {
+            if (p.sku) existingSkus.add(p.sku);
+            if (p.name) existingNames.add(p.name);
+          }
+        }
+        if (data.length < 1000) break;
+        pFetchFrom += 1000;
       }
 
-      const existingSkus = new Set(
-        existingProductRows.map((p) => p.sku).filter(Boolean),
-      );
-      const existingNames = new Set(
-        existingProductRows.map((p) => p.name).filter(Boolean),
+      flowLog(
+        "DEDUP_MAP_BUILT",
+        { skus: existingSkus.size, names: existingNames.size },
+        "info",
       );
 
-      let tagsQuery = supabase
-        .from("tags" as any)
-        .select("*")
-        .eq("owner_id", user.id);
-      if (storeId) {
-        tagsQuery = tagsQuery.eq("store_id", storeId);
+      let allExistingTags: any[] = [];
+      let fetchFrom = 0;
+      const fetchLimit = 1000;
+      let isFetchingTags = true;
+
+      while (isFetchingTags) {
+        let tagsQuery = supabase
+          .from("tags" as any)
+          .select("*")
+          .eq("owner_id", user.id)
+          .range(fetchFrom, fetchFrom + fetchLimit - 1);
+        if (storeId) tagsQuery = tagsQuery.eq("store_id", storeId);
+
+        const { data: tagsPage, error: fetchErr } = await tagsQuery;
+        if (fetchErr) {
+          flowLog("FETCH_TAGS_ERROR", fetchErr, "error", "tags");
+          break;
+        }
+
+        if (tagsPage && tagsPage.length > 0) {
+          allExistingTags = [...allExistingTags, ...tagsPage];
+          fetchFrom += fetchLimit;
+        } else {
+          isFetchingTags = false;
+        }
       }
-      const { data: existingTagsData } = await tagsQuery;
 
+      flowLog(
+        "FETCHED_EXISTING_TAGS",
+        { count: allExistingTags.length },
+        "db_read",
+        "tags",
+      );
       const existingTagsMap = new Map(
-        ((existingTagsData as unknown as Tag[]) || []).map((t) => [
-          t.name.toLowerCase(),
+        (allExistingTags as unknown as Tag[]).map((t) => [
+          t.name.toLowerCase().trim(),
           t,
         ]),
       );
 
-      const toInsert: any[] = [];
       const isShopifyFormat =
         parsedData.length > 0 && "Handle" in parsedData[0];
       let normalizedRows: any[] = parsedData;
 
       if (isShopifyFormat) {
         const handleMap = new Map<string, any>();
-
         for (const row of parsedData) {
           const handle = row["Handle"];
           if (!handle) continue;
-
           if (!handleMap.has(handle)) {
             handleMap.set(handle, {
               name: row["Title"] || "",
@@ -918,28 +1195,28 @@ function useStoresInternal() {
               price: row["Variant Price"] || "",
               description: row["Body (HTML)"] || "",
               image_url: row["Image Src"] || "",
-              tags: extractTagsFromRow(row), // Using dynamic extraction
+              tags: extractTagsFromRow(row),
               in_stock: (row["Status"] || "").toLowerCase() === "active",
             });
           } else {
-            const merged = handleMap.get(handle)!;
-            if (!merged.sku && row["Variant SKU"])
-              merged.sku = row["Variant SKU"];
-            if (!merged.price && row["Variant Price"])
-              merged.price = row["Variant Price"];
-            if (!merged.description && row["Body (HTML)"])
-              merged.description = row["Body (HTML)"];
-
-            const currentTags = extractTagsFromRow(row); // Using dynamic extraction
-            if (!merged.tags && currentTags) merged.tags = currentTags;
-
-            if (!merged.image_url || row["Image Position"] === "1")
-              if (row["Image Src"]) merged.image_url = row["Image Src"];
+            const m = handleMap.get(handle)!;
+            if (!m.sku && row["Variant SKU"]) m.sku = row["Variant SKU"];
+            if (!m.price && row["Variant Price"])
+              m.price = row["Variant Price"];
+            if (!m.description && row["Body (HTML)"])
+              m.description = row["Body (HTML)"];
+            const nextTags = extractTagsFromRow(row);
+            if (nextTags.length > 0)
+              m.tags = Array.from(new Set([...(m.tags || []), ...nextTags]));
+            if (!m.image_url || row["Image Position"] === "1") {
+              if (row["Image Src"]) m.image_url = row["Image Src"];
+            }
           }
         }
         normalizedRows = Array.from(handleMap.values()).filter((r) => r.name);
       }
 
+      const toInsert: any[] = [];
       for (const row of normalizedRows) {
         const name =
           row.name ||
@@ -965,39 +1242,38 @@ function useStoresInternal() {
           row["Variant Price"] ||
           "";
         const price = String(priceStr).replace(/[^0-9.]/g, "");
-        const rawDescription =
-          row.description || row.Description || row["Body (HTML)"] || null;
-        const description = stripHtml(rawDescription);
-        // Lightspeed (and some other POS systems) may store multiple comma-
-        // separated image URLs in a single quoted field. We pick the URL at
-        // imageIndex (0-based), falling back to the first if out of range.
-        const rawImageUrl =
+        const description = stripHtml(
+          row.description || row.Description || row["Body (HTML)"] || null,
+        );
+        const rawImg =
           row.image_url || row["Image URL"] || row["Image Src"] || null;
-        const imageUrl = rawImageUrl
-          ? ((String(rawImageUrl).split(",").map((u: string) => u.trim()).filter(Boolean)[imageIndex]
-              ?? String(rawImageUrl).split(",")[0].trim()) || null)
+        const imageUrl = rawImg
+          ? (String(rawImg)
+              .split(",")
+              .map((u: string) => u.trim())
+              .filter(Boolean)[imageIndex] ??
+              String(rawImg).split(",")[0].trim()) ||
+            null
           : null;
 
         let inStock = true;
-        // Lightspeed: `active` column (1 = active/in-stock, 0 = inactive)
-        if (row.active !== undefined && row.active !== "") {
+        if (row.active !== undefined && row.active !== "")
           inStock = String(row.active).trim() === "1";
-        } else if (row.in_stock !== undefined) {
-          inStock = Boolean(row.in_stock);
-        }
+        else if (row.in_stock !== undefined) inStock = Boolean(row.in_stock);
         if (
           row.inventory_quantity !== undefined ||
           row.stock_quantity !== undefined
         ) {
-          const qty = parseInt(
-            row.inventory_quantity || row.stock_quantity || "0",
-            10,
-          );
-          inStock = qty > 0;
+          inStock =
+            parseInt(row.inventory_quantity || row.stock_quantity || "0", 10) >
+            0;
         }
+
+        const tags = isShopifyFormat ? row.tags || [] : extractTagsFromRow(row);
 
         toInsert.push({
           raw: row,
+          tags,
           dbRow: {
             store_id: storeId || null,
             owner_id: user?.id,
@@ -1016,32 +1292,38 @@ function useStoresInternal() {
         : parsedData.length;
       const skipped = totalDistinct - toInsert.length;
 
-      if (toInsert.length === 0) {
-        return { imported: 0, skipped, error: null };
+      if (toInsert.length === 0) return { imported: 0, skipped, error: null };
+
+      const newProducts: Product[] = [];
+      for (let i = 0; i < toInsert.length; i += IMPORT_BATCH_SIZE) {
+        const chunk = toInsert.slice(i, i + IMPORT_BATCH_SIZE);
+        const { data: insertedChunk, error: insertError } = await supabase
+          .from("products" as any)
+          .insert(chunk.map((t) => t.dbRow))
+          .select();
+
+        if (insertError) throw insertError;
+        if (insertedChunk)
+          newProducts.push(...(insertedChunk as unknown as Product[]));
       }
-
-      const { data: insertedProducts, error: insertError } = await supabase
-        .from("products" as any)
-        .insert(toInsert.map((t) => t.dbRow))
-        .select();
-
-      if (insertError) throw insertError;
-
-      const newProducts = (insertedProducts as unknown as Product[]) || [];
+      flowLog(
+        "PRODUCTS_INSERTED",
+        { count: newProducts.length },
+        "db_write",
+        "products",
+      );
 
       if (storeId && newProducts.length > 0) {
-        const storeProductsToInsert = newProducts.map((p) => ({
+        const spRows = newProducts.map((p) => ({
           store_id: storeId,
           product_id: p.id,
         }));
-        const { error: spError } = await supabase
-          .from("store_products" as any)
-          .upsert(storeProductsToInsert, {
+        for (let i = 0; i < spRows.length; i += IMPORT_BATCH_SIZE) {
+          const chunk = spRows.slice(i, i + IMPORT_BATCH_SIZE);
+          await supabase.from("store_products" as any).upsert(chunk, {
             onConflict: "store_id, product_id",
             ignoreDuplicates: true,
           });
-        if (spError) {
-          console.error("[import] ⚠️ store_products link failed:", spError);
         }
         newProducts.forEach((p) => {
           p.store_ids = [storeId];
@@ -1052,118 +1334,165 @@ function useStoresInternal() {
         });
       }
 
-      setProducts((prev) => [...prev, ...newProducts]);
-
-      // Process Tags
       const productTagsToInsert: { product_id: string; tag_id: string }[] = [];
-      const newTagsToInsertMap = new Map<string, string>();
+      const newTagsMap = new Map<string, string>();
 
-      // Collect new tags
       toInsert.forEach((item) => {
-        const tagsStr = extractTagsFromRow(item.raw); // Using dynamic extraction
-        if (tagsStr && typeof tagsStr === "string") {
-          const rowTags = tagsStr
-            .split(",")
-            .map((t: string) => t.trim())
-            .filter(Boolean);
-          rowTags.forEach((t: string) => {
-            const tl = t.toLowerCase();
-            if (!existingTagsMap.has(tl) && !newTagsToInsertMap.has(tl)) {
-              newTagsToInsertMap.set(tl, t);
-            }
-          });
-        }
+        const tagsArray = item.tags || [];
+        tagsArray.forEach((t: string) => {
+          const tl = t.toLowerCase().trim();
+          if (!existingTagsMap.has(tl) && !newTagsMap.has(tl)) {
+            newTagsMap.set(tl, t.trim());
+          }
+        });
       });
 
-      // Create new tags
-      if (newTagsToInsertMap.size > 0) {
-        // ✅ removed storeId check
-        const tagsToInsertDb = Array.from(newTagsToInsertMap.values()).map(
-          (tagName) => ({
-            store_id: storeId || null, // ✅ null if no store, that's fine
+      const successfulNewTags: Tag[] = [];
+
+      if (newTagsMap.size > 0) {
+        const tagNamesToInsert = Array.from(newTagsMap.values());
+        const tagChunks = chunkArray(tagNamesToInsert, IMPORT_BATCH_SIZE);
+
+        for (const chunk of tagChunks) {
+          const payload = chunk.map((tagName) => ({
+            store_id: storeId || null,
             owner_id: user?.id,
             name: tagName,
             is_hard_constraint: false,
-          }),
-        );
-        // ...
+          }));
 
-        const { data: insertedTags, error: tagsInsertError } = await supabase
-          .from("tags" as any)
-          .insert(tagsToInsertDb)
-          .select();
+          const { data: bulkData, error: bulkError } = await supabase
+            .from("tags" as any)
+            .insert(payload)
+            .select();
 
-        if (!tagsInsertError && insertedTags) {
-          (insertedTags as unknown as Tag[]).forEach((t) => {
-            existingTagsMap.set(t.name.toLowerCase(), t);
-          });
-          setTags((prev) => {
-            const existingIds = new Set(prev.map((t) => t.id));
-            const newTs = (insertedTags as unknown as Tag[]).filter(
-              (t) => !existingIds.has(t.id),
+          if (bulkData && !bulkError) {
+            (bulkData as unknown as Tag[]).forEach((tag) => {
+              successfulNewTags.push(tag);
+              existingTagsMap.set(tag.name.toLowerCase().trim(), tag);
+            });
+            flowLog(
+              "TAGS_BULK_CREATED",
+              { count: chunk.length },
+              "db_write",
+              "tags",
             );
-            return [...prev, ...newTs];
-          });
+          } else {
+            for (const tagName of chunk) {
+              const { data, error } = await supabase
+                .from("tags" as any)
+                .insert({
+                  store_id: storeId || null,
+                  owner_id: user?.id,
+                  name: tagName,
+                  is_hard_constraint: false,
+                })
+                .select()
+                .single();
+
+              if (data) {
+                successfulNewTags.push(data as unknown as Tag);
+                existingTagsMap.set(
+                  tagName.toLowerCase().trim(),
+                  data as unknown as Tag,
+                );
+              } else if (error) {
+                const { data: recoveredTag } = await supabase
+                  .from("tags" as any)
+                  .select("*")
+                  .ilike("name", tagName)
+                  .eq("owner_id", user?.id)
+                  .maybeSingle();
+                if (recoveredTag)
+                  existingTagsMap.set(
+                    tagName.toLowerCase().trim(),
+                    recoveredTag as unknown as Tag,
+                  );
+              }
+            }
+          }
+        }
+
+        if (successfulNewTags.length > 0) {
+          setTags((prev) => [...prev, ...successfulNewTags]);
+          setTagCount((c) => c + successfulNewTags.length);
         }
       }
 
-      // Build a fast lookup: (name::sku) → raw CSV row so we can match
-      // inserted products back to their source rows regardless of return order.
-      const rawRowByKey = new Map<string, any>();
+      const insertItemByKey = new Map<string, any>();
       toInsert.forEach((item) => {
-        const key = `${item.dbRow.name}::${item.dbRow.sku ?? ""}`;
-        rawRowByKey.set(key, item.raw);
+        const key = `${String(item.dbRow.name).toLowerCase().trim()}::${String(
+          item.dbRow.sku || "",
+        )
+          .toLowerCase()
+          .trim()}`;
+        insertItemByKey.set(key, item);
       });
 
-      // Create product-tag relationships
       newProducts.forEach((product) => {
-        const key = `${product.name}::${product.sku ?? ""}`;
-        const rawRow = rawRowByKey.get(key);
-        if (!rawRow) return;
+        const key = `${String(product.name).toLowerCase().trim()}::${String(
+          product.sku || "",
+        )
+          .toLowerCase()
+          .trim()}`;
+        const item = insertItemByKey.get(key);
+        if (!item) return;
 
-        const tagsStr = extractTagsFromRow(rawRow);
-        if (tagsStr && typeof tagsStr === "string") {
-          const rowTags = Array.from(
-            new Set(
-              tagsStr
-                .split(",")
-                .map((t: string) => t.trim())
-                .filter(Boolean),
-            ),
-          );
-          rowTags.forEach((tagStr: string) => {
-            const tagObj = existingTagsMap.get(tagStr.toLowerCase());
-            if (tagObj) {
+        const tagsArray = item.tags || [];
+        (Array.from(new Set(tagsArray)) as string[]).forEach(
+          (tagStr: string) => {
+            const tagObj = existingTagsMap.get(tagStr.toLowerCase().trim());
+            if (tagObj && tagObj.id) {
               productTagsToInsert.push({
                 product_id: product.id,
                 tag_id: tagObj.id,
               });
             }
-          });
-        }
+          },
+        );
       });
 
       if (productTagsToInsert.length > 0) {
-        const { error: ptError } = await supabase
-          .from("product_tags" as any)
-          .upsert(productTagsToInsert, {
+        for (
+          let i = 0;
+          i < productTagsToInsert.length;
+          i += IMPORT_BATCH_SIZE
+        ) {
+          const chunk = productTagsToInsert.slice(i, i + IMPORT_BATCH_SIZE);
+          await supabase.from("product_tags" as any).upsert(chunk, {
             onConflict: "product_id, tag_id",
             ignoreDuplicates: true,
           });
-        if (ptError) {
-          console.error("[import] ⚠️ product_tags insert failed:", ptError);
-        } else {
-          console.log(
-            `[import] ✅ linked ${productTagsToInsert.length} product-tag entries`,
-          );
         }
+        flowLog(
+          "PRODUCT_TAGS_LINKED",
+          { count: productTagsToInsert.length },
+          "db_write",
+          "product_tags",
+        );
       }
+      if (newProducts.length > 0 && user?.id) {
+        triggerBatchEmbedding(user.id).catch((err) =>
+          console.warn(
+            "[importProductsFromFile] embedding trigger failed silently:",
+            err,
+          ),
+        );
+      }
+      setProductCount((c) => c + newProducts.length);
 
-      await fetchProducts();
-
+      flowLog(
+        "IMPORT_COMPLETE",
+        { imported: newProducts.length, skipped },
+        "info",
+      );
       return { imported: newProducts.length, skipped, error: null };
     } catch (err: any) {
-      console.error("[import] 💥 CAUGHT ERROR:", err);
+      flowLog(
+        "IMPORT_FATAL_ERROR",
+        { error: err.message, stack: err.stack },
+        "error",
+      );
       return {
         imported: 0,
         skipped: 0,
@@ -1172,6 +1501,8 @@ function useStoresInternal() {
     }
   };
 
+  // ─── Return ───────────────────────────────────────────────────────────────
+
   return {
     stores,
     zones,
@@ -1179,32 +1510,105 @@ function useStoresInternal() {
     tags,
     integrations,
     isLoading,
+    isProductsLoading,
     error,
+    productCount,
+    tagCount,
     fetchStores,
-    fetchProducts,
     createStore,
     updateStore,
     deleteStore,
+    fetchZones,
     createZone,
     updateZone,
     deleteZone,
+    fetchProducts,
+    fetchProductCount,
     createProduct,
     updateProduct,
     deleteProduct,
+    deleteAllProductsByOwner,
     refreshProduct,
+    linkProductToStore,
+    unlinkProductFromStore,
+    fetchTags,
+    connectNango,
+    fetchTagCount,
     createTag,
     updateTag,
     deleteTag,
-    fetchTags,
+    bulkDeleteTags,
+    deleteAllTagsByOwner,
+    clearAllOrphanTags,
     linkTagToProduct,
     unlinkTagFromProduct,
     linkTagToZone,
     unlinkTagFromZone,
     fetchIntegrations,
     saveIntegration,
+    saveWebhookUrl,
     importSquarespaceProducts,
     importProductsFromFile,
-    linkProductToStore,
-    unlinkProductFromStore,
   };
+}
+
+// ─── Embedding Helpers ────────────────────────────────────────────────────
+
+// Retry config
+const EMBED_MAX_RETRIES = 3;
+const EMBED_RETRY_DELAYS = [2000, 5000, 10000]; // ms — exponential backoff
+
+async function triggerEmbedding(productId: string): Promise<void> {
+  for (let attempt = 0; attempt < EMBED_MAX_RETRIES; attempt++) {
+    try {
+      const res = await fetch("/api/embeddings/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ product_id: productId }),
+      });
+
+      if (res.ok) return;
+
+      const body = await res.json().catch(() => ({}));
+      const status = res.status;
+
+      if (status === 400 || status === 404) {
+        console.warn(
+          `[triggerEmbedding] non-retryable error ${status} for product ${productId}:`,
+          body,
+        );
+        return;
+      }
+
+      console.warn(
+        `[triggerEmbedding] attempt ${attempt + 1} failed (${status}) for ${productId}, retrying in ${EMBED_RETRY_DELAYS[attempt]}ms...`,
+      );
+    } catch (networkErr) {
+      console.warn(
+        `[triggerEmbedding] network error attempt ${attempt + 1} for ${productId}:`,
+        networkErr,
+      );
+    }
+
+    if (attempt < EMBED_MAX_RETRIES - 1) {
+      await new Promise((r) => setTimeout(r, EMBED_RETRY_DELAYS[attempt]));
+    }
+  }
+
+  console.warn(
+    `[triggerEmbedding] all ${EMBED_MAX_RETRIES} attempts failed for product ${productId}. ` +
+      `Product is saved. Run /api/embeddings/backfill to re-process.`,
+  );
+}
+
+async function triggerBatchEmbedding(ownerId: string): Promise<void> {
+  const res = await fetch("/api/embeddings/backfill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ owner_id: ownerId }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Backfill failed: ${res.status}`);
+  }
 }

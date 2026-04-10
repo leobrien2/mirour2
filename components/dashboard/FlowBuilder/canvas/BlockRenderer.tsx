@@ -9,8 +9,10 @@ import {
   ChevronRight,
   Check,
   ShoppingBag,
+  Search,
+  Sparkles,
 } from "lucide-react";
-import type { CanvasBlock, AspectRatio, SelectOption } from "@/types/canvas";
+import type { CanvasBlock, AspectRatio, SelectOption, AiSearchBlockData } from "@/types/canvas";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -115,7 +117,7 @@ function CarouselBlock({
   const isAuto = data.aspectRatio === "auto";
   const aspectClass = isAuto
     ? ""
-    : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+    : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
 
   return (
     <div
@@ -182,7 +184,7 @@ function CarouselBlock({
 
 // ── Select block ──────────────────────────────────────────────────────────────
 
-function SelectBlock({
+export function SelectBlock({
   data,
 }: {
   data: Extract<CanvasBlock["data"], { type: "select" }>;
@@ -213,7 +215,11 @@ function SelectBlock({
               <div
                 key={opt.id}
                 className={`w-full flex items-center gap-4 p-4 sm:p-5 rounded-2xl border transition-all duration-200 group
-                  ${isGrid ? "flex-col text-center justify-center min-h-[120px]" : "justify-between"}
+                  ${
+                    isGrid
+                      ? "flex-col text-center justify-center min-h-[120px]"
+                      : "justify-between"
+                  }
                   ${
                     isSel
                       ? "border-primary bg-primary/5 shadow-[0_4px_14px_rgba(0,0,0,0.03)]"
@@ -221,7 +227,9 @@ function SelectBlock({
                   }`}
               >
                 <div
-                  className={`flex items-center gap-4 ${isGrid ? "flex-col" : "w-full"}`}
+                  className={`flex items-center gap-4 ${
+                    isGrid ? "flex-col" : "w-full"
+                  }`}
                 >
                   {!isGrid && (
                     <div className="shrink-0">
@@ -276,12 +284,6 @@ function SelectBlock({
               </div>
             );
           })}
-        </div>
-      )}
-
-      {isMulti && (
-        <div className="w-full mt-4 py-4 rounded-2xl bg-foreground text-background font-bold text-base flex items-center justify-center opacity-40">
-          Continue
         </div>
       )}
     </div>
@@ -461,8 +463,6 @@ function RatingBlock({
   );
 }
 
-// ── Products block ────────────────────────────────────────────────────────────
-
 function ProductCardStatic({
   product,
   compact,
@@ -472,14 +472,25 @@ function ProductCardStatic({
   compact: boolean;
   showTags?: boolean;
 }) {
-  const title = product.name ?? product.title ?? "Product";
-  const imageUrl = product.imageurl ?? product.imageUrl ?? null;
-  const price = product.price ?? null;
-  const tags = product.tags ?? [];
+  console.log(product);
 
+  const title = product.name ?? product.title ?? "Product";
+  const imageUrl = product.image_url ?? product.imageUrl ?? null;
+  const price = product.price ?? null;
+  const tags = Array.isArray(product.tags) ? product.tags : [];
+  const desc = product.description ?? null;
+
+  // Logic to handle both Number (40) and String ("$ 30")
+  const getCleanPrice = (val: any) => {
+    if (val == null) return "";
+    // Convert to string and remove '$' and spaces
+    return String(val).replace(/[$\s]/g, "");
+  };
+
+  const priceWithoutDollar = getCleanPrice(price);
   if (compact) {
     return (
-      <div className="group rounded-2xl border border-border/50 bg-card overflow-hidden flex flex-col h-full">
+      <div className="rounded-2xl border border-border/50 bg-card overflow-hidden flex flex-col h-full">
         <div className="aspect-square w-full overflow-hidden bg-muted/30 relative">
           {imageUrl ? (
             <img
@@ -493,28 +504,29 @@ function ProductCardStatic({
             </div>
           )}
         </div>
-
-        <div className="p-3 flex flex-col gap-2 flex-1">
+        <div className="p-3 flex flex-col gap-1.5 flex-1">
           <p className="text-xs font-semibold text-foreground leading-tight line-clamp-2">
             {title}
           </p>
-          <p className="text-[10px] text-muted-foreground line-clamp-2">
-            {product.description}
-          </p>
-          <div className="mt-auto flex items-center justify-between">
-            {price && (
+          {product.description && (
+            <p className="text-[10px] text-muted-foreground line-clamp-2">
+              {product.description}
+            </p>
+          )}
+          {/* <div className="mt-auto pt-1 flex items-center justify-between">
+            {price != null && (
               <p className="text-sm font-bold text-foreground/80">
-                ${Number(price).toFixed(2)}
+                ${priceWithoutDollar}
               </p>
             )}
-          </div>
+          </div> */}
         </div>
       </div>
     );
   }
 
   return (
-    <div className="group flex gap-4 rounded-2xl border border-border/50 bg-card p-4 items-center">
+    <div className="flex gap-4 rounded-2xl border border-border/50 bg-card p-4 items-center">
       <div className="w-20 h-20 shrink-0 rounded-xl overflow-hidden bg-muted/30 relative">
         {imageUrl ? (
           <img
@@ -528,16 +540,15 @@ function ProductCardStatic({
           </div>
         )}
       </div>
-
       <div className="flex-1 min-w-0 space-y-1">
         <p className="text-base font-semibold text-foreground leading-snug line-clamp-2">
           {title}
         </p>
-        {price && (
+        {/* {price != null && (
           <p className="text-sm font-bold text-foreground/80">
             ${Number(price).toFixed(2)}
           </p>
-        )}
+        )} */}
         {showTags && tags.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mt-2">
             {tags.slice(0, 3).map((t: any) => (
@@ -557,67 +568,97 @@ function ProductCardStatic({
 
 function ProductsBlock({
   data,
+  simProducts,
 }: {
   data: Extract<CanvasBlock["data"], { type: "products" }>;
+  simProducts?: any[];
 }) {
   const isGrid = data.layout === "grid";
   const isTagged = data.mode === "tagged";
   const pins = data.pinnedProducts ?? [];
   const limit = data.resultLimit ?? 12;
-  const skeletonCount = isTagged ? Math.min(limit, 4) : 0;
 
+  const showSkeletons = isTagged && simProducts === undefined;
+  const products = isTagged
+    ? (simProducts ?? [])
+    : (pins.slice(0, limit) as any[]);
+
+  // ── Loading skeleton ──────────────────────────────────────────────────────
+  if (showSkeletons) {
+    return (
+      <div className="w-full space-y-5 animate-in fade-in pointer-events-none">
+        {data.heading && (
+          <p className="text-xl font-bold text-foreground tracking-tight">
+            {data.heading}
+          </p>
+        )}
+        <div className={isGrid ? "grid grid-cols-2 gap-4" : "space-y-4"}>
+          {Array.from({ length: Math.min(limit, 4) }).map((_, i) => (
+            <div
+              key={i}
+              className={`rounded-2xl border border-border/40 bg-card overflow-hidden animate-pulse
+                ${isGrid ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
+            >
+              <div
+                className={`bg-muted/40 ${
+                  isGrid ? "h-2/3 w-full" : "w-20 h-20 rounded-xl shrink-0"
+                }`}
+              />
+              <div className={`flex-1 space-y-2.5 ${isGrid ? "p-4" : "py-2"}`}>
+                <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
+                <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
+                <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Empty state ───────────────────────────────────────────────────────────
+  if (products.length === 0) {
+    return (
+      <div className="w-full py-16 flex flex-col items-center gap-4 text-center bg-card rounded-3xl border border-border/40 border-dashed pointer-events-none">
+        <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center mb-2">
+          <ShoppingBag className="w-8 h-8 text-muted-foreground/40" />
+        </div>
+        <p className="text-base font-medium text-muted-foreground/80 max-w-xs">
+          {isTagged
+            ? (data.fallbackMessage ??
+              "Select options in the sidebar to preview products")
+            : "No products pinned yet"}
+        </p>
+      </div>
+    );
+  }
+
+  // ── Products ──────────────────────────────────────────────────────────────
   return (
-    <div className="w-full space-y-5 pointer-events-none">
+    <div className="w-full space-y-5 animate-in fade-in duration-500 pointer-events-none">
       {data.heading && (
         <p className="text-xl sm:text-2xl font-bold text-foreground tracking-tight leading-snug">
           {data.heading}
         </p>
       )}
-
-      {isTagged || pins.length === 0 ? (
-        <div
-          className={
-            isGrid
-              ? "grid grid-cols-2 gap-3 sm:gap-5"
-              : "space-y-3 sm:space-y-4"
-          }
-        >
-          {Array.from({ length: skeletonCount > 0 ? skeletonCount : 2 }).map(
-            (_, i) => (
-              <div
-                key={i}
-                className={`rounded-2xl border border-border/40 bg-card overflow-hidden
-                ${isGrid ? "flex flex-col h-[280px]" : "flex gap-4 p-4 h-28"}`}
-              >
-                <div
-                  className={`bg-muted/40 ${
-                    isGrid ? "h-2/3 w-full" : "w-20 h-20 rounded-xl shrink-0"
-                  }`}
-                />
-                <div
-                  className={`flex-1 space-y-2.5 ${isGrid ? "p-4" : "py-2"}`}
-                >
-                  <div className="h-3.5 bg-muted/60 rounded-full w-3/4" />
-                  <div className="h-3.5 bg-muted/60 rounded-full w-1/2" />
-                  <div className="h-3 bg-muted/40 rounded-full w-1/4 mt-4" />
-                </div>
-              </div>
-            ),
-          )}
-        </div>
-      ) : (
-        <div
-          className={
-            isGrid
-              ? "grid grid-cols-2 gap-3 sm:gap-5"
-              : "space-y-3 sm:space-y-4"
-          }
-        >
-          {pins.slice(0, 4).map((p) => (
+      {isGrid ? (
+        <div className="grid grid-cols-2 gap-3 sm:gap-5">
+          {products.map((p: any) => (
             <ProductCardStatic
               key={p.id}
               product={p}
-              compact={isGrid}
+              compact
+              showTags={data.showProductTags}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-3 sm:space-y-4">
+          {products.map((p: any) => (
+            <ProductCardStatic
+              key={p.id}
+              product={p}
+              compact={false}
               showTags={data.showProductTags}
             />
           ))}
@@ -627,9 +668,54 @@ function ProductsBlock({
   );
 }
 
+// ── AI Search Block (editor preview) ───────────────────────────────────────────────────
+
+function AiSearchBlock({ data }: { data: AiSearchBlockData }) {
+  return (
+    <div className="w-full space-y-4 pointer-events-none">
+      {data.heading && (
+        <p className="text-xl font-bold text-foreground tracking-tight">
+          {data.heading}
+        </p>
+      )}
+      {data.description && (
+        <p className="text-sm text-muted-foreground/70 -mt-2">
+          {data.description}
+        </p>
+      )}
+      {/* Fake search bar */}
+      <div className="flex items-center gap-3 px-5 py-4 rounded-2xl border border-border/60 bg-card shadow-sm">
+        <Search className="w-5 h-5 text-muted-foreground/30 shrink-0" />
+        <span className="text-sm text-muted-foreground/30">
+          {data.placeholder ?? "Search products…"}
+        </span>
+      </div>
+      {/* Skeleton result grid */}
+      <div className="grid grid-cols-2 gap-3">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <div key={i} className="rounded-2xl border border-border/30 bg-muted/20 overflow-hidden">
+            <div className="aspect-square bg-muted/30" />
+            <div className="p-3 space-y-2">
+              <div className="h-3 bg-muted/40 rounded-full w-3/4" />
+              <div className="h-3 bg-muted/30 rounded-full w-1/2" />
+            </div>
+          </div>
+        ))}
+      </div>
+   
+    </div>
+  );
+}
+
 // ── Main BlockRenderer ────────────────────────────────────────────────────────
 
-export function BlockRenderer({ block }: { block: CanvasBlock }) {
+export function BlockRenderer({
+  block,
+  simProducts,
+}: {
+  block: CanvasBlock;
+  simProducts?: any[]; // ← ADD
+}) {
   const { data } = block;
 
   switch (data.type) {
@@ -705,7 +791,7 @@ export function BlockRenderer({ block }: { block: CanvasBlock }) {
       const isAuto = data.aspectRatio === "auto";
       const aspectClass = isAuto
         ? ""
-        : RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video";
+        : (RATIO_CLASS[data.aspectRatio ?? "16:9"] ?? "aspect-video");
 
       if (!data.src) {
         return (
@@ -807,7 +893,11 @@ export function BlockRenderer({ block }: { block: CanvasBlock }) {
 
     // ── Products ────────────────────────────────────────────────────────────────
     case "products":
-      return <ProductsBlock data={data} />;
+      return <ProductsBlock data={data} simProducts={simProducts} />;
+
+    // ── AI Search ───────────────────────────────────────────────────────────────────
+    case "ai-search":
+      return <AiSearchBlock data={data} />;
 
     // ── Divider ────────────────────────────────────────────────────────────────
     case "divider":

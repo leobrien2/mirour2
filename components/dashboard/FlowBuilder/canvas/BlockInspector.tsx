@@ -2,6 +2,7 @@
 "use client";
 
 import { useState, useMemo, useEffect } from "react";
+import { supabase } from "@/integrations/supabase/client";
 
 import {
   Trash2,
@@ -67,7 +68,7 @@ const inputCls =
   "w-full px-2 py-1.5 h-8 rounded border border-border/60 bg-background text-xs text-foreground shadow-sm placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary/30 focus:border-primary transition-all";
 
 const sectionCls =
-  "space-y-3 py-4 border-b border-border/40 last:border-0 last:pb-0";
+  "space-y-3 py-1 border-b border-border/40 last:border-0 last:pb-0";
 
 function Field({
   label,
@@ -451,25 +452,35 @@ function DbTagSelector({
   );
 }
 
-// ── DbProductPicker (Compact) ─────────────────────────────────────────────────
-
 function DbProductPicker({
   storeId,
+  formId, // Added formId to pass to the API
   pinnedProducts,
   onAdd,
+  onAddMultiple,
   onRemove,
 }: {
   storeId?: string;
+  formId?: string;
   pinnedProducts: PinnedProduct[];
   onAdd: (p: PinnedProduct) => void;
+  onAddMultiple: (products: PinnedProduct[]) => void;
   onRemove: (id: string) => void;
 }) {
-  const { products } = useStores();
+  const { products, tags } = useStores();
+
+  // Product Search State
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState(false);
 
+  // Tag Search State
+  const [tagSearch, setTagSearch] = useState("");
+  const [tagOpen, setTagOpen] = useState(false);
+  const [isAddingFromTag, setIsAddingFromTag] = useState(false);
+
   const pinnedIds = new Set(pinnedProducts.map((p) => p.id));
 
+  // --- Product Logic (Manual Search) ---
   const storeProducts = useMemo(() => {
     if (!storeId) return products;
     return products.filter(
@@ -477,28 +488,101 @@ function DbProductPicker({
     );
   }, [products, storeId]);
 
-  const filtered = useMemo(
+  const filteredProducts = useMemo(
     () =>
       storeProducts.filter((p) =>
-        (p.name ?? p.tags ?? "").toLowerCase().includes(search.toLowerCase()),
+        (p.name ?? p.name ?? p.id ?? "")
+          .toLowerCase()
+          .includes(search.toLowerCase()),
       ),
     [storeProducts, search],
   );
 
-  const handleSelect = (p: any) => {
-    if (pinnedIds.has(p.id)) return;
-    onAdd({
-      id: p.id,
-      title: p.name ?? p.title ?? p.id,
-      imageUrl: p.image_url ?? p.imageUrl ?? undefined,
-      price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
-    });
-    setSearch("");
-    setOpen(false);
-  };
+const handleSelectProduct = (p: any) => {
+  if (pinnedIds.has(p.id)) return;
+  onAdd({
+    id: p.id,
+    title: p.name ?? p.title ?? p.id,
+    name: p.name ?? p.title, // Keep consistent with DB
+    imageUrl: p.image_url ?? p.imageUrl ?? undefined,
+    image_url: p.image_url ?? p.imageUrl ?? undefined, // Keep consistent with DB
+    description: p.description ?? undefined, // ADDED description
+    price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
+  });
+  setSearch("");
+  setOpen(false);
+};
+
+const handleSelectTag = async (tag: any) => {
+  setTagSearch("");
+  setTagOpen(false);
+  setIsAddingFromTag(true);
+
+  try {
+    // ADDED 'description' to the select string!
+    let selectString =
+      "id, name, description, image_url, price, tags!inner(id)";
+
+    if (storeId) {
+      selectString += ", store_products!inner(store_id)";
+    }
+
+    let query = supabase
+      .from("products")
+      .select(selectString)
+      .eq("tags.id", tag.id)
+      .limit(50);
+
+    if (storeId) {
+      query = query.eq("store_products.store_id", storeId);
+    }
+
+    const { data: fetchedProducts, error } = await query;
+
+    if (error) throw error;
+
+    if (fetchedProducts && fetchedProducts.length > 0) {
+      const newPinned = fetchedProducts
+        .filter((p: any) => !pinnedIds.has(p.id))
+        .map((p: any) => ({
+          id: p.id,
+          title: p.name ?? p.id,
+          name: p.name,
+          imageUrl: p.image_url ?? undefined,
+          image_url: p.image_url ?? undefined,
+          description: p.description ?? undefined, // ADDED description
+          price: p.price != null ? `$${Number(p.price).toFixed(2)}` : undefined,
+        }));
+
+      if (newPinned.length > 0) {
+        onAddMultiple(newPinned);
+      }
+    }
+  } catch (error) {
+    console.error("Error fetching products by tag from Supabase:", error);
+  } finally {
+    setIsAddingFromTag(false);
+  }
+};
+  // --- Tag Logic (API Fetch) ---
+  const storeTags = useMemo(
+    () => (storeId ? tags.filter((t) => t.store_id === storeId) : tags),
+    [tags, storeId],
+  );
+
+  const filteredTags = useMemo(
+    () =>
+      storeTags.filter((t) =>
+        t.name.toLowerCase().includes(tagSearch.toLowerCase()),
+      ),
+    [storeTags, tagSearch],
+  );
+
+
 
   return (
     <div className="space-y-2">
+      {/* Product Search */}
       <div className="relative">
         <div
           className="flex items-center gap-1.5 px-2 py-1.5 h-8 rounded border border-primary/30 bg-primary/5 cursor-text focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary"
@@ -518,16 +602,18 @@ function DbProductPicker({
           />
         </div>
 
-        {open && filtered.length > 0 && (
+        {open && filteredProducts.length > 0 && (
           <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
-            {filtered.slice(0, 30).map((p: any) => {
+            {filteredProducts.slice(0, 30).map((p: any) => {
               const isPinned = pinnedIds.has(p.id);
               return (
                 <button
                   key={p.id}
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => handleSelect(p)}
                   disabled={isPinned}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    if (!isPinned) handleSelectProduct(p);
+                  }}
                   className={`w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted ${
                     isPinned ? "opacity-40 cursor-not-allowed bg-muted/50" : ""
                   }`}
@@ -555,12 +641,71 @@ function DbProductPicker({
           </div>
         )}
         {open && (
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div
+            className="fixed inset-0 z-40"
+            onMouseDown={() => setOpen(false)}
+          />
         )}
       </div>
 
+      {/* Tag Search */}
+      <div className="relative">
+        <div
+          className={`flex items-center gap-1.5 px-2 py-1.5 h-8 rounded border border-border bg-muted/30 cursor-text focus-within:ring-1 focus-within:ring-primary/30 focus-within:border-primary ${isAddingFromTag ? "opacity-50 pointer-events-none" : ""}`}
+          onClick={() => !isAddingFromTag && setTagOpen(true)}
+        >
+          {isAddingFromTag ? (
+            <Loader2 className="w-3.5 h-3.5 text-primary animate-spin shrink-0" />
+          ) : (
+            <Tag className="w-3.5 h-3.5 text-muted-foreground/50 shrink-0" />
+          )}
+          <input
+            type="text"
+            value={tagSearch}
+            onChange={(e) => {
+              setTagSearch(e.target.value);
+              setTagOpen(true);
+            }}
+            onFocus={() => setTagOpen(true)}
+            disabled={isAddingFromTag}
+            placeholder={
+              isAddingFromTag ? "Fetching products..." : "Bulk add by tag..."
+            }
+            className="flex-1 text-xs bg-transparent outline-none text-foreground placeholder:text-muted-foreground/50 min-w-0"
+          />
+        </div>
+
+        {tagOpen && filteredTags.length > 0 && (
+          <div className="absolute z-50 top-full left-0 right-0 mt-1 max-h-48 overflow-y-auto rounded border border-border bg-popover shadow-xl py-1">
+            {filteredTags.map((t) => (
+              <button
+                key={t.id}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  handleSelectTag(t);
+                }}
+                className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted"
+              >
+                <Tag className="w-3 h-3 text-muted-foreground/40 shrink-0" />
+                <span className="flex-1 text-[11px] font-medium truncate">
+                  {t.name}
+                </span>
+                <Plus className="w-3 h-3 text-muted-foreground/40 shrink-0" />
+              </button>
+            ))}
+          </div>
+        )}
+        {tagOpen && (
+          <div
+            className="fixed inset-0 z-40"
+            onMouseDown={() => setTagOpen(false)}
+          />
+        )}
+      </div>
+
+      {/* Pinned Products List */}
       {pinnedProducts.length > 0 && (
-        <div className="space-y-1.5">
+        <div className="space-y-1.5 pt-1">
           {pinnedProducts.map((p) => (
             <div
               key={p.id}
@@ -574,6 +719,7 @@ function DbProductPicker({
                   <img
                     src={p.imageUrl}
                     className="w-full h-full object-cover"
+                    alt=""
                   />
                 ) : (
                   <ShoppingBag className="w-3 h-3 text-muted-foreground/30" />
@@ -602,7 +748,6 @@ function DbProductPicker({
     </div>
   );
 }
-
 // ── Sortable Items (Select & Carousel) ────────────────────────────────────────
 
 function SortableCarouselItem({
@@ -959,7 +1104,7 @@ function ImageEditor({
         <Field label="Image URL">
           <input
             type="url"
-            value={data.src?.startsWith("data:") ? "" : (data.src || "")}
+            value={data.src?.startsWith("data:") ? "" : data.src || ""}
             onChange={(e) => update({ src: e.target.value })}
             placeholder="https://..."
             className={inputCls}
@@ -1049,7 +1194,6 @@ function ImageEditor({
         max={48}
         onChange={(v) => update({ borderRadius: v })}
       />
-
     </div>
   );
 }
@@ -1492,7 +1636,6 @@ function TextInputEditor({
           ]}
         />
       </Field>
-      
     </div>
   );
 }
@@ -1663,13 +1806,18 @@ function ProductsEditor({
   storeId,
   allSteps,
   formId,
+  blockId,
+  onSimProductsChange,
 }: {
   data: ExtractBlockData<"products">;
   onChange: (d: BlockData) => void;
   storeId?: string;
   allSteps?: CanvasStep[];
   formId?: string;
+  blockId?: string;
+  onSimProductsChange?: (blockId: string, products: any[]) => void;
 }) {
+  const { tags } = useStores();
   const update = (patch: object) =>
     onChange({ ...data, ...patch } as BlockData);
 
@@ -1677,62 +1825,58 @@ function ProductsEditor({
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
   );
 
-  // ── Collect all Select options with tags mapped across the whole flow ──
-  const taggedOptions = useMemo(() => {
+  // ── Collect all unique tags across the whole flow for simulation ──
+  const simulatorTags = useMemo(() => {
     if (!allSteps) return [];
-    const result: { id: string; label: string; tags: string[] }[] = [];
+    const allTags = new Set<string>();
     for (const step of allSteps) {
       for (const block of step.blocks ?? []) {
         const bd = block.data as any;
         if (bd?.type === "select") {
           for (const opt of bd.options ?? []) {
-            if ((opt.tags?.length ?? 0) > 0 && opt.label?.trim()) {
-              result.push({
-                id: opt.id,
-                label: opt.label,
-                tags: opt.tags as string[],
-              });
+            for (const tag of opt.tags ?? []) {
+              allTags.add(tag);
             }
           }
         }
       }
     }
-    return result;
+    return Array.from(allTags);
   }, [allSteps]);
 
-  // ── Simulation selection state — pre-select first 2 ──
+  // ── Simulation selection state — pre-select first 2 tags ──
   const [simSelected, setSimSelected] = useState<string[]>(() =>
-    taggedOptions.slice(0, 2).map((o) => o.id),
+    simulatorTags.slice(0, 2),
   );
 
   // Re-sync when user adds/maps tags in the flow
-  const optionKey = taggedOptions.map((o) => o.id).join(",");
+  const tagsKey = simulatorTags.join(",");
   useEffect(() => {
-    setSimSelected(taggedOptions.slice(0, 2).map((o) => o.id));
+    setSimSelected(simulatorTags.slice(0, 2));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [optionKey]);
+  }, [tagsKey]);
 
-  // Flatten tags from selected options
-  const simulatedTags = useMemo(() => {
-    const chosen = taggedOptions.filter((o) => simSelected.includes(o.id));
-    return [...new Set(chosen.flatMap((o) => o.tags))];
-  }, [simSelected, taggedOptions]);
+  // Simulated tags is just the selected tags
+  const simulatedTags = simSelected;
 
-  // ── Fetch products for simulation ──
-  const [simProducts, setSimProducts] = useState<any[]>([]);
+  // ── Fetch products — send to canvas via callback ──
   const [simLoading, setSimLoading] = useState(false);
 
   useEffect(() => {
     if (data.mode !== "tagged") return;
     if (simulatedTags.length === 0) {
-      setSimProducts([]);
+      if (blockId) onSimProductsChange?.(blockId, []);
       return;
     }
     if (!formId && !storeId) return;
+
+    const controller = new AbortController();
     setSimLoading(true);
+
     fetch("/api/products/by-tags", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
       body: JSON.stringify({
         formId: formId ?? storeId,
         tagIds: simulatedTags,
@@ -1741,9 +1885,16 @@ function ProductsEditor({
       }),
     })
       .then((r) => r.json())
-      .then((products) => setSimProducts(products ?? []))
-      .catch(() => setSimProducts([]))
+      .then(({ products: fetched }) => {
+        if (blockId) onSimProductsChange?.(blockId, fetched ?? []);
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError" && blockId)
+          onSimProductsChange?.(blockId, []);
+      })
       .finally(() => setSimLoading(false));
+
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     simulatedTags.join(","),
@@ -1759,6 +1910,10 @@ function ProductsEditor({
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
     );
 
+    console.log("data", data)
+
+    // tags 
+    console.log("tags", tags)
   return (
     <div className="space-y-4">
       {/* Mode */}
@@ -1779,16 +1934,6 @@ function ProductsEditor({
       {data.mode === "tagged" && (
         <>
           <div className={sectionCls}>
-            <Field label="Logic">
-              <SegmentedControl
-                value={data.matchStrategy ?? "any"}
-                onChange={(v) => update({ matchStrategy: v as "any" | "all" })}
-                options={[
-                  { label: "Any", value: "any" },
-                  { label: "All", value: "all" },
-                ]}
-              />
-            </Field>
             <SliderField
               label="Limit"
               value={data.resultLimit ?? 15}
@@ -1800,7 +1945,7 @@ function ProductsEditor({
             <Field label="Empty Msg">
               <input
                 type="text"
-                value={data.fallbackMessage}
+                value={data.fallbackMessage ?? ""}
                 onChange={(e) => update({ fallbackMessage: e.target.value })}
                 className={inputCls}
               />
@@ -1810,132 +1955,85 @@ function ProductsEditor({
           {/* ── Canvas Preview Simulator ── */}
           <div className={sectionCls}>
             <div className="flex items-center gap-1.5 mb-2">
-              <p className="text-9px font-bold text-muted-foreground50 uppercase tracking-widest">
+              <p className="text-[9px] font-bold text-muted-foreground/50 uppercase tracking-widest">
                 Canvas Preview
               </p>
-              <span className="text-9px text-muted-foreground30">
+              <span className="text-[9px] text-muted-foreground/30">
                 · editor only
               </span>
             </div>
 
-            {taggedOptions.length === 0 ? (
-              /* Empty state — no Select blocks with tags exist yet */
-              <div className="rounded-lg border border-dashed border-border60 p-3 text-center space-y-1.5">
-                <ShoppingBag className="w-4 h-4 text-muted-foreground30 mx-auto" />
-                <p className="text-10px text-muted-foreground50 leading-relaxed">
+            {simulatorTags.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-border/60 p-3 text-center space-y-1.5">
+                <ShoppingBag className="w-4 h-4 text-muted-foreground/30 mx-auto" />
+                <p className="text-[10px] text-muted-foreground/50 leading-relaxed">
                   Add a{" "}
-                  <span className="font-semibold text-foreground60">
+                  <span className="font-semibold text-foreground/60">
                     Selection block
                   </span>{" "}
-                  with tags mapped to its options — products will preview here
-                  automatically.
+                  and map tags to simulate products.
                 </p>
               </div>
             ) : (
               <div className="space-y-2.5">
-                <p className="text-10px text-muted-foreground40 leading-relaxed">
-                  Toggle options to simulate what products your customers will
-                  see.
+                {simulatedTags.length > 0 && (
+                  <div className="bg-primary/[0.03] border border-primary/10 rounded-lg p-2.5 space-y-2">
+                    <p className="text-[9px] font-bold text-primary/60 uppercase tracking-tighter">
+                      Active Combination
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {[...new Set(simulatedTags)]
+                        .map((id) => tags.find((t) => t.id === id)?.name)
+                        .filter(Boolean)
+                        .map((name) => (
+                          <span
+                            key={name}
+                            className="inline-flex items-center px-1.5 py-0.5 rounded-md bg-muted border border-border/40 text-[9px] font-medium text-foreground/70"
+                          >
+                            {name}
+                          </span>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-[10px] text-muted-foreground/40 leading-relaxed pt-1">
+                  Toggle options to change the simulation output:
                 </p>
 
-                {/* Option toggle chips */}
                 <div className="flex flex-wrap gap-1.5">
-                  {taggedOptions.map((opt) => {
-                    const isOn = simSelected.includes(opt.id);
+                  {simulatorTags.map((tagId) => {
+                    const isOn = simSelected.includes(tagId);
+                    const tagName =
+                      tags.find((t) => t.id === tagId)?.name || "Unknown Tag";
+
                     return (
                       <button
-                        key={opt.id}
-                        onClick={() => toggleOption(opt.id)}
-                        className={`flex items-center gap-1 px-2 py-1 rounded-full text-10px font-semibold border transition-all ${
+                        key={tagId}
+                        onClick={() => toggleOption(tagId)}
+                        title={tagName}
+                        className={`flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-semibold border transition-all max-w-full ${
                           isOn
-                            ? "bg-primary10 border-primary40 text-primary"
-                            : "bg-muted40 border-border50 text-muted-foreground60 hover:border-primary30 hover:text-foreground"
+                            ? "bg-primary/10 border-primary/40 text-primary"
+                            : "bg-muted/40 border-border/50 text-muted-foreground/60 hover:border-primary/30 hover:text-foreground"
                         }`}
                       >
                         {isOn && <Check className="w-2.5 h-2.5 shrink-0" />}
-                        {opt.label}
+                        <span className="truncate flex-1 min-w-0 text-left">
+                          {tagName}
+                        </span>
                       </button>
                     );
                   })}
                 </div>
 
-                {/* Resolved tag pills — helps user understand what tags are active */}
-                {simulatedTags.length > 0 && (
-                  <div className="flex flex-wrap gap-1">
-                    {simulatedTags.map((tag) => (
-                      <span
-                        key={tag}
-                        className="text-9px px-1.5 py-0.5 rounded bg-muted60 text-muted-foreground50 font-mono"
-                      >
-                        #{tag}
-                      </span>
-                    ))}
+                {simLoading && (
+                  <div className="flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/40" />
+                    <span className="text-[9px] text-muted-foreground/40">
+                      Updating canvas...
+                    </span>
                   </div>
-                )}
-
-                {/* Live product list */}
-                <div className="rounded-lg border border-border40 bg-muted10 overflow-hidden">
-                  {simLoading ? (
-                    <div className="flex items-center justify-center gap-2 py-5">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground40" />
-                      <span className="text-10px text-muted-foreground40">
-                        Loading...
-                      </span>
-                    </div>
-                  ) : simProducts.length === 0 ? (
-                    <div className="py-5 text-center space-y-1">
-                      <ShoppingBag className="w-4 h-4 text-muted-foreground20 mx-auto" />
-                      <p className="text-10px text-muted-foreground40">
-                        {simSelected.length === 0
-                          ? "Select options above to preview"
-                          : data.fallbackMessage ||
-                            "No products match these tags"}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="divide-y divide-border30 max-h-52 overflow-y-auto custom-scrollbar">
-                      {simProducts.map((p: any) => {
-                        const title = p.name ?? p.title ?? "Product";
-                        const price = p.price ?? null;
-                        const img = p.imageurl ?? p.imageUrl ?? null;
-                        return (
-                          <div
-                            key={p.id}
-                            className="flex items-center gap-2.5 px-2.5 py-2"
-                          >
-                            <div className="w-8 h-8 rounded-md bg-muted50 shrink-0 overflow-hidden border border-border40 flex items-center justify-center">
-                              {img ? (
-                                <img
-                                  src={img}
-                                  alt={title}
-                                  className="w-full h-full object-cover"
-                                />
-                              ) : (
-                                <ShoppingBag className="w-3 h-3 text-muted-foreground30" />
-                              )}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-10px font-semibold text-foreground70 truncate">
-                                {title}
-                              </p>
-                              {price !== null && (
-                                <p className="text-9px text-muted-foreground50">
-                                  ${Number(price).toFixed(2)}
-                                </p>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {simProducts.length > 0 && (
-                  <p className="text-9px text-muted-foreground30 text-right">
-                    {simProducts.length} product
-                    {simProducts.length !== 1 ? "s" : ""} matched
-                  </p>
                 )}
               </div>
             )}
@@ -1974,6 +2072,14 @@ function ProductsEditor({
                     pinnedProducts: [...(data.pinnedProducts ?? []), p],
                   })
                 }
+                onAddMultiple={(products) =>
+                  update({
+                    pinnedProducts: [
+                      ...(data.pinnedProducts ?? []),
+                      ...products,
+                    ],
+                  })
+                }
                 onRemove={(id) =>
                   update({
                     pinnedProducts: (data.pinnedProducts ?? []).filter(
@@ -1992,7 +2098,7 @@ function ProductsEditor({
         <Field label="Heading">
           <input
             type="text"
-            value={data.heading}
+            value={data.heading ?? ""}
             onChange={(e) => update({ heading: e.target.value })}
             className={inputCls}
           />
@@ -2007,18 +2113,6 @@ function ProductsEditor({
             ]}
           />
         </Field>
-        <div className="space-y-1.5 pt-1">
-          <ToggleRow
-            label="Show Cart Btn"
-            value={!!data.showAddToCart}
-            onChange={(v) => update({ showAddToCart: v })}
-          />
-          <ToggleRow
-            label="Show Tags"
-            value={!!data.showProductTags}
-            onChange={(v) => update({ showProductTags: v })}
-          />
-        </div>
       </div>
     </div>
   );
@@ -2100,6 +2194,7 @@ const BLOCK_TYPE_LABELS: Record<string, string> = {
   rating: "Rating",
   button: "Button",
   products: "Products",
+  "ai-search": "AI Search",
   divider: "Divider",
   spacer: "Spacer",
 };
@@ -2110,8 +2205,9 @@ export type BlockInspectorProps = {
   onDelete: () => void;
   steps?: { id: string; label: string }[];
   storeId?: string;
-  allSteps?: CanvasStep[]; // NEW
-  formId?: string; // NEW
+  allSteps?: CanvasStep[];
+  formId?: string;
+  onSimProductsChange?: (blockId: string, products: any[]) => void; // ← ADD
 };
 
 export function BlockInspector({
@@ -2122,8 +2218,10 @@ export function BlockInspector({
   storeId,
   allSteps,
   formId,
+  onSimProductsChange, // ← ADD
 }: BlockInspectorProps) {
   const { data } = block;
+
   const renderEditor = () => {
     switch (data.type) {
       case "h1":
@@ -2141,7 +2239,7 @@ export function BlockInspector({
           <SelectEditor
             data={data}
             onChange={onChange}
-            steps={steps ?? []} // ← add ?? []
+            steps={steps ?? []}
             storeId={storeId}
           />
         );
@@ -2153,11 +2251,7 @@ export function BlockInspector({
         return <RatingEditor data={data} onChange={onChange} />;
       case "button":
         return (
-          <ButtonEditor
-            data={data}
-            onChange={onChange}
-            steps={steps ?? []} // ← add ?? []
-          />
+          <ButtonEditor data={data} onChange={onChange} steps={steps ?? []} />
         );
       case "products":
         return (
@@ -2167,8 +2261,108 @@ export function BlockInspector({
             storeId={storeId}
             allSteps={allSteps}
             formId={formId}
+            blockId={block.id} // ← ADD
+            onSimProductsChange={onSimProductsChange} // ← ADD
           />
         );
+      case "ai-search": {
+        return (
+          <div className="space-y-4">
+            {/* Heading */}
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                Heading
+              </label>
+              <input
+                type="text"
+                value={(data as any).heading ?? ""}
+                onChange={(e) => onChange({ ...data, heading: e.target.value } as any)}
+                placeholder="Search our products"
+                className="w-full px-3 py-2 rounded-lg border border-border/60 bg-muted/30 text-sm text-foreground placeholder:text-muted-foreground/30 focus:outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </div>
+
+            {/* Description */}
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                Description
+              </label>
+              <textarea
+                rows={2}
+                value={(data as any).description ?? ""}
+                onChange={(e) => onChange({ ...data, description: e.target.value } as any)}
+                placeholder="Describe what you're looking for in any words"
+                className="w-full px-3 py-2 rounded-lg border border-border/60 bg-muted/30 text-sm text-foreground placeholder:text-muted-foreground/30 focus:outline-none focus:ring-2 focus:ring-primary/20 resize-none"
+              />
+            </div>
+
+            {/* Placeholder */}
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                Search Placeholder
+              </label>
+              <input
+                type="text"
+                value={(data as any).placeholder ?? ""}
+                onChange={(e) => onChange({ ...data, placeholder: e.target.value } as any)}
+                placeholder="e.g. something relaxing to wear…"
+                className="w-full px-3 py-2 rounded-lg border border-border/60 bg-muted/30 text-sm text-foreground placeholder:text-muted-foreground/30 focus:outline-none focus:ring-2 focus:ring-primary/20"
+              />
+            </div>
+
+            {/* Result limit */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Max Results
+                </label>
+                <span className="text-xs font-semibold text-foreground/70">
+                  {(data as any).resultLimit ?? 6}
+                </span>
+              </div>
+              <input
+                type="range"
+                min={3}
+                max={12}
+                step={1}
+                value={(data as any).resultLimit ?? 6}
+                onChange={(e) => onChange({ ...data, resultLimit: Number(e.target.value) } as any)}
+                className="w-full accent-primary"
+              />
+              <div className="flex justify-between text-[9px] text-muted-foreground/40">
+                <span>3</span><span>12</span>
+              </div>
+            </div>
+
+            {/* Show prices toggle */}
+            <div className="flex items-center justify-between py-1">
+              <div>
+                <p className="text-xs font-semibold text-foreground/80">Show Prices</p>
+                <p className="text-[10px] text-muted-foreground/50">Display price on result cards</p>
+              </div>
+              <button
+                onClick={() => onChange({ ...data, showPrices: !(data as any).showPrices } as any)}
+                className={`relative w-9 h-5 rounded-full transition-colors ${
+                  (data as any).showPrices ? "bg-primary" : "bg-muted-foreground/20"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${
+                    (data as any).showPrices ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Info note */}
+            <div className="rounded-xl bg-primary/5 border border-primary/15 p-3">
+              <p className="text-[10px] text-primary/70 leading-relaxed">
+                AI Search uses semantic similarity to find relevant products from your store inventory.
+              </p>
+            </div>
+          </div>
+        );
+      }
       case "divider":
         return <DividerEditor data={data} onChange={onChange} />;
       case "spacer":

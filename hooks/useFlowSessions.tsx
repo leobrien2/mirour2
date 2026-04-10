@@ -56,6 +56,10 @@ export interface FlowSessionActions {
   goBack: () => void;
   goToStep: (stepId: string) => void;
   submitContact: (data: ContactData) => Promise<{ error: string | null }>;
+  /** Clears the in-memory customer identity without resetting the flow.
+   *  Call this when the user clicks "Not me?" so the next submitContact
+   *  goes through the full phone/email lookup instead of Path 1 (skip-upsert). */
+  clearCustomerId: () => void;
   reset: () => void;
 }
 
@@ -217,137 +221,189 @@ export function useFlowSession({
   );
 
   // ── Commit Response ────────────────────────────────────────────────────────
-
+  const isCommittingRef = useRef(false);
+  const sessionRedemptionCodeRef = useRef<string | null>(null);
   const commitResponse = useCallback(
     async (cid: string | null, contactData?: ContactData) => {
       if (isPreview) return null;
+
+      // 1. Synchronous Guards
       if (responseIdRef.current) return responseIdRef.current;
+      if (isCommittingRef.current) return null;
 
-      const sessionId = analyticsSessionIdRef.current;
-      const fullName = contactData
-        ? [contactData.firstName, contactData.lastName]
-            .filter(Boolean)
-            .join(" ") || null
-        : null;
+      // Lock the thread
+      isCommittingRef.current = true;
 
-      // 1. Build enriched answers
-      const enrichedAnswers: Record<string, any> = {};
-      for (const [blockId, value] of Object.entries(answersRef.current)) {
-        enrichedAnswers[blockId] = {
-          label: questionLabelMap[blockId] ?? blockId,
-          value,
-          answeredAt: answerTimestampsRef.current[blockId] ?? null,
-        };
-      }
+      try {
+        const sessionId = analyticsSessionIdRef.current;
 
-      flowLog("ENRICHED_ANSWERS_BUILT", {
-        count: Object.keys(enrichedAnswers).length,
-        answers: enrichedAnswers,
-      });
+        // ── Contact data resolution ──────────────────────────────────────────
+        // commitResponse is called from two paths:
+        //   (A) Auto-save watcher (last step reached) — contactData is undefined.
+        //       The customer may already be identified (cid set from localStorage).
+        //       In this case read the locally-cached profile so the response row
+        //       gets denormalized customer_name / customer_email / customer_phone.
+        //   (B) submitContact flow — contactData is provided directly.
+        let resolvedName = contactData
+          ? [contactData.firstName, contactData.lastName]
+              .filter(Boolean)
+              .join(" ") || null
+          : null;
+        let resolvedEmail = contactData?.email ?? null;
+        let resolvedPhone = contactData?.phone ?? null;
 
-      // 2. Insert form_responses row
-      const finalCode = redemptionCode
-        ? `${redemptionCode}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
-        : `PERK-${Date.now()}`;
+        if (!contactData && cid) {
+          // Path A: try to backfill from the cached local profile
+          const localProfile = getLocalCustomer();
+          if (localProfile && localProfile.id === cid) {
+            resolvedName =
+              localProfile.name ?? localProfile.firstname ?? resolvedName;
+            resolvedEmail = localProfile.email ?? resolvedEmail;
+            resolvedPhone = localProfile.phone ?? resolvedPhone;
+            flowLog("COMMIT_RESPONSE_PROFILE_BACKFILL", {
+              name: resolvedName,
+              email: resolvedEmail,
+              phone: resolvedPhone,
+            });
+          }
+        }
 
-      const responsePayload = {
-        form_id: formId,
-        customer_id: cid ?? undefined,
-        customer_name: fullName ?? undefined,
-        customer_email: contactData?.email ?? undefined,
-        customer_phone: contactData?.phone ?? undefined,
-        answers: enrichedAnswers,
-        redemption_code: finalCode,
-        session_id: sessionId,
-      };
+        const fullName = resolvedName;
 
-      flowLog(
-        "DB_WRITE form_responses — insert",
-        responsePayload,
-        "db_write",
-        "form_responses",
-      );
+        // Build enriched answers
+        const enrichedAnswers: Record<string, any> = {};
+        for (const [blockId, value] of Object.entries(answersRef.current)) {
+          enrichedAnswers[blockId] = {
+            label: questionLabelMap[blockId] ?? blockId,
+            value,
+            answeredAt: answerTimestampsRef.current[blockId] ?? null,
+          };
+        }
 
-      const { error: responseError, data: responseData } =
-        await submitResponse(responsePayload);
+        flowLog("ENRICHED_ANSWERS_BUILT", {
+          count: Object.keys(enrichedAnswers).length,
+          answers: enrichedAnswers,
+        });
 
-      if (responseError || !responseData) {
-        flowLog(
-          "FORM_RESPONSE_ERROR",
-          { error: responseError?.message },
-          "error",
-        );
-        return null;
-      }
+        // 2. Idempotent Redemption Code
+        // Cache the code so if a network request fails and the user retries,
+        // they send the exact same payload, allowing DB constraints to catch duplicates.
+        if (!sessionRedemptionCodeRef.current) {
+          sessionRedemptionCodeRef.current = redemptionCode
+            ? `${redemptionCode}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`
+            : `PERK-${Date.now()}`;
+        }
 
-      flowLog("FORM_RESPONSE_SAVED", { responseId: responseData.id });
-      responseIdRef.current = responseData.id;
-
-      // 3. Bulk insert submission_answers
-      const answerRows = Object.entries(answersRef.current).map(
-        ([blockId, value]) => ({
-          response_id: responseData.id,
+        const responsePayload = {
           form_id: formId,
-          customer_id: cid,
-          question_id: blockId,
-          question_label: questionLabelMap[blockId] ?? null,
-          answer_value:
-            typeof value === "string" ? value : JSON.stringify(value),
-        }),
-      );
+          customer_id: cid ?? undefined,
+          customer_name: fullName ?? undefined,
+          customer_email: resolvedEmail ?? undefined,
+          customer_phone: resolvedPhone ?? undefined,
+          answers: enrichedAnswers,
+          redemption_code: sessionRedemptionCodeRef.current,
+          session_id: sessionId,
+        };
 
-      if (answerRows.length > 0) {
         flowLog(
-          "DB_WRITE submission_answers — bulk insert",
-          { count: answerRows.length, rows: answerRows },
+          "DB_WRITE form_responses — insert",
+          responsePayload,
           "db_write",
-          "submission_answers",
+          "form_responses",
         );
-        (supabase as any)
-          .from("submission_answers")
-          .insert(answerRows)
-          .then(({ error: answersError }: { error: any }) => {
-            if (answersError) {
-              flowLog(
-                "SUBMISSION_ANSWERS_ERROR",
-                { error: answersError.message },
-                "error",
-              );
-              console.error(
-                "[submission_answers] bulk insert failed:",
-                answersError.message,
-              );
-            } else {
-              flowLog("SUBMISSION_ANSWERS_SAVED", { count: answerRows.length });
-            }
-          });
-      }
 
-      // 4. Backfill response_id on flow_sessions row
-      if (sessionId) {
-        flowLog(
-          "DB_WRITE flow_sessions — backfill response_id",
-          { sessionId, responseId: responseData.id },
-          "db_write",
-          "flow_sessions",
+        const { error: responseError, data: responseData } =
+          await submitResponse(responsePayload);
+
+        if (responseError || !responseData) {
+          flowLog(
+            "FORM_RESPONSE_ERROR",
+            { error: responseError?.message },
+            "error",
+          );
+          return null; // Returns null, finally block will unlock for a retry
+        }
+
+        flowLog("FORM_RESPONSE_SAVED", { responseId: responseData.id });
+
+        // Secure the success state
+        responseIdRef.current = responseData.id;
+
+        // Bulk insert submission_answers
+        const answerRows = Object.entries(answersRef.current).map(
+          ([blockId, value]) => ({
+            response_id: responseData.id,
+            form_id: formId,
+            customer_id: cid,
+            question_id: blockId,
+            question_label: questionLabelMap[blockId] ?? null,
+            answer_value:
+              typeof value === "string" ? value : JSON.stringify(value),
+          }),
         );
-        (supabase as any)
-          .from("flow_sessions")
-          .update({ response_id: responseData.id })
-          .eq("id", sessionId)
-          .then(({ error: sessionRespErr }: { error: any }) => {
-            if (sessionRespErr) {
-              flowLog(
-                "SESSION_UPDATE_ERROR",
-                { field: "response_id", error: sessionRespErr.message },
-                "error",
-              );
-            }
-          });
-      }
 
-      onComplete?.(responseData.id);
-      return responseData.id;
+        if (answerRows.length > 0) {
+          flowLog(
+            "DB_WRITE submission_answers — bulk insert",
+            { count: answerRows.length, rows: answerRows },
+            "db_write",
+            "submission_answers",
+          );
+          (supabase as any)
+            .from("submission_answers")
+            .insert(answerRows)
+            .then(({ error: answersError }: { error: any }) => {
+              if (answersError) {
+                flowLog(
+                  "SUBMISSION_ANSWERS_ERROR",
+                  { error: answersError.message },
+                  "error",
+                );
+                console.error(
+                  "[submission_answers] bulk insert failed:",
+                  answersError.message,
+                );
+              } else {
+                flowLog("SUBMISSION_ANSWERS_SAVED", {
+                  count: answerRows.length,
+                });
+              }
+            });
+        }
+
+        // Backfill response_id on flow_sessions row
+        if (sessionId) {
+          flowLog(
+            "DB_WRITE flow_sessions — backfill response_id",
+            { sessionId, responseId: responseData.id },
+            "db_write",
+            "flow_sessions",
+          );
+          (supabase as any)
+            .from("flow_sessions")
+            .update({ response_id: responseData.id })
+            .eq("id", sessionId)
+            .then(({ error: sessionRespErr }: { error: any }) => {
+              if (sessionRespErr) {
+                flowLog(
+                  "SESSION_UPDATE_ERROR",
+                  { field: "response_id", error: sessionRespErr.message },
+                  "error",
+                );
+              }
+            });
+        }
+
+        onComplete?.(responseData.id);
+        return responseData.id;
+      } finally {
+        // 3. Lock Release
+        // If the request was successful, keep it locked permanently for this session.
+        // If it failed (responseIdRef is null), unlock it so the user can try clicking submit again.
+        if (!responseIdRef.current) {
+          isCommittingRef.current = false;
+        }
+      }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -401,15 +457,6 @@ export function useFlowSession({
         "flow_sessions",
       );
       await analytics.completeSession(finalResponseId ?? "");
-
-  
-      flowLog(
-        "LOCALSTORAGE_CLEAR",
-        { keys: ["mirour:customertoken", "mirour:customer:profile"] },
-        "warn",
-      );
-
-
 
       flowLog("setPhase", "done");
     };
@@ -633,371 +680,453 @@ export function useFlowSession({
 
   // ── Contact submit ─────────────────────────────────────────────────────────
 
-const submitContact = useCallback(
-  async (data: ContactData): Promise<{ error: string | null }> => {
-    if (isPreview) return { error: null };
+  const submitContact = useCallback(
+    async (data: ContactData): Promise<{ error: string | null }> => {
+      if (isPreview) return { error: null };
 
-    setIsSubmitting(true);
-    flowLog("CONTACT_SUBMIT_START", {
-      hasFirstName: !!data.firstName,
-      hasLastName: !!data.lastName,
-      hasEmail: !!data.email,
-      hasPhone: !!data.phone,
-    });
+      setIsSubmitting(true);
+      flowLog("CONTACT_SUBMIT_START", {
+        hasFirstName: !!data.firstName,
+        hasLastName: !!data.lastName,
+        hasEmail: !!data.email,
+        hasPhone: !!data.phone,
+      });
 
-    try {
-      const sessionId = analyticsSessionIdRef.current;
-      const fullName =
-        [data.firstName, data.lastName].filter(Boolean).join(" ") || null;
+      try {
+        const sessionId = analyticsSessionIdRef.current;
+        const fullName =
+          [data.firstName, data.lastName].filter(Boolean).join(" ") || null;
 
-      let cid: string;
+        let cid: string;
 
-      // ── Path 1: Known customer — skip DB entirely ──────────────────────
-      if (customerIdRef.current) {
-        cid = customerIdRef.current;
-        flowLog("CONTACT_SUBMIT_SKIP_UPSERT", {
-          reason: "customer already identified via floating bar login",
-          customerId: cid,
-        });
-
-        // Silently patch any new data — fire & forget
-        if (data.email || data.phone || fullName) {
-          (supabase as any)
-            .from("customers")
-            .update({
-              ...(fullName ? { name: fullName } : {}),
-              ...(data.firstName ? { first_name: data.firstName } : {}),
-              ...(data.email ? { email: data.email } : {}),
-              ...(data.phone ? { phone: data.phone } : {}),
-              last_active: new Date().toISOString(),
-            })
-            .eq("id", cid)
-            .then(({ error: patchErr }: { error: any }) => {
-              if (patchErr)
-                flowLog(
-                  "CUSTOMER_PATCH_ERROR",
-                  { error: patchErr.message },
-                  "error",
-                );
-            });
-        }
-
-        // ── Path 2: Customer with phone — SELECT first, then INSERT/UPDATE ─
-      } else if (data.phone) {
-        flowLog(
-          "DB_READ customers — lookup by phone",
-          { phone: data.phone, storeId },
-          "db_read",
-          "customers",
-        );
-
-        // Step 1: Find existing customer by phone
-        const { data: existing, error: lookupError } = await (supabase as any)
-          .from("customers")
-          .select("id")
-          .eq("phone", data.phone)
-          .maybeSingle();
-
-        if (lookupError) {
-          flowLog(
-            "CUSTOMER_LOOKUP_ERROR",
-            { error: lookupError.message },
-            "error",
-          );
-          return {
-            error:
-              "We encountered an issue verifying your phone number. Please try again.",
-          };
-        }
-
-        if (existing) {
-          // Step 2a: Found — UPDATE by primary key
-          cid = existing.id;
-          flowLog("CUSTOMER_FOUND", {
+        // ── Path 1: Known customer — skip DB entirely ──────────────────────
+        if (customerIdRef.current) {
+          cid = customerIdRef.current;
+          flowLog("CONTACT_SUBMIT_SKIP_UPSERT", {
+            reason: "customer already identified via floating bar login",
             customerId: cid,
-            method: "phone_lookup",
           });
 
-          (supabase as any)
-            .from("customers")
-            .update({
-              ...(fullName ? { name: fullName } : {}),
-              ...(data.firstName ? { first_name: data.firstName } : {}),
-              ...(data.email ? { email: data.email } : {}),
-              traits: { tags: accumulatedTagsRef.current },
-              last_active: new Date().toISOString(),
-            })
-            .eq("id", cid)
-            .then(({ error: updateErr }: { error: any }) => {
-              if (updateErr) {
-                flowLog(
-                  "CUSTOMER_UPDATE_ERROR",
-                  { error: updateErr.message },
-                  "error",
-                );
-              } else {
-                flowLog("CUSTOMER_UPDATED", { customerId: cid });
-              }
-            });
-        } else {
-          // Step 2b: Not found — INSERT fresh row without email first
-          const insertPayload = {
-            name: fullName,
-            first_name: data.firstName ?? null,
-            phone: data.phone,
-            store_id: storeId ?? null,
-            traits: { tags: accumulatedTagsRef.current },
-            last_active: new Date().toISOString(),
-          };
+          // Silently patch safe fields only — fire & forget.
+          // IMPORTANT: email and phone are intentionally excluded.
+          // Both have unique partial indexes (idx_customers_store_email,
+          // idx_customers_store_phone). Patching them without a prior
+          // SELECT check will 409 if another customer already holds the
+          // same value in this store. Name/last_active are safe.
+          if (fullName) {
+            (supabase as any)
+              .from("customers")
+              .update({
+                name: fullName,
+                ...(data.firstName ? { first_name: data.firstName } : {}),
+                last_active: new Date().toISOString(),
+              })
+              .eq("id", cid)
+              .then(({ error: patchErr }: { error: any }) => {
+                if (patchErr)
+                  flowLog(
+                    "CUSTOMER_PATCH_ERROR",
+                    { error: patchErr.message },
+                    "error",
+                  );
+              });
+          }
+
+          // ── Path 2: Customer with phone — SELECT first, then INSERT/UPDATE ─
+        } else if (data.phone) {
           flowLog(
-            "DB_WRITE customers — insert (new phone customer)",
-            insertPayload,
-            "db_write",
+            "DB_READ customers — lookup by phone",
+            { phone: data.phone, storeId },
+            "db_read",
             "customers",
           );
 
-          const { data: newCustomer, error: insertError } = await (
-            supabase as any
-          )
+          // Step 1: Find existing customer by phone — fetch email + secondary_emails
+          // so we can decide whether the supplied email is new or already known.
+          const { data: existing, error: lookupError } = await (supabase as any)
             .from("customers")
-            .insert(insertPayload)
-            .select("id")
-            .single();
+            .select("id, email, secondary_emails")
+            .eq("phone", data.phone)
+            .maybeSingle();
 
-          if (insertError || !newCustomer) {
+          if (lookupError) {
             flowLog(
-              "CUSTOMER_INSERT_ERROR",
-              { error: insertError?.message },
+              "CUSTOMER_LOOKUP_ERROR",
+              { error: lookupError.message },
               "error",
             );
             return {
               error:
-                "We couldn't save your details at this time. Please try again.",
+                "We encountered an issue verifying your phone number. Please try again.",
             };
           }
 
-          cid = newCustomer.id;
-          flowLog("CUSTOMER_SAVED", {
-            customerId: cid,
-            method: "insert_phone",
-          });
+          if (existing) {
+            // Step 2a: Found by phone — UPDATE safe fields only.
+            cid = existing.id;
+            flowLog("CUSTOMER_FOUND", {
+              customerId: cid,
+              method: "phone_lookup",
+            });
 
-          // Patch email separately by primary key
-          if (data.email) {
+            // Email handling:
+            //  • Never overwrite customers.email — it has a unique partial
+            //    index (idx_customers_store_email) that causes a 409.
+            //  • If the user gave a NEW email (different from primary + not already
+            //    in secondary_emails), append it to secondary_emails.
+            const primaryEmail: string | null = existing.email ?? null;
+            const secondaryEmails: string[] = existing.secondary_emails ?? [];
+            const incomingEmail = data.email?.trim().toLowerCase() ?? null;
+
+            const isNewEmail =
+              incomingEmail &&
+              incomingEmail !== primaryEmail?.toLowerCase() &&
+              !secondaryEmails
+                .map((e: string) => e.toLowerCase())
+                .includes(incomingEmail);
+
+            flowLog("PHONE_LOOKUP_EMAIL_DECISION", {
+              primaryEmail,
+              incomingEmail,
+              isNewEmail,
+            });
+
             (supabase as any)
               .from("customers")
-              .update({ email: data.email })
+              .update({
+                ...(fullName ? { name: fullName } : {}),
+                ...(data.firstName ? { first_name: data.firstName } : {}),
+                // Append new email to secondary_emails if it differs from primary.
+                // If no new email, leave the array unchanged.
+                ...(isNewEmail
+                  ? { secondary_emails: [...secondaryEmails, incomingEmail] }
+                  : {}),
+                traits: { tags: accumulatedTagsRef.current },
+                last_active: new Date().toISOString(),
+              })
               .eq("id", cid)
-              .then(({ error: emailErr }: { error: any }) => {
-                if (emailErr) {
+              .then(({ error: updateErr }: { error: any }) => {
+                if (updateErr) {
                   flowLog(
-                    "CUSTOMER_EMAIL_PATCH_ERROR",
-                    { error: emailErr.message },
+                    "CUSTOMER_UPDATE_ERROR",
+                    { error: updateErr.message },
                     "error",
                   );
                 } else {
-                  flowLog("CUSTOMER_EMAIL_PATCHED", { customerId: cid });
+                  flowLog("CUSTOMER_UPDATED", {
+                    customerId: cid,
+                    secondaryEmailAdded: isNewEmail ? incomingEmail : null,
+                  });
                 }
               });
-          }
-        }
-
-        saveCustomerLocally({
-          id: cid,
-          name: fullName,
-          firstname: data.firstName ?? null,
-          email: data.email ?? null,
-          phone: data.phone ?? null,
-        });
-        flowLog("LOCALSTORAGE_WRITE", {
-          key: "mirour:customertoken + mirour:customer:profile",
-          cid,
-        });
-
-        customerIdRef.current = cid;
-        setCustomerId(cid);
-
-        // ── Path 3: Email only (no phone) — safe select then insert/update ──────────
-      } else if (data.email) {
-        flowLog(
-          "DB_READ customers — lookup by email",
-          { email: data.email, storeId },
-          "db_read",
-          "customers",
-        );
-
-        // Step 1: Find existing customer by email
-        let query = (supabase as any)
-          .from("customers")
-          .select("id")
-          .eq("email", data.email);
-       if (storeId) {
-         query = query.eq("store_id", storeId);
-       } else {
-         query = query.is("store_id", null); // ← must be explicit
-       }
-
-        const { data: existing, error: lookupError } =
-          await query.maybeSingle();
-
-        if (lookupError) {
-          flowLog(
-            "CUSTOMER_LOOKUP_ERROR",
-            { error: lookupError.message },
-            "error",
-          );
-          return {
-            error:
-              "We encountered an issue verifying your email address. Please try again.",
-          };
-        }
-
-        if (existing) {
-          // Step 2a: Found — UPDATE by primary key
-          cid = existing.id;
-          flowLog("CUSTOMER_FOUND", {
-            customerId: cid,
-            method: "email_lookup",
-          });
-
-          (supabase as any)
-            .from("customers")
-            .update({
-              ...(fullName ? { name: fullName } : {}),
-              ...(data.firstName ? { first_name: data.firstName } : {}),
+          } else {
+            // Step 2b: Not found — INSERT fresh row without email first
+            const insertPayload = {
+              name: fullName,
+              first_name: data.firstName ?? null,
+              phone: data.phone,
+              store_id: storeId ?? null,
               traits: { tags: accumulatedTagsRef.current },
               last_active: new Date().toISOString(),
-            })
-            .eq("id", cid)
-            .then(({ error: updateErr }: { error: any }) => {
-              if (updateErr) {
-                flowLog(
-                  "CUSTOMER_UPDATE_ERROR",
-                  { error: updateErr.message },
-                  "error",
-                );
-              } else {
-                flowLog("CUSTOMER_UPDATED", { customerId: cid });
-              }
-            });
-        } else {
-          // Step 2b: Not found — INSERT fresh row
-          const insertPayload = {
-            name: fullName,
-            first_name: data.firstName ?? null,
-            email: data.email,
-            phone: null,
-            store_id: storeId ?? null,
-            traits: { tags: accumulatedTagsRef.current },
-            last_active: new Date().toISOString(),
-          };
+            };
+            flowLog(
+              "DB_WRITE customers — insert (new phone customer)",
+              insertPayload,
+              "db_write",
+              "customers",
+            );
 
+            const { data: newCustomer, error: insertError } = await (
+              supabase as any
+            )
+              .from("customers")
+              .insert(insertPayload)
+              .select("id")
+              .single();
+
+            if (insertError || !newCustomer) {
+              flowLog(
+                "CUSTOMER_INSERT_ERROR",
+                { error: insertError?.message },
+                "error",
+              );
+              return {
+                error:
+                  "We couldn't save your details at this time. Please try again.",
+              };
+            }
+
+            cid = newCustomer.id;
+            flowLog("CUSTOMER_SAVED", {
+              customerId: cid,
+              method: "insert_phone",
+            });
+
+            // Patch email separately by primary key
+            if (data.email) {
+              (supabase as any)
+                .from("customers")
+                .update({ email: data.email })
+                .eq("id", cid)
+                .then(({ error: emailErr }: { error: any }) => {
+                  if (emailErr) {
+                    flowLog(
+                      "CUSTOMER_EMAIL_PATCH_ERROR",
+                      { error: emailErr.message },
+                      "error",
+                    );
+                  } else {
+                    flowLog("CUSTOMER_EMAIL_PATCHED", { customerId: cid });
+                  }
+                });
+            }
+          }
+
+          saveCustomerLocally({
+            id: cid,
+            name: fullName,
+            firstname: data.firstName ?? null,
+            email: data.email ?? null,
+            phone: data.phone ?? null,
+          });
+          flowLog("LOCALSTORAGE_WRITE", {
+            key: "mirour:customertoken + mirour:customer:profile",
+            cid,
+          });
+
+          customerIdRef.current = cid;
+          setCustomerId(cid);
+
+          // ── Path 3: Email only (no phone) — safe select then insert/update ──────────
+        } else if (data.email) {
           flowLog(
-            "DB_WRITE customers — insert (new email customer)",
-            insertPayload,
-            "db_write",
+            "DB_READ customers — lookup by email",
+            { email: data.email, storeId },
+            "db_read",
             "customers",
           );
 
-          const { data: newCustomer, error: insertError } = await (
-            supabase as any
-          )
+          // Step 1: Find existing customer by email
+          let query = (supabase as any)
             .from("customers")
-            .insert(insertPayload)
             .select("id")
-            .single();
+            .eq("email", data.email);
+          if (storeId) {
+            query = query.eq("store_id", storeId);
+          } else {
+            query = query.is("store_id", null); // ← must be explicit
+          }
 
-          if (insertError || !newCustomer) {
+          const { data: existing, error: lookupError } =
+            await query.maybeSingle();
+
+          if (lookupError) {
             flowLog(
-              "CUSTOMER_INSERT_ERROR",
-              { error: insertError?.message },
+              "CUSTOMER_LOOKUP_ERROR",
+              { error: lookupError.message },
               "error",
             );
             return {
               error:
-                "We couldn't save your details at this time. Please try again.",
+                "We encountered an issue verifying your email address. Please try again.",
             };
           }
 
-          cid = newCustomer.id;
-          flowLog("CUSTOMER_SAVED", {
-            customerId: cid,
-            method: "insert_email",
+          if (existing) {
+            // Step 2a: Found — UPDATE by primary key
+            cid = existing.id;
+            flowLog("CUSTOMER_FOUND", {
+              customerId: cid,
+              method: "email_lookup",
+            });
+
+            (supabase as any)
+              .from("customers")
+              .update({
+                ...(fullName ? { name: fullName } : {}),
+                ...(data.firstName ? { first_name: data.firstName } : {}),
+                traits: { tags: accumulatedTagsRef.current },
+                last_active: new Date().toISOString(),
+              })
+              .eq("id", cid)
+              .then(({ error: updateErr }: { error: any }) => {
+                if (updateErr) {
+                  flowLog(
+                    "CUSTOMER_UPDATE_ERROR",
+                    { error: updateErr.message },
+                    "error",
+                  );
+                } else {
+                  flowLog("CUSTOMER_UPDATED", { customerId: cid });
+                }
+              });
+          } else {
+            // Step 2b: Not found — INSERT fresh row
+            const insertPayload = {
+              name: fullName,
+              first_name: data.firstName ?? null,
+              email: data.email,
+              phone: null,
+              store_id: storeId ?? null,
+              traits: { tags: accumulatedTagsRef.current },
+              last_active: new Date().toISOString(),
+            };
+
+            flowLog(
+              "DB_WRITE customers — insert (new email customer)",
+              insertPayload,
+              "db_write",
+              "customers",
+            );
+
+            const { data: newCustomer, error: insertError } = await (
+              supabase as any
+            )
+              .from("customers")
+              .insert(insertPayload)
+              .select("id")
+              .single();
+
+            if (insertError || !newCustomer) {
+              flowLog(
+                "CUSTOMER_INSERT_ERROR",
+                { error: insertError?.message },
+                "error",
+              );
+              return {
+                error:
+                  "We couldn't save your details at this time. Please try again.",
+              };
+            }
+
+            cid = newCustomer.id;
+            flowLog("CUSTOMER_SAVED", {
+              customerId: cid,
+              method: "insert_email",
+            });
+          }
+
+          saveCustomerLocally({
+            id: cid,
+            name: fullName,
+            firstname: data.firstName ?? null,
+            email: data.email,
+            phone: null,
           });
+
+          flowLog("LOCALSTORAGE_WRITE", {
+            key: "mirour:customertoken + mirour:customer:profile",
+            cid,
+          });
+
+          customerIdRef.current = cid;
+          setCustomerId(cid);
+        } else {
+          // Fallback if neither email nor phone is provided but somehow passed validation
+          return {
+            error: "Please provide either an email address or a phone number.",
+          };
         }
 
-        saveCustomerLocally({
-          id: cid,
-          name: fullName,
-          firstname: data.firstName ?? null,
-          email: data.email,
-          phone: null,
-        });
-
-        flowLog("LOCALSTORAGE_WRITE", {
-          key: "mirour:customertoken + mirour:customer:profile",
-          cid,
-        });
-
-        customerIdRef.current = cid;
-        setCustomerId(cid);
-      } else {
-        // Fallback if neither email nor phone is provided but somehow passed validation
-        return {
-          error: "Please provide either an email address or a phone number.",
-        };
-      }
-
-      // ── Backfill session — runs for all 3 paths ────────────────────────
-      if (sessionId) {
-        flowLog(
-          "DB_WRITE flow_sessions — backfill customer_id post-contact",
-          { sessionId, customerId: cid },
-          "db_write",
-          "flow_sessions",
-        );
-        const { error: sessionCustErr } = await (supabase as any)
-          .from("flow_sessions")
-          .update({ customer_id: cid })
-          .eq("id", sessionId);
-        if (sessionCustErr) {
+        // ── Backfill session — runs for all 3 paths ────────────────────────
+        if (sessionId) {
           flowLog(
-            "SESSION_UPDATE_ERROR",
-            { field: "customer_id", error: sessionCustErr.message },
-            "error",
+            "DB_WRITE flow_sessions — backfill customer_id post-contact",
+            { sessionId, customerId: cid },
+            "db_write",
+            "flow_sessions",
           );
+          const { error: sessionCustErr } = await (supabase as any)
+            .from("flow_sessions")
+            .update({ customer_id: cid })
+            .eq("id", sessionId);
+          if (sessionCustErr) {
+            flowLog(
+              "SESSION_UPDATE_ERROR",
+              { field: "customer_id", error: sessionCustErr.message },
+              "error",
+            );
+          }
         }
-      }
 
-      // ── Commit response ────────────────────────────────────────────────
-      const responseId = await commitResponse(cid, data);
-      if (!responseId) {
-        return { error: "We couldn't submit your response. Please try again." };
-      }
+        // ── Patch already-committed response if identity switched ──────────
+        // The anon client cannot UPDATE responses (RLS only allows INSERT for anon).
+        // Calling supabase.from("responses").update() silently succeeds with 0 rows.
+        // We must call the server-side route that uses the service-role key.
+        const existingResponseId = responseIdRef.current;
+        if (existingResponseId) {
+          const fullName =
+            [data.firstName, data.lastName].filter(Boolean).join(" ") || null;
+          flowLog(
+            "RESPONSE_IDENTITY_PATCH",
+            { responseId: existingResponseId, newCustomerId: cid },
+            "db_write",
+            "responses",
+          );
+          const patchRes = await fetch("/api/responses/patch-identity", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              responseId: existingResponseId,
+              customerId: cid,
+              customerName: fullName,
+              customerEmail: data.email ?? null,
+              customerPhone: data.phone ?? null,
+            }),
+          });
+          if (!patchRes.ok) {
+            const patchBody = await patchRes.json().catch(() => ({}));
+            flowLog(
+              "RESPONSE_IDENTITY_PATCH_ERROR",
+              {
+                responseId: existingResponseId,
+                status: patchRes.status,
+                error: patchBody?.error,
+              },
+              "error",
+            );
+          }
+        }
 
-      flowLog("CONTACT_SUBMIT_SUCCESS", {
-        responseId,
-        customerId: cid,
-        sessionId,
-      });
-      return { error: null };
-    } catch (err: any) {
-      flowLog(
-        "CONTACT_SUBMIT_FATAL_ERROR",
-        { error: err?.message || err },
-        "error",
-      );
-      return {
-        error:
-          "An unexpected error occurred while saving your information. Please try again.",
-      };
-    } finally {
-      setIsSubmitting(false);
-    }
-  },
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  [commitResponse, storeId, isPreview],
-);
+        // ── Commit response ────────────────────────────────────────────────
+        const responseId = await commitResponse(cid, data);
+        if (!responseId) {
+          return {
+            error: "We couldn't submit your response. Please try again.",
+          };
+        }
+        fetch("/api/integrations/dispatch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            formId: formId, // Make sure you pass formId here!
+            customerData: data,
+          }),
+        }).catch((err) => console.error("Integration dispatcher failed:", err));
+
+        flowLog("CONTACT_SUBMIT_SUCCESS", {
+          responseId,
+          customerId: cid,
+          sessionId,
+        });
+        return { error: null };
+      } catch (err: any) {
+        flowLog(
+          "CONTACT_SUBMIT_FATAL_ERROR",
+          { error: err?.message || err },
+          "error",
+        );
+        return {
+          error:
+            "An unexpected error occurred while saving your information. Please try again.",
+        };
+      } finally {
+        setIsSubmitting(false);
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [commitResponse, storeId, isPreview],
+  );
   // ── Reset ──────────────────────────────────────────────────────────────────
 
   const reset = useCallback(() => {
@@ -1029,7 +1158,22 @@ const submitContact = useCallback(
     customerIdRef.current = null;
     sessionCompletedRef.current = false;
     analyticsSessionIdRef.current = null;
+    // These two must also be cleared on reset — otherwise a "Start Over" after
+    // a successful commit leaves the commit lock raised (isCommittingRef) and
+    // reuses the old redemption code, both of which break the next session.
+    isCommittingRef.current = false;
+    sessionRedemptionCodeRef.current = null;
   }, [flow.steps, formId]);
+
+  // ── Clear identity ("Not me?" switch) ────────────────────────────────────
+  // Clears the in-memory customer reference so the next submitContact call
+  // goes through the full phone/email lookup path instead of Path 1 (skip-upsert).
+  // Does NOT reset the flow steps, answers, or session.
+  const clearCustomerId = useCallback(() => {
+    flowLog("IDENTITY_CLEARED", { previous: customerIdRef.current }, "warn");
+    customerIdRef.current = null;
+    setCustomerId(null);
+  }, []);
 
   // ── Return ─────────────────────────────────────────────────────────────────
 
@@ -1053,6 +1197,7 @@ const submitContact = useCallback(
     goBack,
     goToStep,
     submitContact,
+    clearCustomerId,
     reset,
   };
 }

@@ -6,14 +6,11 @@ import {
   Mail,
   Phone,
   Calendar,
-  MapPin,
   ShoppingBag,
   Edit2,
   Check,
   X,
   Tag,
-  RefreshCw,
-  Timer,
 } from "lucide-react";
 import { useState, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
@@ -24,7 +21,6 @@ import { CustomerFormSubmissions } from "./CustomerFormSubmissions";
 
 type ResponderProfileProps = {
   userId: string;
-  // forms: DashboardForm[]; <-- REMOVED: No longer needed!
   onBack: () => void;
   onNavigateToResponse: (formId: string, searchQuery: string) => void;
   onUpdateCustomerInfo: (
@@ -63,10 +59,7 @@ export function ResponderProfile({
   useEffect(() => {
     const fetchCustomer = async () => {
       const isUUID = /^[0-9a-f-]{36}$/i.test(userId);
-      let query: any = supabase
-        .from("customers")
-        .select("*")
-        .limit(1);
+      let query: any = supabase.from("customers").select("*").limit(1);
 
       if (isUUID) {
         query = query.eq("id", userId);
@@ -122,8 +115,6 @@ export function ResponderProfile({
             .limit(50)) as any;
 
           if (sessionsData) setFlowSessions(sessionsData);
-
-          // REMOVED: storeProducts, storeZones, locationJourneys (unused in UI)
         }
       }
     };
@@ -155,7 +146,7 @@ export function ResponderProfile({
   let statusClasses = "bg-amber-500";
 
   if (totalSubmissions >= 5) {
-    status = "VIP";
+    status = "Repeat";
     statusClasses = "bg-gradient-to-r from-primary to-primary/70";
   } else if (totalSubmissions >= 3) {
     status = "Regular";
@@ -216,11 +207,9 @@ export function ResponderProfile({
         <div className="flex items-start justify-between mb-6">
           <div className="flex items-center gap-4">
             <div className="w-20 h-20 bg-secondary rounded-full flex items-center justify-center border border-primary/20 overflow-hidden shadow-sm">
-              <img
-                src={`https://api.dicebear.com/9.x/glass/svg?seed=${encodeURIComponent(userName || userEmail || userPhone || userId)}`}
-                alt="Profile Avatar"
-                className="w-full h-full object-cover"
-              />
+              <p>
+                {userName.charAt(0).toUpperCase()}
+              </p>
             </div>
             <div>
               <h1 className="text-2xl font-semibold text-foreground mb-2">
@@ -340,7 +329,8 @@ export function ResponderProfile({
 
       {/* Stats Grid */}
       <div className="space-y-4">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {/* Updated Grid for 2 items instead of 4 */}
+        <div className="grid grid-cols-2 md:grid-cols-2 gap-4">
           <div className="bg-card rounded-2xl shadow-lg border border-border p-6">
             <div className="flex items-center gap-2 mb-2">
               <Calendar className="w-5 h-5 text-primary" />
@@ -348,26 +338,6 @@ export function ResponderProfile({
             </div>
             <p className="text-3xl font-semibold text-primary">
               {totalSubmissions}
-            </p>
-          </div>
-          <div className="bg-card rounded-2xl shadow-lg border border-border p-6 flex flex-col justify-center">
-            <div className="flex items-center gap-2 mb-2">
-              <RefreshCw className="w-5 h-5 text-blue-500" />
-              <p className="text-sm text-muted-foreground">Visitor Status</p>
-            </div>
-            <p className="text-xl font-semibold text-blue-500">
-              {customerRecord?.visit_count > 1 || flowSessions.length > 1
-                ? "Returning Visitor"
-                : "New Visitor"}
-            </p>
-          </div>
-          <div className="bg-card rounded-2xl shadow-lg border border-border p-6 flex flex-col justify-center">
-            <div className="flex items-center gap-2 mb-2">
-              <Timer className="w-5 h-5 text-purple-500" />
-              <p className="text-sm text-muted-foreground">Flow Sessions</p>
-            </div>
-            <p className="text-xl font-semibold text-purple-500">
-              {flowSessions.length}
             </p>
           </div>
 
@@ -385,8 +355,6 @@ export function ResponderProfile({
             </div>
           )}
         </div>
-
-        <div className="grid grid-cols-2 md:grid-cols-2 gap-4"></div>
       </div>
 
       {/* Saved Items */}

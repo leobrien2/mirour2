@@ -31,13 +31,16 @@ import {
 
 type Tab = "activity" | "localstorage" | "sessionstorage" | "db";
 
-const LEVEL_COLORS: Record<LogLevel, { bg: string; text: string; label: string }> = {
-  info:     { bg: "#1e2d5a", text: "#8b9cf4", label: "INFO" },
+const LEVEL_COLORS: Record<
+  LogLevel,
+  { bg: string; text: string; label: string }
+> = {
+  info: { bg: "#1e2d5a", text: "#8b9cf4", label: "INFO" },
   db_write: { bg: "#3a1a1a", text: "#e05e5e", label: "DB_WRITE" },
-  db_read:  { bg: "#0f2233", text: "#5eb6e0", label: "DB_READ" },
-  nav:      { bg: "#0f2d1e", text: "#5ee09a", label: "NAV" },
-  error:    { bg: "#3a1e1a", text: "#e07c5e", label: "ERROR" },
-  warn:     { bg: "#2f2500", text: "#e0c85e", label: "WARN" },
+  db_read: { bg: "#0f2233", text: "#5eb6e0", label: "DB_READ" },
+  nav: { bg: "#0f2d1e", text: "#5ee09a", label: "NAV" },
+  error: { bg: "#3a1e1a", text: "#e07c5e", label: "ERROR" },
+  warn: { bg: "#2f2500", text: "#e0c85e", label: "WARN" },
 };
 
 function getStorage(type: "local" | "session"): Record<string, string> {
@@ -112,7 +115,11 @@ function LogEntry({ entry }: { entry: FlowLogEntry }) {
         <button
           onClick={() =>
             copyToClipboard(
-              JSON.stringify({ event: entry.event, payload: entry.payload }, null, 2),
+              JSON.stringify(
+                { event: entry.event, payload: entry.payload },
+                null,
+                2,
+              ),
             )
           }
           className="shrink-0 opacity-0 group-hover:opacity-50 hover:!opacity-100 text-[#6b7280] transition-all"
@@ -194,7 +201,9 @@ function StorageTab({ type }: { type: "local" | "session" }) {
 }
 
 function DbTab({ entries }: { entries: FlowLogEntry[] }) {
-  const dbEntries = entries.filter((e) => e.level === "db_write" || e.level === "db_read");
+  const dbEntries = entries.filter(
+    (e) => e.level === "db_write" || e.level === "db_read",
+  );
 
   // Group by table
   const grouped: Record<string, FlowLogEntry[]> = {};
@@ -277,7 +286,9 @@ export function DevConsole() {
     ? entries.filter(
         (e) =>
           e.event.toLowerCase().includes(search.toLowerCase()) ||
-          JSON.stringify(e.payload ?? "").toLowerCase().includes(search.toLowerCase()),
+          JSON.stringify(e.payload ?? "")
+            .toLowerCase()
+            .includes(search.toLowerCase()),
       )
     : entries;
 
@@ -316,8 +327,10 @@ export function DevConsole() {
   // ── Panel ───────────────────────────────────────────────────────────────────
   return (
     <div
-      className="fixed inset-0 z-[9999] flex flex-col bg-[#060b14] text-white"
-      style={{ fontFamily: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace" }}
+      className="fixed inset-30 z-[9999] flex flex-col bg-[#060b14] text-white"
+      style={{
+        fontFamily: "'JetBrains Mono', 'Fira Code', 'Courier New', monospace",
+      }}
     >
       {/* ── Header ── */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-[#1e2a3f] bg-[#080d18] shrink-0">
@@ -335,7 +348,11 @@ export function DevConsole() {
             [
               { id: "activity", icon: Activity, label: "Activity" },
               { id: "localstorage", icon: HardDrive, label: "LocalStorage" },
-              { id: "sessionstorage", icon: HardDrive, label: "SessionStorage" },
+              {
+                id: "sessionstorage",
+                icon: HardDrive,
+                label: "SessionStorage",
+              },
               { id: "db", icon: Database, label: "DB Ops" },
             ] as { id: Tab; icon: any; label: string }[]
           ).map(({ id, icon: Icon, label }) => (
@@ -352,7 +369,11 @@ export function DevConsole() {
               {label}
               {id === "db" && (
                 <span className="text-[9px] px-1 rounded bg-[#3a1a1a] text-[#e05e5e]">
-                  {entries.filter((e) => e.level === "db_write" || e.level === "db_read").length}
+                  {
+                    entries.filter(
+                      (e) => e.level === "db_write" || e.level === "db_read",
+                    ).length
+                  }
                 </span>
               )}
             </button>
@@ -438,7 +459,9 @@ export function DevConsole() {
               bottomRef.current?.scrollIntoView({ behavior: "smooth" });
             }}
             className={`text-[10px] font-mono transition-colors ${
-              autoScroll ? "text-[#5ee09a]" : "text-[#4b5563] hover:text-[#9ca3af]"
+              autoScroll
+                ? "text-[#5ee09a]"
+                : "text-[#4b5563] hover:text-[#9ca3af]"
             }`}
           >
             {autoScroll ? "↓ auto-scroll on" : "↓ click to resume"}

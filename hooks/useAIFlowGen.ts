@@ -3,17 +3,23 @@
 
 import { useState, useCallback, useRef } from "react";
 import type { CanvasFlow } from "@/types/canvas";
+import { supabase } from "@/integrations/supabase/client";
 
 export type AIMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  generatedFlow?: CanvasFlow; // set when AI returns a flow
+  generatedFlow?: CanvasFlow;
+  tagsSummary?: string;
 };
 
 export type AIGenState = "idle" | "loading" | "error";
 
-export function useAIFlowGen() {
+interface UseAIFlowGenOptions {
+  storeId?: string;
+}
+
+export function useAIFlowGen({ storeId }: UseAIFlowGenOptions = {}) {
   const [messages, setMessages] = useState<AIMessage[]>([]);
   const [state, setState] = useState<AIGenState>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -35,35 +41,58 @@ export function useAIFlowGen() {
 
       abortRef.current = new AbortController();
 
-      // Build message history in OpenAI/Mistral format
+      // Build compact message history (avoid sending full JSON back)
       const apiMessages = [...messages, userMsg].map((m) => ({
         role: m.role,
         content:
           m.role === "assistant" && m.generatedFlow
-            ? `[Generated flow: ${m.generatedFlow.name}]` // Compact for context
+            ? `[Previously generated flow: "${m.generatedFlow.name}" with ${m.generatedFlow.steps.length} steps]`
             : m.content,
       }));
+
+      const { data: user } = await supabase.auth.getUser();
+
+      console.log("user", user);
+      const owner_id = user?.user?.id;
 
       try {
         const res = await fetch("/api/ai/generate-flow", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: apiMessages }),
+          body: JSON.stringify({ messages: apiMessages, storeId, owner_id }),
           signal: abortRef.current.signal,
         });
 
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error ?? `HTTP ${res.status}`);
+        }
 
         const data = await res.json();
+
+        const isFlow = data.type === "flow";
+        const flow = isFlow ? (data.data as CanvasFlow) : undefined;
+
+        const outcomeSteps = flow
+          ? flow.steps.filter((s) => {
+              const hasSelect = s.blocks?.some(
+                (b: any) => b.data?.type === "select",
+              );
+              const hasContact = s.blocks?.some(
+                (b: any) => b.data?.type === "contact",
+              );
+              return !s.nextStepId && !hasSelect && !hasContact;
+            }).length
+          : 0;
 
         const assistantMsg: AIMessage = {
           id: crypto.randomUUID(),
           role: "assistant",
-          content:
-            data.type === "question"
-              ? data.content
-              : `I've created **${data.data?.name ?? "your flow"}** with ${data.data?.steps?.length ?? 0} steps. Click "Apply to Canvas" to load it.`,
-          generatedFlow: data.type === "flow" ? data.data : undefined,
+          content: isFlow
+            ? `I've built **${flow!.name}** — ${flow!.steps.length} steps${outcomeSteps > 0 ? `, ${outcomeSteps} outcome${outcomeSteps !== 1 ? "s" : ""}` : ""}. Review the preview below, then click **Apply to Canvas**.`
+            : data.content,
+          generatedFlow: flow,
+          tagsSummary: data.tagsSummary,
         };
 
         setMessages((prev) => [...prev, assistantMsg]);
@@ -74,7 +103,7 @@ export function useAIFlowGen() {
         setState("error");
       }
     },
-    [messages, state],
+    [messages, state, storeId],
   );
 
   const reset = useCallback(() => {

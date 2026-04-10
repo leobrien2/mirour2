@@ -1,7 +1,7 @@
 // components/flow/FloatingProfileBar.tsx
 "use client";
 
-import { Bookmark, User, ChevronUp } from "lucide-react";
+import { User, LogIn } from "lucide-react";
 import type { LocalCustomerProfile } from "@/lib/customerSession";
 
 interface FloatingProfileBarProps {
@@ -18,49 +18,40 @@ export function FloatingProfileBar({
   const isLoggedIn = !!customer;
   const displayName = customer?.firstname ?? customer?.name?.split(" ")[0];
 
+  // ── Not logged in → compact "Login" pill ─────────────────────────────────
+  if (!isLoggedIn) {
+    return (
+      <button
+        onClick={onClick}
+        className="fixed top-4 right-4 z-30 flex items-center gap-1.5 px-4 py-2 rounded-full
+          bg-background/95 backdrop-blur-md border border-border shadow-md
+          hover:shadow-lg hover:border-primary/30 transition-all duration-200 active:scale-[0.97]"
+      >
+        <LogIn className="w-3.5 h-3.5 text-muted-foreground/60" />
+        <span className="text-sm font-semibold text-foreground/80">Login</span>
+      </button>
+    );
+  }
+
+  // ── Logged in → name + saved count badge ─────────────────────────────────
   return (
     <button
       onClick={onClick}
-      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-3 px-5 py-3 rounded-full bg-background/95 backdrop-blur-md border border-border shadow-lg hover:shadow-xl hover:border-primary/30 transition-all duration-200 active:scale-[0.97] max-w-xs w-auto"
+      className="fixed top-4 right-4 z-30 flex items-center gap-2 px-3 py-2 rounded-full
+        bg-background/95 backdrop-blur-md border border-border shadow-md
+        hover:shadow-lg hover:border-primary/30 transition-all duration-200 active:scale-[0.97]"
     >
-      {/* Left: user/identity indicator */}
-      <div className="flex items-center gap-2">
-        <div
-          className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
-            isLoggedIn
-              ? "bg-primary/10 text-primary"
-              : "bg-muted text-muted-foreground/50"
-          }`}
-        >
-          <User className="w-3.5 h-3.5" />
-        </div>
-        <span className="text-sm font-semibold text-foreground">
-          {isLoggedIn ? `Hi, ${displayName}` : "Your profile"}
-        </span>
+      <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+        <User className="w-3 h-3 text-primary" />
       </div>
-
-      {/* Divider */}
-      <div className="w-px h-4 bg-border/60" />
-
-      {/* Right: saved items count */}
-      {/* <div className="flex items-center gap-1.5">
-        <Bookmark
-          className={`w-3.5 h-3.5 transition-colors ${
-            savedCount > 0
-              ? "text-primary fill-primary/20"
-              : "text-muted-foreground/40"
-          }`}
-        />
-        <span
-          className={`text-xs font-bold ${
-            savedCount > 0 ? "text-primary" : "text-muted-foreground/50"
-          }`}
-        >
-          {savedCount > 0 ? savedCount : "0"} saved
+      <span className="text-sm font-semibold text-foreground max-w-[80px] truncate">
+        {displayName}
+      </span>
+      {savedCount > 0 && (
+        <span className="flex items-center justify-center w-5 h-5 rounded-full bg-primary text-primary-foreground text-[10px] font-bold shrink-0 leading-none">
+          {savedCount > 9 ? "9+" : savedCount}
         </span>
-      </div> */}
-
-      <ChevronUp className="w-3.5 h-3.5 text-muted-foreground/40 ml-1" />
+      )}
     </button>
   );
 }

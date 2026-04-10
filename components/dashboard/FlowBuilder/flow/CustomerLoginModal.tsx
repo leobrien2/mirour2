@@ -5,30 +5,22 @@ import {
   X,
   Phone,
   Loader2,
-  CheckCircle2,
-  Bookmark,
-  FileText,
+  Heart,
   ShoppingBag,
   Trash2,
   User,
-  Clock,
   LogOut,
-  Pencil,
-  Check,
-  Mail,
+  ExternalLink,
+  HeartOffIcon,
+  HeartIcon,
 } from "lucide-react";
-import {
-  lookupCustomerByPhone,
-  getCustomerHistory,
-  type CustomerHistory,
-} from "@/services/customerLookup";
+import { lookupCustomerByPhone, createCustomer } from "@/services/customerLookup";
 import {
   saveCustomerLocally,
   getLocalCustomer,
   type LocalCustomerProfile,
   clearCustomerLocally,
 } from "@/lib/customerSession";
-import { supabase } from "@/integrations/supabase/client";
 import type { SavedItem } from "@/types/mirour";
 
 interface CustomerProfileDrawerProps {
@@ -42,8 +34,111 @@ interface CustomerProfileDrawerProps {
   allProducts?: any[];
 }
 
-type DrawerPhase = "login" | "profile";
-type ProfileTab = "saved" | "history" | "account"; // ← ADD account tab
+type DrawerPhase = "login" | "profile" | "signup";
+
+// Extracted component to handle individual "Read more" state
+// Extracted component to handle individual "Read more" state
+function SavedProductCard({
+  item,
+  isRemoving,
+  onRemove,
+}: {
+  item: any;
+  isRemoving: boolean;
+  onRemove: (id: string) => void;
+}) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const p = item._product;
+  const imgSrc = p?.image_url ?? p?.imageurl;
+
+  return (
+    <div
+      className={`flex flex-col rounded-2xl border border-border/40 bg-card overflow-hidden transition-all duration-200 ${
+        isRemoving
+          ? "opacity-40 scale-[0.97]"
+          : "active:scale-[0.99] active:border-border/60" // Replaced hover with active for mobile tap feedback
+      }`}
+    >
+      {/* Image */}
+      <div className="relative w-full aspect-square bg-muted overflow-hidden shrink-0">
+        {imgSrc ? (
+          <img
+            src={imgSrc}
+            alt={p?.name ?? ""}
+            className="w-full h-full object-cover"
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <ShoppingBag className="w-8 h-8 text-muted-foreground/20" />
+          </div>
+        )}
+
+        {/* Mobile-optimized remove button */}
+        <button
+          onClick={(e) => {
+            e.preventDefault();
+            onRemove(item.product_id);
+          }}
+          disabled={isRemoving}
+          aria-label="Remove from favorites"
+          className={`
+    absolute top-2 right-2 w-8 h-8 rounded-full flex items-center justify-center
+    shadow-sm border transition-all active:scale-90
+    bg-primary text-primary-foreground border-primary
+    disabled:opacity-70
+  `}
+        >
+          {isRemoving ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <Heart className="w-3.5 h-3.5 fill-current" />
+          )}
+        </button>
+      </div>
+
+      {/* Details */}
+      <div className="flex flex-col flex-1 p-3 gap-1">
+        {/* Name */}
+        <p className="text-xs font-bold text-foreground leading-snug line-clamp-2">
+          {p?.name ?? "Product"}
+        </p>
+
+        {/* SKU */}
+        {p?.sku && (
+          <p className="text-[10px] text-muted-foreground/50 font-mono truncate">
+            {p.sku}
+          </p>
+        )}
+
+        {/* Description with Read More toggle */}
+        {p?.description && (
+          <div className="flex flex-col gap-1 mt-0.5">
+            <p
+              className={`text-[11px] text-muted-foreground/60 leading-relaxed transition-all duration-300 ease-in-out ${
+                isExpanded ? "line-clamp-none" : "line-clamp-2"
+              }`}
+            >
+              {p.description}
+            </p>
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation(); // Prevents parent clicks
+                setIsExpanded(!isExpanded);
+              }}
+              className="text-[10px] font-bold text-primary self-start active:opacity-70 active:scale-95 transition-all py-1"
+            >
+              {isExpanded ? "Show less" : "Read more"}
+            </button>
+          </div>
+        )}
+
+        {/* Spacer pushes CTA to bottom */}
+        <div className="flex-1" />
+      </div>
+    </div>
+  );
+}
 
 export function CustomerProfileDrawer({
   open,
@@ -58,33 +153,16 @@ export function CustomerProfileDrawer({
   const [phase, setPhase] = useState<DrawerPhase>(
     customerId ? "profile" : "login",
   );
-  const [activeTab, setActiveTab] = useState<ProfileTab>("saved");
-
-  // ── Login state ────────────────────────────────────────────────────────────
   const [phone, setPhone] = useState("");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
+  const [signUpLoading, setSignUpLoading] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
-
-  // ── Profile state ──────────────────────────────────────────────────────────
   const [localCustomer, setLocalCustomer] =
     useState<LocalCustomerProfile | null>(null);
-  const [history, setHistory] = useState<CustomerHistory | null>(null);
-  const [historyLoading, setHistoryLoading] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
 
-  // ── Edit profile state ─────────────────────────────────────────────────────
-  const [isEditing, setIsEditing] = useState(false);
-  const [editFields, setEditFields] = useState({
-    firstName: "",
-    lastName: "",
-    email: "",
-    phone: "",
-  });
-  const [editSaving, setEditSaving] = useState(false);
-  const [editError, setEditError] = useState<string | null>(null);
-  const [editSuccess, setEditSuccess] = useState(false);
-
-  // ── Sync phase when customerId changes externally ──────────────────────────
   useEffect(() => {
     if (customerId) {
       setPhase("profile");
@@ -95,44 +173,34 @@ export function CustomerProfileDrawer({
     }
   }, [customerId]);
 
-  // ── Load history when profile phase becomes active ─────────────────────────
-  useEffect(() => {
-    if (phase !== "profile" || !customerId || history) return;
-    setHistoryLoading(true);
-    getCustomerHistory(customerId)
-      .then(setHistory)
-      .catch(console.error)
-      .finally(() => setHistoryLoading(false));
-  }, [phase, customerId, history]);
-
-  // ── Seed edit fields when switching to account tab ────────────────────────
-  useEffect(() => {
-    if (activeTab === "account" && localCustomer) {
-      const nameParts = localCustomer.name?.split(" ") ?? [];
-      setEditFields({
-        firstName: localCustomer.firstname ?? nameParts[0] ?? "",
-        lastName: nameParts.slice(1).join(" ") ?? "",
-        email: localCustomer.email ?? "",
-        phone: localCustomer.phone ?? "",
-      });
-      setIsEditing(false);
-      setEditError(null);
-      setEditSuccess(false);
-    }
-  }, [activeTab, localCustomer]);
-
-  // ── Reset on close ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (!open) {
       const t = setTimeout(() => {
         setPhone("");
+        setName("");
+        setEmail("");
         setLoginError(null);
+        if (!customerId) setPhase("login");
       }, 300);
       return () => clearTimeout(t);
     }
+  }, [open, customerId]);
+
+  useEffect(() => {
+    document.body.style.overflow = open ? "hidden" : "";
+    return () => {
+      document.body.style.overflow = "";
+    };
   }, [open]);
 
-  // ── Handlers ───────────────────────────────────────────────────────────────
+  // Escape key to close
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && open) onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [open, onClose]);
 
   const handleLogin = async () => {
     if (!phone.trim()) return;
@@ -141,29 +209,56 @@ export function CustomerProfileDrawer({
     try {
       const customer = await lookupCustomerByPhone(phone);
       if (!customer) {
-        setLoginError(
-          "No account found with this number. Try the phone you used in the quiz.",
-        );
+        setPhase("signup");
         return;
       }
       saveCustomerLocally(customer);
       setLocalCustomer(customer);
       setPhase("profile");
       onLogin(customer);
-    } catch {
+    } catch (error) {
+      console.error("Login error:", error);
       setLoginError("Something went wrong. Please try again.");
     } finally {
       setLoginLoading(false);
     }
   };
 
+  const handleSignUp = async () => {
+    if (!phone.trim() || !name.trim()) {
+      setLoginError("Please provide your name and phone number.");
+      return;
+    }
+    setSignUpLoading(true);
+    setLoginError(null);
+    try {
+      const customer = await createCustomer({
+        phone: phone.trim(),
+        name: name.trim(),
+        email: email.trim() || undefined,
+        first_name: name.trim().split(" ")[0]
+      });
+      if (!customer) {
+        setLoginError("Failed to create account. Please try again.");
+        return;
+      }
+      saveCustomerLocally(customer);
+      setLocalCustomer(customer);
+      setPhase("profile");
+      onLogin(customer);
+    } catch (error) {
+      console.error("Signup error:", error);
+      setLoginError("Something went wrong. Please try again.");
+    } finally {
+      setSignUpLoading(false);
+    }
+  };
+
   const handleLogout = () => {
     clearCustomerLocally();
     setLocalCustomer(null);
-    setHistory(null);
     setPhone("");
     setLoginError(null);
-    setIsEditing(false);
     setPhase("login");
     onLogout();
   };
@@ -174,70 +269,6 @@ export function CustomerProfileDrawer({
     setRemovingId(null);
   };
 
-  const handleSaveProfile = async () => {
-    if (!customerId || !localCustomer) return;
-    setEditSaving(true);
-    setEditError(null);
-    setEditSuccess(false);
-
-    try {
-      const fullName =
-        [editFields.firstName, editFields.lastName].filter(Boolean).join(" ") ||
-        null;
-
-      const { error } = await (supabase as any)
-        .from("customers")
-        .update({
-          name: fullName,
-          first_name: editFields.firstName || null,
-          email: editFields.email || null,
-          phone: editFields.phone || null,
-          last_active: new Date().toISOString(),
-        })
-        .eq("id", customerId);
-
-      if (error) {
-        setEditError(error.message ?? "Failed to save changes.");
-        return;
-      }
-
-      // Update localStorage immediately
-      const updated: LocalCustomerProfile = {
-        ...localCustomer,
-        name: fullName,
-        firstname: editFields.firstName || null,
-        email: editFields.email || null,
-        phone: editFields.phone || null,
-      };
-      saveCustomerLocally(updated);
-      setLocalCustomer(updated);
-      setEditSuccess(true);
-      setIsEditing(false);
-
-      // Flash success for 2s
-      setTimeout(() => setEditSuccess(false), 2000);
-    } catch (err: any) {
-      setEditError(err?.message ?? "An unexpected error occurred.");
-    } finally {
-      setEditSaving(false);
-    }
-  };
-
-  const handleCancelEdit = () => {
-    if (!localCustomer) return;
-    const nameParts = localCustomer.name?.split(" ") ?? [];
-    setEditFields({
-      firstName: localCustomer.firstname ?? nameParts[0] ?? "",
-      lastName: nameParts.slice(1).join(" ") ?? "",
-      email: localCustomer.email ?? "",
-      phone: localCustomer.phone ?? "",
-    });
-    setEditError(null);
-    setIsEditing(false);
-  };
-
-  // ── Derived ────────────────────────────────────────────────────────────────
-
   const enrichedSavedItems = savedItems.map((item) => ({
     ...item,
     _product:
@@ -245,537 +276,268 @@ export function CustomerProfileDrawer({
       allProducts.find((p) => p.id === item.product_id),
   }));
 
-  const allSavedItems = history?.savedItems.length
-    ? history.savedItems.map((item: any) => ({
-        ...item,
-        _product:
-          item.products ??
-          allProducts.find((p: any) => p.id === item.product_id),
-      }))
-    : enrichedSavedItems;
-
   const displayName =
     localCustomer?.firstname ??
     localCustomer?.name?.split(" ")[0] ??
     localCustomer?.email?.split("@")[0] ??
     "there";
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  if (!open) return null;
 
   return (
     <>
-      {open && (
-        <div
-          className="fixed inset-0 bg-black/30 z-40 backdrop-blur-sm"
-          onClick={onClose}
-        />
-      )}
+      <div
+        className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm hidden lg:block"
+        onClick={onClose}
+      />
 
       <div
         className={`
-          fixed bottom-0 left-0 right-0 z-50 max-w-xl mx-auto
-          bg-background rounded-t-3xl shadow-2xl
-          border-t border-border/50
-          transition-transform duration-300 ease-out
-          flex flex-col
-          ${open ? "translate-y-0" : "translate-y-full pointer-events-none"}
+          fixed z-50 bg-background flex flex-col
+          inset-0
+          lg:inset-auto lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2
+          lg:w-full lg:max-w-2xl lg:max-h-[90dvh] lg:rounded-3xl lg:shadow-2xl
+          lg:border lg:border-border/50
+          animate-in fade-in duration-200
+          lg:slide-in-from-bottom-4
         `}
-        style={{ maxHeight: "88dvh" }}
       >
-        {/* Drag handle */}
-        <div className="flex justify-center pt-3 pb-1 shrink-0">
-          <div className="w-10 h-1 rounded-full bg-border/60" />
-        </div>
-
-        {/* ── LOGIN PHASE ─────────────────────────────────────────────────── */}
         {phase === "login" && (
-          <div className="flex flex-col px-6 pb-8 pt-2">
-            <div className="flex items-start justify-between mb-6">
+          <div className="flex flex-col h-full lg:h-auto lg:max-h-[90dvh]">
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border/40 shrink-0">
               <div>
-                <h2 className="text-lg font-bold text-foreground leading-tight">
+                <h2 className="text-base font-bold text-foreground">
                   Your profile
                 </h2>
-                <p className="text-sm text-muted-foreground mt-0.5">
+                <p className="text-xs text-muted-foreground mt-0.5">
                   Enter the phone you used in the quiz
                 </p>
               </div>
               <button
                 onClick={onClose}
-                className="w-8 h-8 rounded-full flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors shrink-0 mt-0.5"
+                className="w-9 h-9 rounded-full flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {enrichedSavedItems.length > 0 && (
-              <div className="mb-5 p-3 rounded-2xl bg-primary/5 border border-primary/15">
-                <p className="text-xs font-semibold text-primary mb-2.5 flex items-center gap-1.5">
-                  <Bookmark className="w-3 h-3" />
-                  {enrichedSavedItems.length} item
-                  {enrichedSavedItems.length !== 1 ? "s" : ""} saved this
-                  session
-                </p>
-                <div className="flex gap-2 overflow-x-auto pb-0.5">
-                  {enrichedSavedItems.slice(0, 5).map((item) => (
-                    <div
-                      key={item.id}
-                      className="w-12 h-12 rounded-xl bg-muted border border-border/40 shrink-0 overflow-hidden"
-                    >
-                      {item._product?.imageurl ? (
-                        <img
-                          src={item._product.imageurl}
-                          alt={item._product.name}
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                          <ShoppingBag className="w-4 h-4 text-muted-foreground/30" />
+            {/* Body */}
+            <div className="flex-1 overflow-y-auto px-5 py-6 flex flex-col gap-5">
+              {/* Session saved items preview */}
+              {enrichedSavedItems.length > 0 && (
+                <div className="p-4 rounded-2xl bg-red-500/5 border border-red-500/15">
+                  <p className="text-xs font-semibold text-red-600 mb-3 flex items-center gap-1.5">
+                    <Heart
+                      className="w-3 h-3 text-red-500"
+                      fill="currentColor"
+                    />
+                    {enrichedSavedItems.length} item
+                    {enrichedSavedItems.length !== 1 ? "s" : ""} saved this
+                    session
+                  </p>
+                  <div className="flex gap-2 overflow-x-auto pb-0.5">
+                    {enrichedSavedItems.slice(0, 8).map((item) => {
+                      const imgSrc =
+                        item._product?.image_url ?? item._product?.imageurl;
+                      return (
+                        <div
+                          key={item.id}
+                          className="w-12 h-12 rounded-xl bg-muted border border-border/40 shrink-0 overflow-hidden"
+                        >
+                          {imgSrc ? (
+                            <img
+                              src={imgSrc}
+                              alt={item._product?.name ?? ""}
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center">
+                              <ShoppingBag className="w-4 h-4 text-muted-foreground/30" />
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
-                  ))}
-                  {enrichedSavedItems.length > 5 && (
-                    <div className="w-12 h-12 rounded-xl bg-muted border border-border/40 shrink-0 flex items-center justify-center">
-                      <span className="text-xs font-bold text-muted-foreground">
-                        +{enrichedSavedItems.length - 5}
-                      </span>
-                    </div>
-                  )}
-                </div>
-                <p className="text-[11px] text-muted-foreground/60 mt-2">
-                  Sign in to keep these across visits
-                </p>
-              </div>
-            )}
-
-            <div className="relative mb-3">
-              <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
-              <input
-                type="tel"
-                placeholder="+1 555 000 0000"
-                value={phone}
-                onChange={(e) => {
-                  setPhone(e.target.value);
-                  setLoginError(null);
-                }}
-                onKeyDown={(e) => e.key === "Enter" && handleLogin()}
-                autoFocus={open}
-                className="w-full pl-11 pr-4 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm"
-              />
-            </div>
-
-            {loginError && (
-              <p className="text-xs text-destructive font-medium px-1 mb-3 animate-in fade-in">
-                {loginError}
-              </p>
-            )}
-
-            <button
-              onClick={handleLogin}
-              disabled={loginLoading || !phone.trim()}
-              className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 transition-all disabled:opacity-50 flex items-center justify-center gap-2 active:scale-[0.98]"
-            >
-              {loginLoading && <Loader2 className="w-4 h-4 animate-spin" />}
-              {loginLoading ? "Looking up…" : "View my profile"}
-            </button>
-
-            <p className="text-[11px] text-center text-muted-foreground/40 mt-4">
-              We only use this to retrieve your saved items &amp; quiz history
-            </p>
-          </div>
-        )}
-
-        {/* ── PROFILE PHASE ───────────────────────────────────────────────── */}
-        {phase === "profile" && (
-          <>
-            {/* Header */}
-            <div className="px-6 pt-2 pb-4 shrink-0">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
-                    <User className="w-4 h-4 text-primary" />
-                  </div>
-                  <div>
-                    <p className="text-base font-bold text-foreground leading-tight">
-                      Hey, {displayName}! 👋
-                    </p>
-                    {localCustomer?.phone && (
-                      <p className="text-xs text-muted-foreground">
-                        {localCustomer.phone}
-                      </p>
+                      );
+                    })}
+                    {enrichedSavedItems.length > 8 && (
+                      <div className="w-12 h-12 rounded-xl bg-muted border border-border/40 shrink-0 flex items-center justify-center">
+                        <span className="text-xs font-bold text-muted-foreground">
+                          +{enrichedSavedItems.length - 8}
+                        </span>
+                      </div>
                     )}
                   </div>
+                  <p className="text-[11px] text-muted-foreground/60 mt-2.5">
+                    Sign in to keep these across visits
+                  </p>
                 </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={handleLogout}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-all"
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                    Logout
-                  </button>
-                  <button
-                    onClick={onClose}
-                    className="w-8 h-8 rounded-full flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
+              )}
 
-              {/* Tabs — now 3 */}
-              <div className="flex items-center gap-1 bg-muted/60 rounded-xl p-1 mt-4">
-                {(["saved", "history", "account"] as ProfileTab[]).map(
-                  (tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-xs font-semibold transition-all ${
-                        activeTab === tab
-                          ? "bg-background shadow-sm text-foreground"
-                          : "text-muted-foreground hover:text-foreground"
-                      }`}
-                    >
-                      {tab === "saved" && <Bookmark className="w-3 h-3" />}
-                      {tab === "history" && <FileText className="w-3 h-3" />}
-                      {tab === "account" && <User className="w-3 h-3" />}
-                      {tab === "saved"
-                        ? "Saved"
-                        : tab === "history"
-                          ? "History"
-                          : "Account"}
-                      {tab === "saved" && allSavedItems.length > 0 && (
-                        <span
-                          className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${activeTab === "saved" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}
-                        >
-                          {allSavedItems.length}
-                        </span>
-                      )}
-                      {tab === "history" &&
-                        history &&
-                        history.responses.length > 0 && (
-                          <span
-                            className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold ${activeTab === "history" ? "bg-primary/10 text-primary" : "bg-muted text-muted-foreground"}`}
-                          >
-                            {history.responses.length}
-                          </span>
-                        )}
-                    </button>
-                  ),
+              {/* Phone input */}
+              <div className="space-y-3 lg:max-w-sm lg:mx-auto lg:w-full">
+                <div className="relative">
+                  <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
+                  <input
+                    type="tel"
+                    aria-label="Phone number"
+                    placeholder="+1 555 000 0000"
+                    value={phone}
+                    onChange={(e) => {
+                      setPhone(e.target.value);
+                      setLoginError(null);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && handleLogin()}
+                    autoFocus={open}
+                    className="w-full pl-11 pr-4 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm"
+                  />
+                </div>
+                {loginError && (
+                  <p className="text-xs text-destructive font-medium px-1 animate-in fade-in">
+                    {loginError}
+                  </p>
                 )}
               </div>
             </div>
 
-            {/* Tab content */}
-            <div className="flex-1 overflow-y-auto px-6 pb-8">
-              {/* ── Saved Items Tab ──────────────────────────────────────── */}
-              {activeTab === "saved" && (
-                <div className="space-y-3">
-                  {allSavedItems.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center py-14 gap-3 text-center">
-                      <div className="w-14 h-14 rounded-full bg-muted flex items-center justify-center">
-                        <ShoppingBag className="w-6 h-6 text-muted-foreground/30" />
-                      </div>
-                      <p className="text-sm font-medium text-muted-foreground">
-                        No saved items yet
-                      </p>
-                      <p className="text-xs text-muted-foreground/50 max-w-48">
-                        Tap the bookmark icon on any product to save it here
-                      </p>
-                    </div>
-                  ) : (
-                    allSavedItems.map((item: any) => {
-                      const p = item._product;
-                      const isRemoving = removingId === item.product_id;
-                      return (
-                        <div
-                          key={item.id}
-                          className={`flex items-center gap-3 p-3 rounded-2xl border border-border/40 bg-card transition-all duration-200 ${isRemoving ? "opacity-40 scale-[0.97]" : ""}`}
-                        >
-                          <div className="w-14 h-14 rounded-xl overflow-hidden bg-muted shrink-0 border border-border/30">
-                            {p?.imageurl ? (
-                              <img
-                                src={p.imageurl}
-                                alt={p.name}
-                                className="w-full h-full object-cover"
-                              />
-                            ) : (
-                              <div className="w-full h-full flex items-center justify-center">
-                                <ShoppingBag className="w-4 h-4 text-muted-foreground/30" />
-                              </div>
-                            )}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-semibold text-foreground leading-tight line-clamp-2">
-                              {p?.name ?? "Product"}
-                            </p>
-                            {p?.price != null && (
-                              <p className="text-xs font-bold text-primary mt-0.5">
-                                ${Number(p.price).toFixed(2)}
-                              </p>
-                            )}
-                          </div>
-                          <button
-                            onClick={() => handleRemove(item.product_id)}
-                            disabled={isRemoving}
-                            className="w-8 h-8 flex items-center justify-center rounded-full text-muted-foreground/40 hover:text-destructive hover:bg-destructive/10 transition-colors shrink-0"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              )}
+            {/* Footer CTA */}
+            <div className="px-5 pb-8 pt-3 shrink-0 border-t border-border/40">
+              <div className="lg:max-w-sm lg:mx-auto">
+                <button
+                  onClick={handleLogin}
+                  disabled={loginLoading || !phone.trim()}
+                  className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 transition-all disabled:opacity-50 flex items-center justify-center gap-2 active:scale-[0.98]"
+                >
+                  {loginLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {loginLoading ? "Looking up…" : "View my profile"}
+                </button>
+                <p className="text-[11px] text-center text-muted-foreground/40 mt-3">
+                  We only use this to retrieve your saved items &amp; quiz
+                  history
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
 
-              {/* ── History Tab ──────────────────────────────────────────── */}
-              {activeTab === "history" && (
-                <div className="space-y-3">
-                  {historyLoading ? (
-                    <div className="flex items-center justify-center py-14">
-                      <Loader2 className="w-5 h-5 animate-spin text-muted-foreground/40" />
-                    </div>
-                  ) : !history || history.responses.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center py-14 gap-3 text-center">
-                      <div className="w-14 h-14 rounded-full bg-muted flex items-center justify-center">
-                        <FileText className="w-6 h-6 text-muted-foreground/30" />
-                      </div>
-                      <p className="text-sm font-medium text-muted-foreground">
-                        No submissions yet
-                      </p>
-                    </div>
-                  ) : (
-                    history.responses.map((r) => (
-                      <div
-                        key={r.id}
-                        className="p-4 rounded-2xl border border-border/40 bg-card space-y-2"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <p className="text-sm font-semibold text-foreground leading-tight">
-                            {r.forms?.name ?? "Quiz"}
-                          </p>
-                          {r.perkredeemed && (
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 shrink-0">
-                              Redeemed
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                          <Clock className="w-3 h-3" />
-                          {new Date(r.submittedat).toLocaleDateString("en-US", {
-                            month: "short",
-                            day: "numeric",
-                            year: "numeric",
-                          })}
-                        </div>
-                        {r.redemptioncode && !r.perkredeemed && (
-                          <div className="flex items-center justify-between mt-1 px-3 py-2 rounded-xl bg-primary/5 border border-primary/15">
-                            <p className="text-xs text-muted-foreground">
-                              Promo code
-                            </p>
-                            <p className="text-xs font-bold text-primary font-mono tracking-wider">
-                              {r.redemptioncode}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
-
-              {/* ── Account Tab ──────────────────────────────────────────── */}
-              {activeTab === "account" && (
+        {phase === "signup" && (
+          <div className="flex flex-col h-full lg:h-auto lg:max-h-[90dvh]">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border/40 shrink-0">
+              <div>
+                <h2 className="text-base font-bold text-foreground">Sign Up</h2>
+                <p className="text-xs text-muted-foreground mt-0.5">Please provide your details</p>
+              </div>
+              <button onClick={onClose} className="w-9 h-9 rounded-full flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-5 py-6 flex flex-col gap-5">
+              <div className="space-y-3 lg:max-w-sm lg:mx-auto lg:w-full">
                 <div className="space-y-4">
-                  {/* Header row */}
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm font-semibold text-foreground">
-                      Profile details
+                  <div className="relative">
+                    <User className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
+                    <input type="text" placeholder="Full name *" value={name} onChange={(e) => { setName(e.target.value); setLoginError(null); }} className="w-full pl-11 pr-4 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm" />
+                  </div>
+                  <div className="relative">
+                    <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
+                    <input type="tel" placeholder="Phone number *" value={phone} onChange={(e) => { setPhone(e.target.value); setLoginError(null); }} className="w-full pl-11 pr-4 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm" />
+                  </div>
+                  <div className="relative">
+                    <ExternalLink className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
+                    <input type="email" placeholder="Email (optional)" value={email} onChange={(e) => { setEmail(e.target.value); setLoginError(null); }} className="w-full pl-11 pr-4 py-4 rounded-2xl border border-border/60 bg-card text-base text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm" />
+                  </div>
+                </div>
+                {loginError && <p className="text-xs text-destructive font-medium px-1 animate-in fade-in">{loginError}</p>}
+              </div>
+            </div>
+            <div className="px-5 pb-8 pt-3 shrink-0 border-t border-border/40">
+              <div className="lg:max-w-sm lg:mx-auto">
+                <button onClick={handleSignUp} disabled={signUpLoading || !phone.trim() || !name.trim()} className="w-full py-4 rounded-2xl bg-foreground text-background font-bold text-base hover:bg-foreground/90 transition-all disabled:opacity-50 flex items-center justify-center gap-2 active:scale-[0.98]">
+                  {signUpLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {signUpLoading ? "Creating account…" : "Sign Up"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {phase === "profile" && (
+          <div className="flex flex-col h-full lg:h-auto lg:max-h-[90dvh]">
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-border/40 shrink-0">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+                  <User className="w-4 h-4 text-primary" />
+                </div>
+                <div>
+                  <p className="text-base font-bold text-foreground leading-tight">
+                    Hey, {displayName}! 👋
+                  </p>
+                  {localCustomer?.phone && (
+                    <p className="text-xs text-muted-foreground">
+                      {localCustomer.phone}
                     </p>
-                    {!isEditing ? (
-                      <button
-                        onClick={() => setIsEditing(true)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/20 transition-all"
-                      >
-                        <Pencil className="w-3 h-3" />
-                        Edit
-                      </button>
-                    ) : (
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={handleCancelEdit}
-                          className="px-3 py-1.5 rounded-full text-xs font-semibold text-muted-foreground hover:bg-muted transition-all"
-                        >
-                          Cancel
-                        </button>
-                        <button
-                          onClick={handleSaveProfile}
-                          disabled={editSaving}
-                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold bg-foreground text-background hover:bg-foreground/90 transition-all disabled:opacity-50"
-                        >
-                          {editSaving ? (
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                          ) : (
-                            <Check className="w-3 h-3" />
-                          )}
-                          Save
-                        </button>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Success banner */}
-                  {editSuccess && (
-                    <div className="flex items-center gap-2 px-4 py-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm font-medium animate-in fade-in">
-                      <CheckCircle2 className="w-4 h-4 shrink-0" />
-                      Profile updated successfully
-                    </div>
                   )}
+                </div>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-all"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Logout</span>
+                </button>
+                <button
+                  onClick={onClose}
+                  className="w-9 h-9 rounded-full flex items-center justify-center text-muted-foreground hover:bg-muted transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
 
-                  {/* Error banner */}
-                  {editError && (
-                    <div className="px-4 py-3 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive text-sm font-medium animate-in fade-in">
-                      {editError}
-                    </div>
-                  )}
+            {/* Section label */}
+            <div className="px-5 pt-5 pb-3 shrink-0 flex items-center justify-between">
+              <p className="text-sm font-bold text-foreground">
+                Saved Products
+              </p>
+              {enrichedSavedItems.length > 0 && (
+                <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-red-500/10 text-red-500">
+                  {enrichedSavedItems.length}
+                </span>
+              )}
+            </div>
 
-                  {/* Fields */}
-                  <div className="space-y-3">
-                    {/* First + Last name row */}
-                    <div className="flex gap-3">
-                      <div className="flex-1 space-y-1.5">
-                        <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
-                          First Name
-                        </label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editFields.firstName}
-                            onChange={(e) =>
-                              setEditFields((p) => ({
-                                ...p,
-                                firstName: e.target.value,
-                              }))
-                            }
-                            placeholder="Jane"
-                            className="w-full px-4 py-3 rounded-2xl border border-border/60 bg-card text-sm focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
-                          />
-                        ) : (
-                          <div className="px-4 py-3 rounded-2xl bg-muted/40 border border-border/40 text-sm text-foreground">
-                            {editFields.firstName || (
-                              <span className="text-muted-foreground/40">
-                                Not set
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex-1 space-y-1.5">
-                        <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1">
-                          Last Name
-                        </label>
-                        {isEditing ? (
-                          <input
-                            type="text"
-                            value={editFields.lastName}
-                            onChange={(e) =>
-                              setEditFields((p) => ({
-                                ...p,
-                                lastName: e.target.value,
-                              }))
-                            }
-                            placeholder="Doe"
-                            className="w-full px-4 py-3 rounded-2xl border border-border/60 bg-card text-sm focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
-                          />
-                        ) : (
-                          <div className="px-4 py-3 rounded-2xl bg-muted/40 border border-border/40 text-sm text-foreground">
-                            {editFields.lastName || (
-                              <span className="text-muted-foreground/40">
-                                Not set
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    {/* Email */}
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1 flex items-center gap-1.5">
-                        <Mail className="w-3 h-3" /> Email
-                      </label>
-                      {isEditing ? (
-                        <input
-                          type="email"
-                          value={editFields.email}
-                          onChange={(e) =>
-                            setEditFields((p) => ({
-                              ...p,
-                              email: e.target.value,
-                            }))
-                          }
-                          placeholder="jane@example.com"
-                          className="w-full px-4 py-3 rounded-2xl border border-border/60 bg-card text-sm focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
-                        />
-                      ) : (
-                        <div className="px-4 py-3 rounded-2xl bg-muted/40 border border-border/40 text-sm text-foreground">
-                          {editFields.email || (
-                            <span className="text-muted-foreground/40">
-                              Not set
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Phone */}
-                    <div className="space-y-1.5">
-                      <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider ml-1 flex items-center gap-1.5">
-                        <Phone className="w-3 h-3" /> Phone
-                      </label>
-                      {isEditing ? (
-                        <input
-                          type="tel"
-                          value={editFields.phone}
-                          onChange={(e) =>
-                            setEditFields((p) => ({
-                              ...p,
-                              phone: e.target.value,
-                            }))
-                          }
-                          placeholder="+1 555 000 0000"
-                          className="w-full px-4 py-3 rounded-2xl border border-border/60 bg-card text-sm focus:outline-none focus:ring-4 focus:ring-primary/10 focus:border-primary transition-all shadow-sm placeholder:text-muted-foreground/30"
-                        />
-                      ) : (
-                        <div className="px-4 py-3 rounded-2xl bg-muted/40 border border-border/40 text-sm text-foreground">
-                          {editFields.phone || (
-                            <span className="text-muted-foreground/40">
-                              Not set
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </div>
+            {/* Products grid */}
+            <div className="flex-1 overflow-y-auto px-5 pb-8">
+              {enrichedSavedItems.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-full gap-4 text-center py-20">
+                  <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
+                    <ShoppingBag className="w-7 h-7 text-muted-foreground/25" />
                   </div>
-
-                  {/* Danger zone */}
-                  <div className="pt-4 border-t border-border/40">
-                    <p className="text-xs text-muted-foreground/50 mb-3 font-semibold uppercase tracking-wider">
-                      Account
+                  <div>
+                    <p className="text-sm font-semibold text-muted-foreground">
+                      No saved products yet
                     </p>
-                    <button
-                      onClick={handleLogout}
-                      className="w-full flex items-center justify-center gap-2 py-3 rounded-2xl border border-destructive/20 text-destructive text-sm font-semibold hover:bg-destructive/5 transition-all"
-                    >
-                      <LogOut className="w-4 h-4" />
-                      Sign out
-                    </button>
+                    <p className="text-xs text-muted-foreground/50 mt-1 max-w-[200px] mx-auto">
+                      Tap the heart icon on any product to save it here
+                    </p>
                   </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+                  {enrichedSavedItems.map((item: any) => (
+                    <SavedProductCard
+                      key={item.id}
+                      item={item}
+                      isRemoving={removingId === item.product_id}
+                      onRemove={handleRemove}
+                    />
+                  ))}
                 </div>
               )}
             </div>
-          </>
+          </div>
         )}
       </div>
     </>

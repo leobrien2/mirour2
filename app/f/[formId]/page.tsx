@@ -13,10 +13,11 @@ interface PageProps {
 interface FormRow {
   id: string;
   name: string;
-  store_id: string | null; // ← real col name from DB output
+  store_id: string | null;
   active: boolean;
-  questions: string; // ← real col name — stored as JSON string of steps[]
+  questions: string;
   perk: string | null;
+  ai_search_enabled: boolean;
 }
 
 async function getFormWithFlow(formId: string): Promise<FormRow | null> {
@@ -24,7 +25,7 @@ async function getFormWithFlow(formId: string): Promise<FormRow | null> {
 
   const { data, error } = await (supabase as any)
     .from("forms")
-    .select("id, name, store_id, active, questions, perk") // ← fixed
+    .select("id, name, store_id, active, questions, perk, ai_search_enabled")
     .eq("id", formId)
     .single();
 
@@ -76,6 +77,7 @@ export default async function PublicFlowPage({
     id: form.id,
     name: form.name,
     steps,
+    aiSearchEnabled: form.ai_search_enabled ?? false,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };

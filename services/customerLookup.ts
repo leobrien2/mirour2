@@ -21,6 +21,22 @@ export const lookupCustomerByPhone = async (
   return data as LocalCustomerProfile;
 };
 
+export const createCustomer = async (customerData: {
+  phone: string;
+  name?: string;
+  email?: string;
+  first_name?: string;
+}): Promise<LocalCustomerProfile | null> => {
+  const { data, error } = await (supabase as any)
+    .from("customers")
+    .insert([customerData])
+    .select("id, name, first_name, email, phone")
+    .maybeSingle();
+
+  if (error || !data) return null;
+  return data as LocalCustomerProfile;
+};
+
 export interface CustomerHistory {
   savedItems: any[];
   responses: {

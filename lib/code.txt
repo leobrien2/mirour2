@@ -1,0 +1,1847 @@
+==================================================
+FILE: bulkTagHelpers.ts
+==================================================
+
+import { SupabaseClient } from "@supabase/supabase-js";
+
+/**
+ * Standard tags required for Soberish entrance flow template
+ */
+export const STANDARD_SOBERISH_TAGS = [
+  // Soft preferences
+  { name: "Social", category: "occasion", is_hard_constraint: false },
+  { name: "Calm", category: "mood", is_hard_constraint: false },
+  { name: "Energize", category: "mood", is_hard_constraint: false },
+  { name: "Focus", category: "mood", is_hard_constraint: false },
+  { name: "Sleep", category: "mood", is_hard_constraint: false },
+  { name: "Gift", category: "occasion", is_hard_constraint: false },
+  { name: "Casual", category: "occasion", is_hard_constraint: false },
+
+  // Hard constraints
+  { name: "No-sugar", category: "dietary", is_hard_constraint: true },
+  { name: "Vegan", category: "dietary", is_hard_constraint: true },
+  { name: "Gluten-free", category: "dietary", is_hard_constraint: true },
+  { name: "Organic", category: "dietary", is_hard_constraint: true },
+  { name: "THC-free", category: "avoiding", is_hard_constraint: true },
+  { name: "Caffeine-free", category: "avoiding", is_hard_constraint: true },
+  { name: "No-effect", category: "avoiding", is_hard_constraint: true },
+];
+
+export interface BulkTagResult {
+  created: number;
+  skipped: number;
+  errors: string[];
+}
+
+/**
+ * Creates all standard Soberish tags in one operation
+ * Skips tags that already exist (duplicate key errors)
+ *
+ * @param supabase - Supabase client instance
+ * @param storeId - Store ID to create tags for
+ * @returns Result object with counts of created, skipped, and errors
+ */
+export async function createStandardSoberishTags(
+  supabase: SupabaseClient,
+  storeId: string,
+): Promise<BulkTagResult> {
+  let created = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+
+  for (const tag of STANDARD_SOBERISH_TAGS) {
+    try {
+      const { error } = await supabase.from("tags").insert({
+        store_id: storeId,
+        name: tag.name,
+        category: tag.category,
+        is_hard_constraint: tag.is_hard_constraint,
+      });
+
+      if (error) {
+        if (error.code === "23505") {
+          // Duplicate key - tag already exists
+          skipped++;
+        } else {
+          errors.push(`${tag.name}: ${error.message}`);
+        }
+      } else {
+        created++;
+      }
+    } catch (err) {
+      errors.push(`${tag.name}: ${err}`);
+    }
+  }
+
+  return { created, skipped, errors };
+}
+
+
+==================================================
+FILE: customerSession.ts
+==================================================
+
+// lib/customerSession.ts
+
+const KEYS = {
+  token: "mirour:customertoken",
+  profile: "mirour:customer:profile",
+};
+
+export interface LocalCustomerProfile {
+  id: string;
+  name: string | null;
+  firstname: string | null;
+  phone: string | null;
+  email: string | null;
+}
+
+export const saveCustomerLocally = (customer: LocalCustomerProfile) => {
+  if (typeof window === "undefined") return;
+  localStorage.setItem(KEYS.token, customer.id);
+  localStorage.setItem(KEYS.profile, JSON.stringify(customer));
+};
+
+export const getLocalCustomer = (): LocalCustomerProfile | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(KEYS.profile);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
+
+export const clearCustomerLocally = () => {
+  if (typeof window === "undefined") return;
+  localStorage.removeItem(KEYS.token);
+  localStorage.removeItem(KEYS.profile);
+};
+
+
+==================================================
+FILE: embeddings.ts
+==================================================
+
+// lib/embeddings.ts
+
+const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/embeddings";
+const EMBEDDING_MODEL = "openai/text-embedding-3-small";
+
+// ── Single embedding ──────────────────────────────────────────────────────────
+
+export async function getEmbedding(text: string): Promise<number[]> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set.");
+
+  const res = await fetch(OPENROUTER_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input: text,
+    }),
+  });
+
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`Embedding API error ${res.status}: ${error}`);
+  }
+
+  const json = await res.json();
+  return json.data[0].embedding as number[];
+}
+
+// ── Batch embeddings (for backfill) ──────────────────────────────────────────
+// OpenAI supports up to 2048 inputs per request
+// We batch in groups of 20 to stay safe
+
+export async function getEmbeddingsBatch(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set.");
+
+  const res = await fetch(OPENROUTER_API_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: EMBEDDING_MODEL,
+      input: texts,
+    }),
+  });
+
+  if (!res.ok) {
+    const error = await res.text();
+    throw new Error(`Embedding batch API error ${res.status}: ${error}`);
+  }
+
+  const json = await res.json();
+
+  // OpenAI returns results sorted by index — preserve original order
+  return json.data
+    .sort((a: any, b: any) => a.index - b.index)
+    .map((item: any) => item.embedding as number[]);
+}
+
+// ── Build product embedding text ──────────────────────────────────────────────
+// Call this to build the text that gets embedded for a product.
+// Used in both the generate route and the backfill route.
+
+export function buildProductEmbeddingText(product: {
+  name: string;
+  description?: string | null;
+  tags?: string[];
+}): string {
+  const parts = [
+    `Name: ${product.name}`,
+    product.description ? `Description: ${product.description}` : null,
+    product.tags?.length ? `Tags: ${product.tags.join(", ")}` : null,
+  ].filter(Boolean);
+
+  return parts.join("\n");
+}
+
+
+==================================================
+FILE: features.ts
+==================================================
+
+export const FEATURES = {
+  ZONE_PERSONALIZATION: false,
+  LOYALTY_LAYER: false,
+  PROFILE_LINKED_ZONES: false,
+} as const;
+
+
+==================================================
+FILE: flowLogger.ts
+==================================================
+
+// lib/flowLogger.ts
+// ─── Dev-only flow logger ─────────────────────────────────────────────────────
+// All log() calls compile to no-ops in production.
+// The DevConsole subscribes to this to show live DB / activity logs.
+
+const IS_DEV =
+  typeof process !== "undefined" && process.env.NODE_ENV === "development";
+
+export type LogLevel = "info" | "db_write" | "db_read" | "nav" | "error" | "warn";
+
+export interface FlowLogEntry {
+  id: string;
+  timestamp: string;
+  level: LogLevel;
+  event: string;
+  payload?: unknown;
+  table?: string; // set for db_write / db_read events
+}
+
+type LogSubscriber = (entry: FlowLogEntry) => void;
+
+const MAX_ENTRIES = 200;
+let _seq = 0;
+
+class FlowLoggerClass {
+  private _entries: FlowLogEntry[] = [];
+  private _subscribers: Set<LogSubscriber> = new Set();
+
+  log(event: string, payload?: unknown, level: LogLevel = "info", table?: string) {
+    if (!IS_DEV) return;
+
+    const entry: FlowLogEntry = {
+      id: `log_${++_seq}`,
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      payload,
+      table,
+    };
+
+    // Circular buffer — keep last MAX_ENTRIES
+    this._entries.push(entry);
+    if (this._entries.length > MAX_ENTRIES) {
+      this._entries.shift();
+    }
+
+    // Pretty-print to browser console
+    const color: Record<LogLevel, string> = {
+      info:     "#8b9cf4",
+      db_write: "#e05e5e",
+      db_read:  "#5eb6e0",
+      nav:      "#5ee09a",
+      error:    "#e07c5e",
+      warn:     "#e0c85e",
+    };
+    const badge = `%c ${level.toUpperCase()} `;
+    const style = `background:${color[level]};color:#fff;border-radius:3px;padding:1px 5px;font-weight:700;font-size:11px`;
+
+    if (level === "error") {
+      console.error(badge, style, `[FLOW] ${event}`, payload ?? "");
+    } else if (level === "warn") {
+      console.warn(badge, style, `[FLOW] ${event}`, payload ?? "");
+    } else {
+      console.log(badge, style, `[FLOW] ${event}`, payload ?? "");
+    }
+
+    // Notify subscribers asynchronously — must NOT call setState synchronously
+    // during a render (e.g. when flowLog is called inside a useState updater).
+    // setTimeout(fn, 0) guarantees the notification fires after React's commit.
+    setTimeout(() => this._subscribers.forEach((cb) => cb(entry)), 0);
+  }
+
+  /** All stored entries (newest last). */
+  get entries(): FlowLogEntry[] {
+    return this._entries;
+  }
+
+  /** Subscribe to new log entries. Returns an unsubscribe function. */
+  subscribe(cb: LogSubscriber): () => void {
+    this._subscribers.add(cb);
+    return () => this._subscribers.delete(cb);
+  }
+
+  /** Clear all stored entries. */
+  clear() {
+    this._entries = [];
+    this._subscribers.forEach((cb) =>
+      cb({ id: "clear", timestamp: new Date().toISOString(), level: "info", event: "LOGS_CLEARED" }),
+    );
+  }
+}
+
+export const flowLogger = new FlowLoggerClass();
+
+// Convenience shorthand
+export const flowLog = (
+  event: string,
+  payload?: unknown,
+  level: LogLevel = "info",
+  table?: string,
+) => flowLogger.log(event, payload, level, table);
+
+
+==================================================
+FILE: flowTemplates.ts
+==================================================
+
+import { Tag, Zone } from "@/types/mirour";
+import { nanoid } from "nanoid";
+
+// Helper: Look up tag ID by name (case-insensitive)
+function getTagIdByName(tags: Tag[], name: string): string | null {
+  const tag = tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+  return tag?.id || null;
+}
+
+/**
+ * Validates that all required tags exist for entrance flow template
+ * @throws Error with list of missing tags if validation fails
+ */
+function validateRequiredTags(tags: Tag[]): void {
+  const requiredTags = [
+    // Soft preferences
+    "Social",
+    "Calm",
+    "Energize",
+    "Focus",
+    "Sleep",
+    "Gift",
+    "Casual",
+    // Hard constraints
+    "No-sugar",
+    "Vegan",
+    "Gluten-free",
+    "Organic",
+    "THC-free",
+    "Caffeine-free",
+    "No-effect",
+  ];
+
+  const missingTags: string[] = [];
+
+  requiredTags.forEach((tagName) => {
+    if (!getTagIdByName(tags, tagName)) {
+      missingTags.push(tagName);
+    }
+  });
+
+  if (missingTags.length > 0) {
+    throw new Error(
+      `Cannot create entrance flow. Missing required tags:\n` +
+        `${missingTags.map((t) => `- ${t}`).join("\n")}\n\n` +
+        `Please create these tags in Tag Manager first, then try again.`,
+    );
+  }
+}
+
+/**
+ * Validates that a zone has all required education fields
+ * @throws Error with list of missing fields if validation fails
+ */
+function validateZoneEducationFields(zone: Zone): void {
+  if (!zone.name || zone.name.trim() === "") {
+    throw new Error("Zone must have a name");
+  }
+
+  const missingFields: string[] = [];
+
+  if (!zone.zone_what || zone.zone_what.trim() === "") {
+    missingFields.push("What (zone_what)");
+  }
+  if (!zone.zone_when || zone.zone_when.trim() === "") {
+    missingFields.push("When (zone_when)");
+  }
+  if (!zone.zone_who || zone.zone_who.trim() === "") {
+    missingFields.push("Who (zone_who)");
+  }
+
+  if (missingFields.length > 0) {
+    throw new Error(
+      `Zone "${zone.name}" is missing education fields:\n` +
+        `${missingFields.map((f) => `- ${f}`).join("\n")}\n\n` +
+        `Please fill in these fields in Zone Manager before creating a flow.`,
+    );
+  }
+}
+
+/**
+ * Creates an entrance flow template based on Soberish content spec
+ * 4 questions: Occasion → Mood → Dietary → Avoiding
+ */
+export function createEntranceFlowTemplate(storeId: string, tags: Tag[]) {
+  // Validate that all required tags exist before generating template
+  validateRequiredTags(tags);
+  // Look up tag IDs (validation ensures all tags exist)
+  const getTagId = (name: string) => {
+    const id = getTagIdByName(tags, name);
+    return id;
+  };
+
+  const nodes = [];
+  const edges = [];
+
+  // Welcome Node
+  const welcomeId = nanoid();
+  nodes.push({
+    id: welcomeId,
+    type: "welcome",
+    position: { x: 250, y: 50 },
+    data: {
+      label: "Welcome",
+      header: "Not sure where to start?",
+      content:
+        "Find your perfect picks in 60 seconds! We'll ask you 4 quick questions to personalize your recommendations.",
+      buttonText: "Let's Go",
+    },
+  });
+
+  // Q1: Occasion
+  const q1Id = nanoid();
+  nodes.push({
+    id: q1Id,
+    type: "question",
+    position: { x: 250, y: 200 },
+    data: {
+      label: "Q1: Occasion",
+      header: "What's the occasion?",
+      questionType: "multiple-choice",
+      options: [
+        { value: "social", label: "Social gathering or party" },
+        { value: "relaxing", label: "Relaxing alone or winding down" },
+        { value: "gift", label: "Looking for a gift" },
+        { value: "browsing", label: "Just browsing" },
+      ],
+      conditionalNext: [
+        {
+          optionValue: "social",
+          addTags: getTagId("Social") ? [getTagId("Social")!] : [],
+        },
+        {
+          optionValue: "relaxing",
+          addTags: getTagId("Calm") ? [getTagId("Calm")!] : [],
+        },
+        {
+          optionValue: "gift",
+          addTags: getTagId("Gift") ? [getTagId("Gift")!] : [],
+        },
+        {
+          optionValue: "browsing",
+          addTags: getTagId("Casual") ? [getTagId("Casual")!] : [],
+        },
+      ],
+    },
+  });
+
+  edges.push({
+    id: `${welcomeId}-${q1Id}`,
+    source: welcomeId,
+    target: q1Id,
+  });
+
+  // Q2: Mood
+  const q2Id = nanoid();
+  nodes.push({
+    id: q2Id,
+    type: "question",
+    position: { x: 250, y: 350 },
+    data: {
+      label: "Q2: Mood",
+      header: "What mood are you going for?",
+      questionType: "multiple-choice",
+      options: [
+        { value: "calm", label: "Relaxed and calm" },
+        { value: "energize", label: "Energized and alert" },
+        { value: "focus", label: "Focused and productive" },
+        { value: "sleep", label: "Ready for sleep" },
+      ],
+      conditionalNext: [
+        {
+          optionValue: "calm",
+          addTags: getTagId("Calm") ? [getTagId("Calm")!] : [],
+        },
+        {
+          optionValue: "energize",
+          addTags: getTagId("Energize") ? [getTagId("Energize")!] : [],
+        },
+        {
+          optionValue: "focus",
+          addTags: getTagId("Focus") ? [getTagId("Focus")!] : [],
+        },
+        {
+          optionValue: "sleep",
+          addTags: getTagId("Sleep") ? [getTagId("Sleep")!] : [],
+        },
+      ],
+    },
+  });
+
+  edges.push({
+    id: `${q1Id}-${q2Id}`,
+    source: q1Id,
+    target: q2Id,
+  });
+
+  // Q3: Dietary
+  const q3Id = nanoid();
+  nodes.push({
+    id: q3Id,
+    type: "question",
+    position: { x: 250, y: 500 },
+    data: {
+      label: "Q3: Dietary",
+      header: "Do you have any dietary restrictions?",
+      questionType: "checkboxes",
+      options: [
+        { value: "no-sugar", label: "No sugar" },
+        { value: "vegan", label: "Vegan" },
+        { value: "gluten-free", label: "Gluten-free" },
+        { value: "organic", label: "Organic only" },
+        { value: "none", label: "No preferences" },
+      ],
+      conditionalNext: [
+        {
+          optionValue: "no-sugar",
+          addTags: getTagId("No-sugar") ? [getTagId("No-sugar")!] : [],
+        },
+        {
+          optionValue: "vegan",
+          addTags: getTagId("Vegan") ? [getTagId("Vegan")!] : [],
+        },
+        {
+          optionValue: "gluten-free",
+          addTags: getTagId("Gluten-free") ? [getTagId("Gluten-free")!] : [],
+        },
+        {
+          optionValue: "organic",
+          addTags: getTagId("Organic") ? [getTagId("Organic")!] : [],
+        },
+      ],
+    },
+  });
+
+  edges.push({
+    id: `${q2Id}-${q3Id}`,
+    source: q2Id,
+    target: q3Id,
+  });
+
+  // Q4: Avoiding
+  const q4Id = nanoid();
+  nodes.push({
+    id: q4Id,
+    type: "question",
+    position: { x: 250, y: 650 },
+    data: {
+      label: "Q4: Avoiding",
+      header: "Anything you want to avoid?",
+      questionType: "checkboxes",
+      options: [
+        { value: "thc", label: "THC / Cannabis" },
+        { value: "caffeine", label: "Caffeine" },
+        { value: "psychoactive", label: "Any psychoactive effects" },
+        { value: "open", label: "I'm open to everything" },
+      ],
+      conditionalNext: [
+        {
+          optionValue: "thc",
+          addTags: getTagId("THC-free") ? [getTagId("THC-free")!] : [],
+        },
+        {
+          optionValue: "caffeine",
+          addTags: getTagId("Caffeine-free")
+            ? [getTagId("Caffeine-free")!]
+            : [],
+        },
+        {
+          optionValue: "psychoactive",
+          addTags: getTagId("No-effect") ? [getTagId("No-effect")!] : [],
+        },
+      ],
+    },
+  });
+
+  edges.push({
+    id: `${q3Id}-${q4Id}`,
+    source: q3Id,
+    target: q4Id,
+  });
+
+  // Recommendation Node
+  const recoId = nanoid();
+  nodes.push({
+    id: recoId,
+    type: "recommendation",
+    position: { x: 250, y: 800 },
+    data: {
+      label: "Your Picks",
+      header: "Here are your personalized picks!",
+      recommendationLogic: {
+        useTags: true,
+        matchStrategy: "any",
+        limit: 6,
+        fallbackToStaffPicks: true,
+      },
+    },
+  });
+
+  edges.push({
+    id: `${q4Id}-${recoId}`,
+    source: q4Id,
+    target: recoId,
+  });
+
+  // Customer Info Node
+  const infoId = nanoid();
+  nodes.push({
+    id: infoId,
+    type: "customer-info",
+    position: { x: 250, y: 950 },
+    data: {
+      label: "Save Profile",
+      header: "Save your preferences?",
+      content: "We'll remember your picks for next time!",
+      collectEmail: true,
+      collectPhone: false,
+    },
+  });
+
+  edges.push({
+    id: `${recoId}-${infoId}`,
+    source: recoId,
+    target: infoId,
+  });
+
+  // Complete Node
+  const completeId = nanoid();
+  nodes.push({
+    id: completeId,
+    type: "complete",
+    position: { x: 250, y: 1100 },
+    data: {
+      label: "Thank You",
+      header: "Enjoy your picks!",
+      content: "Ask a team member if you need help finding these products.",
+    },
+  });
+
+  edges.push({
+    id: `${infoId}-${completeId}`,
+    source: infoId,
+    target: completeId,
+  });
+
+  return {
+    name: "Entrance Flow - Soberish",
+    description: "4-question quiz to find perfect picks",
+    flow_type: "entrance" as const,
+    nodes,
+    edges,
+  };
+}
+
+/**
+ * Creates a zone-specific flow template with placeholder support
+ */
+export function createZoneFlowTemplate(storeId: string, zone: Zone) {
+  // Validate that zone has all required education fields
+  validateZoneEducationFields(zone);
+
+  const nodes = [];
+  const edges = [];
+
+  // Welcome Node with zone placeholders
+  const welcomeId = nanoid();
+  nodes.push({
+    id: welcomeId,
+    type: "welcome",
+    position: { x: 250, y: 50 },
+    data: {
+      label: "Welcome",
+      header: "Welcome to {{zone_name}}",
+      content: "Let us show you some great options from this collection!",
+      buttonText: "Explore",
+    },
+  });
+
+  // Message Node with zone education copy
+  const messageId = nanoid();
+  nodes.push({
+    id: messageId,
+    type: "message",
+    position: { x: 250, y: 200 },
+    data: {
+      label: "About This Zone",
+      header: "{{zone_name}}",
+      content:
+        "{{zone_what}}\n\nPerfect for: {{zone_when}}\n\nIdeal for: {{zone_who}}",
+    },
+  });
+
+  edges.push({
+    id: `${welcomeId}-${messageId}`,
+    source: welcomeId,
+    target: messageId,
+  });
+
+  // Recommendation Node (zone-filtered)
+  const recoId = nanoid();
+  nodes.push({
+    id: recoId,
+    type: "recommendation",
+    position: { x: 250, y: 350 },
+    data: {
+      label: "Featured Products",
+      header: "Check out these {{zone_name}} favorites",
+      recommendationLogic: {
+        useTags: true,
+        matchStrategy: "zone-first",
+        limit: 3,
+        zoneId: zone.id,
+        fallbackToStaffPicks: true,
+      },
+    },
+  });
+
+  edges.push({
+    id: `${messageId}-${recoId}`,
+    source: messageId,
+    target: recoId,
+  });
+
+  // Complete Node
+  const completeId = nanoid();
+  nodes.push({
+    id: completeId,
+    type: "complete",
+    position: { x: 250, y: 500 },
+    data: {
+      label: "Enjoy",
+      header: "Enjoy exploring {{zone_name}}!",
+      content:
+        "Ask a team member if you'd like to learn more about any of these products.",
+    },
+  });
+
+  edges.push({
+    id: `${recoId}-${completeId}`,
+    source: recoId,
+    target: completeId,
+  });
+
+  return {
+    name: `${zone.name} - Zone Flow`,
+    description: `Quick exploration flow for ${zone.name} zone`,
+    flow_type: "zone" as const,
+    zone_id: zone.id,
+    nodes,
+    edges,
+  };
+}
+
+
+==================================================
+FILE: logger.ts
+==================================================
+
+import { supabase } from "@/integrations/supabase/client";
+import { Interaction, InteractionEventType } from "@/types/mirour";
+
+/**
+ * Logs a customer interaction for analytics and conversion tracking.
+ * @param storeId The ID of the store
+ * @param sessionId The current session ID (anonymous or otherwise)
+ * @param eventType The type of event (e.g., qr_scan, product_shown)
+ * @param metadata Additional JSON metadata about the event
+ * @param customerId Optional customer ID if they are known
+ */
+export const logInteraction = async (
+  storeId: string,
+  sessionId: string,
+  eventType: InteractionEventType | string,
+  metadata?: Record<string, any>,
+  customerId?: string,
+): Promise<Interaction | null> => {
+  try {
+    const { data, error } = await supabase
+      .from("interactions")
+      .insert({
+        store_id: storeId,
+        session_id: sessionId,
+        event_type: eventType,
+        metadata: metadata || {},
+        customer_id: customerId || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Error logging interaction:", error);
+      return null;
+    }
+
+    return data as Interaction;
+  } catch (err) {
+    console.error("Error in logInteraction:", err);
+    return null;
+  }
+};
+
+
+==================================================
+FILE: mixpanel.ts
+==================================================
+
+import mixpanel from "mixpanel-browser";
+
+const MIXPANEL_TOKEN = "feb7bd3ce238b8ba1fc61e69fa2a4e06";
+
+const isProductionOrStaging =
+  process.env.NODE_ENV !== "development" &&
+  typeof window !== "undefined" &&
+  window.location.hostname !== "localhost";
+
+let initialized = false;
+
+export const initMixpanel = () => {
+  if (initialized || !isProductionOrStaging) return;
+
+  // We do not want to initialize for /f/ routes
+  if (window.location.pathname.startsWith("/f/")) {
+    return;
+  }
+
+  mixpanel.init(MIXPANEL_TOKEN, {
+    autocapture: true,
+    record_sessions_percent: 100,
+  });
+  initialized = true;
+};
+
+export const trackEvent = (eventName: string, props?: Record<string, any>) => {
+  if (!initialized || !isProductionOrStaging) return;
+  if (
+    typeof window !== "undefined" &&
+    window.location.pathname.startsWith("/f/")
+  )
+    return;
+
+  mixpanel.track(eventName, props);
+};
+
+export const identifyUser = (userId: string, traits?: Record<string, any>) => {
+  if (!initialized || !isProductionOrStaging) return;
+  if (
+    typeof window !== "undefined" &&
+    window.location.pathname.startsWith("/f/")
+  )
+    return;
+
+  mixpanel.identify(userId);
+  if (traits) {
+    mixpanel.people.set(traits);
+  }
+};
+
+export const resetMixpanel = () => {
+  if (!initialized || !isProductionOrStaging) return;
+  mixpanel.reset();
+};
+
+
+==================================================
+FILE: nango.ts
+==================================================
+
+// lib/nango.ts
+import { Nango } from "@nangohq/node";
+
+export const nango = new Nango({
+  secretKey: process.env.NANGO_SECRET_KEY!,
+});
+
+
+==================================================
+FILE: posthog.ts
+==================================================
+
+import posthog from "posthog-js";
+
+const POSTHOG_KEY = "phc_1RXnVRJOrHdRjhLXg1SAnQnqyzEeG0bo5cTGI8IzM6Z";
+const POSTHOG_HOST = "https://us.i.posthog.com";
+
+export const initPostHog = () => {
+  if (typeof window !== "undefined") {
+    posthog.init(POSTHOG_KEY, {
+      api_host: POSTHOG_HOST,
+      capture_pageview: true,
+      capture_pageleave: true,
+      autocapture: true,
+      session_recording: {
+        maskAllInputs: false,
+        maskInputFn: (text: string, element?: HTMLElement) => {
+          // Don't mask form inputs so we can see what users type
+          return text;
+        },
+      },
+      persistence: "localStorage+cookie",
+      loaded: (posthog: any) => {
+        if (process.env.NODE_ENV === "development") {
+          // Optionally disable in dev
+          // posthog.opt_out_capturing();
+        }
+      },
+    });
+  }
+  return posthog;
+};
+
+// Identify user when they provide contact info
+export const identifyUser = (email?: string, name?: string, phone?: string) => {
+  if (!email && !name && !phone) return;
+
+  const userId = email || phone || name;
+  if (userId) {
+    posthog.identify(userId, {
+      email: email || undefined,
+      name: name || undefined,
+      phone: phone || undefined,
+    });
+  }
+};
+
+// Track custom events
+export const trackEvent = (
+  eventName: string,
+  properties?: Record<string, unknown>,
+) => {
+  posthog.capture(eventName, properties);
+};
+
+// Link anonymous session to form
+export const trackFormStart = (formId: string, formName?: string) => {
+  posthog.capture("form_started", {
+    form_id: formId,
+    form_name: formName,
+  });
+};
+
+export const trackFormSubmission = (formId: string, formName?: string) => {
+  posthog.capture("form_submitted", {
+    form_id: formId,
+    form_name: formName,
+  });
+};
+
+export { posthog };
+
+
+==================================================
+FILE: product-delete-sync.ts
+==================================================
+
+/**
+ * lib/product-delete-sync.ts
+ *
+ * Client-side helpers for the background product-delete system.
+ *
+ * Usage:
+ *   import { registerProductDeleteSW, queueProductDelete } from '@/lib/product-delete-sync';
+ *
+ *   // Call once on app mount:
+ *   registerProductDeleteSW();
+ *
+ *   // Call instead of direct Supabase delete:
+ *   await queueProductDelete(productId, supabaseUrl, anonKey, accessToken, ownerId);
+ */
+
+// Background Sync API types (not yet in standard TypeScript lib)
+declare global {
+  interface SyncManager {
+    register(tag: string): Promise<void>;
+  }
+  interface ServiceWorkerRegistration {
+    readonly sync: SyncManager;
+  }
+  interface Window {
+    SyncManager?: typeof Object;
+  }
+}
+
+const DB_NAME = "mirour-bg";
+const DB_VERSION = 1;
+const STORE_NAME = "product-delete-queue";
+const SYNC_TAG = "product-delete-sync";
+const SW_PATH = "/sw-product-delete.js";
+
+// ─── Service Worker registration ────────────────────────────────────────────
+
+let swRegistrationPromise: Promise<ServiceWorkerRegistration | null> | null = null;
+
+/**
+ * Registers the product-delete service worker.
+ * Call this once on app startup. Safe to call multiple times (cached).
+ */
+export function registerProductDeleteSW(): void {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+
+  if (!swRegistrationPromise) {
+    swRegistrationPromise = navigator.serviceWorker
+      .register(SW_PATH, { scope: "/" })
+      .then((reg) => {
+        console.log("[product-delete-sync] SW registered:", reg.scope);
+        return reg;
+      })
+      .catch((err) => {
+        console.error("[product-delete-sync] SW registration failed:", err);
+        return null;
+      });
+  }
+}
+
+// ─── IndexedDB helpers ───────────────────────────────────────────────────────
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: "id", autoIncrement: true });
+      }
+    };
+    req.onsuccess = () => resolve(req.result as IDBDatabase);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+interface QueueEntry {
+  productId: string;
+  supabaseUrl: string;
+  supabaseAnonKey: string;
+  authToken: string;
+  ownerId: string;
+  queuedAt: number;
+}
+
+function addToQueue(db: IDBDatabase, entry: QueueEntry): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const req = tx.objectStore(STORE_NAME).add(entry);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ─── Fallback: direct Supabase REST delete ───────────────────────────────────
+
+async function deleteDirectly(
+  productId: string,
+  supabaseUrl: string,
+  supabaseAnonKey: string,
+  authToken: string,
+  ownerId: string
+): Promise<{ error: string | null }> {
+  const url = new URL(`${supabaseUrl}/rest/v1/products`);
+  url.searchParams.set("id", `eq.${productId}`);
+  url.searchParams.set("owner_id", `eq.${ownerId}`);
+
+  try {
+    const res = await fetch(url.toString(), {
+      method: "DELETE",
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: `Bearer ${authToken}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+    });
+
+    if (res.ok || res.status === 404) return { error: null };
+    const body = await res.text().catch(() => "");
+    return { error: `HTTP ${res.status}: ${body}` };
+  } catch (err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// ─── Main export ─────────────────────────────────────────────────────────────
+
+/**
+ * Queues a product deletion for background processing.
+ *
+ * - If Background Sync is available: writes to IndexedDB + registers sync tag.
+ *   The service worker will complete the delete even if the tab is closed.
+ * - If not available (Firefox/Safari): falls back to an inline fetch.
+ *
+ * @returns { error } - null on success (or when queued successfully)
+ */
+export async function queueProductDelete(
+  productId: string,
+  supabaseUrl: string,
+  supabaseAnonKey: string,
+  authToken: string,
+  ownerId: string
+): Promise<{ error: string | null }> {
+  const hasBackgroundSync =
+    typeof navigator !== "undefined" &&
+    "serviceWorker" in navigator &&
+    "SyncManager" in window;
+
+  if (!hasBackgroundSync) {
+    // Fallback — direct delete in the current page context
+    return deleteDirectly(productId, supabaseUrl, supabaseAnonKey, authToken, ownerId);
+  }
+
+  try {
+    // Write to IndexedDB queue
+    const db = await openDB();
+    await addToQueue(db, {
+      productId,
+      supabaseUrl,
+      supabaseAnonKey,
+      authToken,
+      ownerId,
+      queuedAt: Date.now(),
+    });
+
+    // Register Background Sync — browser fires 'sync' event when online,
+    // even if this tab is already closed.
+    const reg = await navigator.serviceWorker.ready;
+    await reg.sync.register(SYNC_TAG);
+
+    return { error: null };
+  } catch (err: unknown) {
+    // If queueing itself fails, fall back to direct delete
+    console.warn("[product-delete-sync] Queue failed, falling back:", err);
+    return deleteDirectly(productId, supabaseUrl, supabaseAnonKey, authToken, ownerId);
+  }
+}
+
+
+==================================================
+FILE: profile-engine.ts
+==================================================
+
+export interface Profile {
+  id: string;
+  display_name: string;
+  description: string | null;
+  is_default: boolean;
+  zones: string[] | null;
+  tags?: string[] | null;
+}
+
+export interface ProfileRule {
+  id: string;
+  profile_id: string;
+  question: string;
+  answer: string;
+  weight: number;
+}
+
+const MINIMUM_PROFILE_SCORE = 3;
+
+/**
+ * M3 Profile Engine
+ * 4-step algorithm to determine the best profile match for a given set of answers.
+ */
+export function evaluateProfile(
+  answers: Record<string, any>,
+  profiles: Profile[],
+  rules: ProfileRule[],
+): Profile {
+  const defaultProfile = profiles.find((p) => p.is_default) || profiles[0];
+
+  if (!profiles || profiles.length === 0) {
+    throw new Error("No profiles provided to evaluateProfile");
+  }
+
+  // 1. Hard branch: non-drinker override
+  // Normalizes question key assuming it could be "Q3" or "q3"
+  const q3Answer = answers["Q3"] || answers["q3"];
+  const isNonDrinker = Array.isArray(q3Answer)
+    ? q3Answer.includes("no")
+    : q3Answer === "no";
+
+  if (isNonDrinker) {
+    const wellnessProfile = profiles.find(
+      (p) =>
+        p.id === "wellness-seeker" ||
+        p.display_name.toLowerCase().includes("wellness"),
+    );
+    return wellnessProfile || defaultProfile;
+  }
+
+  // 2. Weighted scoring from public.profile_rules
+  const scoreMap: Record<string, number> = {};
+  profiles.forEach((p) => {
+    scoreMap[p.id] = 0;
+  });
+
+  rules.forEach((rule) => {
+    // Accommodate 'Qx' or 'qx' keys
+    const userAnswer =
+      answers[rule.question] ||
+      answers[rule.question.toLowerCase()] ||
+      answers[rule.question.toUpperCase()];
+    if (userAnswer) {
+      if (Array.isArray(userAnswer)) {
+        if (userAnswer.includes(rule.answer)) {
+          scoreMap[rule.profile_id] += rule.weight;
+        }
+      } else if (
+        String(userAnswer).toLowerCase() === String(rule.answer).toLowerCase()
+      ) {
+        scoreMap[rule.profile_id] += rule.weight;
+      }
+    }
+  });
+
+  const sortedProfiles = profiles
+    .map((p) => ({ profile: p, score: scoreMap[p.id] || 0 }))
+    .sort((a, b) => b.score - a.score);
+
+  // 3. Catch-all check
+  if (sortedProfiles[0].score < MINIMUM_PROFILE_SCORE) {
+    return defaultProfile; // curious-explorer usually
+  }
+
+  // 4. Tiebreaker
+  if (
+    sortedProfiles.length > 1 &&
+    sortedProfiles[0].score === sortedProfiles[1].score
+  ) {
+    const q4Answer = answers["Q4"] || answers["q4"];
+    if (q4Answer) {
+      const q4Str = String(q4Answer).toLowerCase();
+
+      const checkTags = (p: Profile) => {
+        if (p.tags) return p.tags.some((t) => t.toLowerCase() === q4Str);
+        if (p.zones)
+          return p.zones.some((z) => z.toLowerCase().includes(q4Str));
+        return false;
+      };
+
+      const p1Matches = checkTags(sortedProfiles[0].profile);
+      const p2Matches = checkTags(sortedProfiles[1].profile);
+
+      if (p1Matches && !p2Matches) return sortedProfiles[0].profile;
+      if (p2Matches && !p1Matches) return sortedProfiles[1].profile;
+    }
+
+    // If tiebreaker fails, fallback to default to avoid random assignments
+    return defaultProfile;
+  }
+
+  return sortedProfiles[0].profile;
+}
+
+
+==================================================
+FILE: rewriteQuery.ts
+==================================================
+
+// lib/rewriteQuery.ts
+import { Mistral } from "@mistralai/mistralai";
+
+const mistral = new Mistral({ apiKey: process.env.MISTRAL_API_KEY });
+
+export async function rewriteQueryForSearch(
+  query: string,
+  storeContext?: string, // optional: e.g. "beverage store", "clothing store"
+): Promise<string> {
+  try {
+    const res = await mistral.chat.complete({
+      model: "mistral-small-2506", // small is plenty for rewrites — fast + cheap
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: `You are a product search assistant${storeContext ? ` for a ${storeContext}` : ""}.
+Rewrite the user's natural language query into a clean, keyword-rich search phrase
+that will match product names, descriptions, and tags in a product catalog.
+
+Rules:
+- Fix typos and spelling mistakes
+- Expand vague intent into concrete product keywords
+- Remove filler words ("i want", "something", "a bit", "like")
+- Handle negations: "not too sweet" → "low sugar mild subtle"
+- Handle occasion/mood: "for sleep" → "sleep aid calming chamomile melatonin relaxing"
+- Handle gift context: "gift for mom who likes floral" → "floral rose jasmine gift feminine"
+- Return ONLY the rewritten keywords, nothing else
+- Max 15 words
+- No punctuation, no quotes`,
+        },
+        {
+          role: "user",
+          content: query,
+        },
+      ],
+    });
+
+    const rewritten = (res.choices?.[0]?.message?.content as string)?.trim();
+    return rewritten || query; // fallback to original if anything goes wrong
+  } catch (err) {
+    console.warn("[rewriteQuery] Mistral rewrite failed, using original:", err);
+    return query; // never break search if rewrite fails
+  }
+}
+
+
+==================================================
+FILE: savedItems.ts
+==================================================
+
+import { supabase } from "@/integrations/supabase/client";
+import { SavedItem } from "@/types/mirour";
+
+export const saveItem = async (
+  sessionId: string,
+  productId: string,
+  storeId?: string | null,
+  customerId?: string,
+): Promise<SavedItem | null> => {
+  try {
+    if (customerId) {
+      const { data: existing } = await supabase
+        .from("saved_items")
+        .select(
+          `
+          id, store_id, customer_id, session_id, product_id, created_at, purchased_at,
+          products ( id, name, price, image_url, description, sku )
+        `,
+        )
+        .eq("customer_id", customerId)
+        .eq("product_id", productId)
+        .maybeSingle();
+      if (existing) return existing as unknown as SavedItem;
+    }
+
+    const { data, error } = await supabase
+      .from("saved_items")
+      .insert({
+        store_id: storeId ?? null,
+        session_id: sessionId,
+        product_id: productId,
+        customer_id: customerId ?? null,
+      } as any)
+      .select(
+        `
+        id, store_id, customer_id, session_id, product_id, created_at, purchased_at,
+        products ( id, name, price, image_url, description, sku )
+      `,
+      )
+      .single();
+
+    if (error) {
+      if (error.code === "23505") {
+        // Race condition: already saved — fetch and return the existing row
+        const { data: existing } = customerId
+          ? await supabase
+              .from("saved_items")
+              .select(
+                "*, products(id, name, price, image_url, description, sku)",
+              )
+              .eq("customer_id", customerId)
+              .eq("product_id", productId)
+              .maybeSingle()
+          : await supabase
+              .from("saved_items")
+              .select(
+                "*, products(id, name, price, image_url, description, sku)",
+              )
+              .eq("session_id", sessionId)
+              .eq("product_id", productId)
+              .is("customer_id", null)
+              .maybeSingle();
+        return existing as unknown as SavedItem | null;
+      }
+      console.error("Error saving item:", error);
+      return null;
+    }
+
+    return data as unknown as SavedItem;
+  } catch (error) {
+    console.error("Error in saveItem:", error);
+    return null;
+  }
+};
+
+export const unsaveItem = async (
+  sessionId: string,
+  productId: string,
+  customerId?: string,
+): Promise<boolean> => {
+  try {
+    let query = supabase
+      .from("saved_items")
+      .delete()
+      .eq("product_id", productId);
+
+    if (customerId) {
+      query = query.eq("customer_id", customerId);
+    } else {
+      query = query.eq("session_id", sessionId).is("customer_id", null);
+    }
+
+    const { error } = await query;
+    if (error) {
+      console.error("Error unsaving item:", error);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("Error in unsaveItem:", error);
+    return false;
+  }
+};
+
+export const getSavedItems = async (
+  sessionId: string,
+  customerId?: string,
+): Promise<SavedItem[]> => {
+  try {
+    let query = supabase
+      .from("saved_items")
+      .select(
+        `
+        id, store_id, customer_id, session_id, product_id, created_at, purchased_at,
+        products ( id, name, price, image_url, description, sku )
+      `,
+      )
+      .order("created_at", { ascending: false });
+
+    if (customerId) {
+      query = query.eq("customer_id", customerId);
+    } else {
+      query = query.eq("session_id", sessionId).is("customer_id", null);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error("Error getting saved items:", error);
+      return [];
+    }
+    return (data ?? []) as unknown as SavedItem[];
+  } catch (error) {
+    console.error("Error in getSavedItems:", error);
+    return [];
+  }
+};
+
+/**
+ * Re-attributes session saved items from one customer to another.
+ * Used when a user switches identity at the contact step ("Not me?").
+ * Items that the new customer already has saved are deleted first to avoid
+ * unique-constraint violations, then the rest are moved over.
+ */
+export const migrateSavedItemsBetweenCustomers = async (
+  sessionId: string,
+  fromCustomerId: string, // who was logged in when items were saved
+  toCustomerId: string,   // who just identified themselves
+): Promise<boolean> => {
+  try {
+    // 1. Find what the new customer already has saved (dedup guard)
+    const { data: alreadySaved } = await supabase
+      .from("saved_items")
+      .select("product_id")
+      .eq("customer_id", toCustomerId);
+
+    const alreadySavedIds = new Set<string>(
+      (alreadySaved ?? []).map((r: any) => r.product_id),
+    );
+
+    // 2. Delete session rows that would create duplicates for the target customer
+    if (alreadySavedIds.size > 0) {
+      await supabase
+        .from("saved_items")
+        .delete()
+        .eq("session_id", sessionId)
+        .eq("customer_id", fromCustomerId)
+        .in("product_id", Array.from(alreadySavedIds));
+    }
+
+    // 3. Move the rest: old customer → new customer (same session)
+    const { error } = await supabase
+      .from("saved_items")
+      .update({ customer_id: toCustomerId } as any)
+      .eq("session_id", sessionId)
+      .eq("customer_id", fromCustomerId);
+
+    if (error) {
+      console.error("[migrateSavedItemsBetweenCustomers] error:", error);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("[migrateSavedItemsBetweenCustomers] unexpected error:", e);
+    return false;
+  }
+};
+
+export const linkSavedItemsToCustomer = async (
+  sessionId: string,
+  customerId: string,
+): Promise<boolean> => {
+  try {
+    // 1. Find products this customer already has saved (dedup guard)
+    const { data: customerExisting, error: existingError } = await supabase
+      .from("saved_items")
+      .select("product_id")
+      .eq("customer_id", customerId);
+
+    if (existingError) {
+      console.error("Error fetching existing customer saves:", existingError);
+      return false;
+    }
+
+    const alreadySaved = new Set<string>(
+      (customerExisting ?? []).map((r: any) => r.product_id),
+    );
+
+    // 2. Delete session rows that would violate unique constraint
+    if (alreadySaved.size > 0) {
+      const { error: deleteError } = await supabase
+        .from("saved_items")
+        .delete()
+        .eq("session_id", sessionId)
+        .is("customer_id", null)
+        .in("product_id", Array.from(alreadySaved));
+
+      if (deleteError) {
+        console.error("Error deleting duplicate session saves:", deleteError);
+        return false;
+      }
+    }
+
+    // 3. Migrate remaining session rows to the customer
+    const { error } = await supabase
+      .from("saved_items")
+      .update({ customer_id: customerId } as any)
+      .eq("session_id", sessionId)
+      .is("customer_id", null);
+
+    if (error) {
+      console.error("Error linking saved items:", error);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    console.error("Error in linkSavedItemsToCustomer:", error);
+    return false;
+  }
+};
+
+
+==================================================
+FILE: storage.ts
+==================================================
+
+import { supabase } from "@/integrations/supabase/client";
+
+/**
+ * Upload an image to the form-uploads bucket
+ * @param file - The file to upload
+ * @param path - The path within the bucket (e.g., 'responses/form-id/session-id')
+ * @returns The public URL of the uploaded file, or null if upload failed
+ */
+export const uploadFormImage = async (
+  file: File,
+  path: string,
+): Promise<string | null> => {
+  try {
+    // Generate a unique filename
+    const timestamp = Date.now();
+    const extension = file.name.split(".").pop() || "jpg";
+    const filename = `${timestamp}.${extension}`;
+    const fullPath = `${path}/${filename}`;
+
+    // Upload the file
+    const { error: uploadError } = await supabase.storage
+      .from("form-uploads")
+      .upload(fullPath, file, {
+        cacheControl: "3600",
+        upsert: false,
+      });
+
+    if (uploadError) {
+      console.error("Upload error:", uploadError);
+      return null;
+    }
+
+    // Get the public URL
+    const {
+      data: { publicUrl },
+    } = supabase.storage.from("form-uploads").getPublicUrl(fullPath);
+
+    return publicUrl;
+  } catch (error) {
+    console.error("Error uploading image:", error);
+    return null;
+  }
+};
+
+/**
+ * Upload a response image (customer photo uploads)
+ */
+export const uploadResponseImage = async (
+  file: File,
+  formId: string,
+  sessionId: string,
+): Promise<string | null> => {
+  return uploadFormImage(file, `responses/${formId}/${sessionId}`);
+};
+
+/**
+ * Upload a form section image (for welcome/complete cards)
+ */
+export const uploadSectionImage = async (
+  file: File,
+  formId: string,
+  sectionId: string,
+): Promise<string | null> => {
+  return uploadFormImage(file, `forms/${formId}/sections`);
+};
+
+/**
+ * Delete an image from storage by URL
+ */
+export const deleteFormImage = async (publicUrl: string): Promise<boolean> => {
+  try {
+    // Extract the path from the URL
+    const url = new URL(publicUrl);
+    const pathMatch = url.pathname.match(
+      /\/storage\/v1\/object\/public\/form-uploads\/(.+)/,
+    );
+
+    if (!pathMatch) {
+      console.error("Could not extract path from URL:", publicUrl);
+      return false;
+    }
+
+    const path = pathMatch[1];
+
+    const { error } = await supabase.storage
+      .from("form-uploads")
+      .remove([path]);
+
+    if (error) {
+      console.error("Delete error:", error);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Error deleting image:", error);
+    return false;
+  }
+};
+
+
+==================================================
+FILE: tags.ts
+==================================================
+
+import { supabase } from "@/integrations/supabase/client";
+import { CustomerTag } from "@/types/mirour";
+
+/**
+ * Appends a tag to a customer's profile or an anonymous session.
+ */
+export const appendTag = async (
+  storeId: string,
+  sessionId: string,
+  tagId: string,
+  source: string,
+  customerId?: string,
+): Promise<CustomerTag | null> => {
+  try {
+    const { data, error } = await supabase
+      .from("customer_tags")
+      .insert({
+        store_id: storeId,
+        session_id: sessionId,
+        tag_id: tagId,
+        source,
+        customer_id: customerId || null,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Error appending tag:", error);
+      return null;
+    }
+
+    return data as CustomerTag;
+  } catch (error) {
+    console.error("Error in appendTag:", error);
+    return null;
+  }
+};
+
+/**
+ * Appends multiple tags at once.
+ */
+export const appendTags = async (
+  storeId: string,
+  sessionId: string,
+  tagIds: string[],
+  source: string,
+  customerId?: string,
+): Promise<CustomerTag[]> => {
+  if (!tagIds || tagIds.length === 0) return [];
+
+  try {
+    const records = tagIds.map((tagId) => ({
+      store_id: storeId,
+      session_id: sessionId,
+      tag_id: tagId,
+      source,
+      customer_id: customerId || null,
+    }));
+
+    const { data, error } = await supabase
+      .from("customer_tags")
+      .insert(records)
+      .select();
+
+    if (error) {
+      console.error("Error appending tags:", error);
+      return [];
+    }
+
+    return data as CustomerTag[];
+  } catch (error) {
+    console.error("Error in appendTags:", error);
+    return [];
+  }
+};
+
+/**
+ * Retrieves all tags for a given session.
+ */
+export const getSessionTags = async (
+  storeId: string,
+  sessionId: string,
+): Promise<CustomerTag[]> => {
+  try {
+    const { data, error } = await supabase
+      .from("customer_tags")
+      .select("*")
+      .eq("session_id", sessionId);
+
+    if (error) {
+      console.error("Error getting session tags:", error);
+      return [];
+    }
+
+    return data as CustomerTag[];
+  } catch (error) {
+    console.error("Error in getSessionTags:", error);
+    return [];
+  }
+};
+
+/**
+ * Retrieves all historical tags for a known customer.
+ */
+export const getCustomerTags = async (
+  storeId: string,
+  customerId: string,
+): Promise<CustomerTag[]> => {
+  try {
+    const { data, error } = await supabase
+      .from("customer_tags")
+      .select("*")
+      .eq("customer_id", customerId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("Error getting customer tags:", error);
+      return [];
+    }
+
+    return data as CustomerTag[];
+  } catch (error) {
+    console.error("Error in getCustomerTags:", error);
+    return [];
+  }
+};
+
+
+==================================================
+FILE: utils.ts
+==================================================
+
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+// Convert UTC timestamp to store's local timezone
+export function formatInStoreTime(
+  date: string | Date,
+  timezone: string = "America/New_York",
+): string {
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return "N/A";
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(d);
+}
+
+

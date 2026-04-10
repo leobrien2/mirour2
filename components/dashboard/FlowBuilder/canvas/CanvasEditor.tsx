@@ -1,7 +1,6 @@
-// components/canvas/CanvasEditor.tsx
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
   DndContext,
   closestCenter,
@@ -51,7 +50,7 @@ import {
 import type {
   CanvasBlock,
   CanvasStep,
-  CanvasFlow, // ← ADD THIS IMPORT
+  CanvasFlow,
   BlockData,
   BlockType,
   DeviceView,
@@ -103,6 +102,7 @@ type SortableBlockRowProps = {
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  simProducts?: any[]; // ← ADD
 };
 
 function SortableBlockRow({
@@ -110,6 +110,7 @@ function SortableBlockRow({
   isSelected,
   onSelect,
   onDelete,
+  simProducts, // ← ADD
 }: SortableBlockRowProps) {
   const {
     attributes,
@@ -182,7 +183,8 @@ function SortableBlockRow({
             bg-primary rounded-full z-10"
           />
         )}
-        <BlockRenderer block={block} />
+        <BlockRenderer block={block} simProducts={simProducts} />{" "}
+        {/* ← FIXED */}
       </div>
     </div>
   );
@@ -279,24 +281,27 @@ const BOTTOM_QUICK_ADD: { type: BlockType; icon: React.ElementType }[] = [
 // ── Main CanvasEditor ─────────────────────────────────────────────────────────
 
 type CanvasEditorProps = {
-  flow?: CanvasFlow; // ← ADD: full flow object (needed by FlowPlayer in preview)
+  flow?: CanvasFlow;
   step: CanvasStep;
   allSteps: CanvasStep[];
-  storeId?: string; // ← ADD: active store ID (needed for tag/product pickers + preview)
+  storeId?: string;
   onChange: (updated: CanvasStep) => void;
 };
 
 export function CanvasEditor({
-  flow, // ← destructure
+  flow,
   step,
   allSteps,
-  storeId, // ← destructure
+  storeId,
   onChange,
 }: CanvasEditorProps) {
   const [device, setDevice] = useState<DeviceView>("mobile");
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [activeBlock, setActiveBlock] = useState<CanvasBlock | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  const [simProductsByBlock, setSimProductsByBlock] = useState<
+    Record<string, any[]>
+  >({}); // ← ADD
   const canvasRef = useRef<HTMLDivElement>(null);
   const autoSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isFirstMount = useRef(true);
@@ -319,7 +324,63 @@ export function CanvasEditor({
     .map((s) => ({ id: s.id, label: s.label }));
 
   // ── Block mutations ─────────────────────────────────────────────────────────
+  // Add this inside CanvasEditor, after the simProductsByBlock state declaration
 
+  useEffect(() => {
+    const taggedProductsBlocks = step.blocks.filter(
+      (b) => b.data.type === "products" && (b.data as any).mode === "tagged",
+    );
+    if (taggedProductsBlocks.length === 0) return;
+    if (!flow?.id && !storeId) return;
+
+    // Collect all tagged options across the whole flow
+    const allTaggedOptions: { id: string; tags: string[] }[] = [];
+    for (const s of allSteps) {
+      for (const block of s.blocks ?? []) {
+        const bd = block.data as any;
+        if (bd?.type === "select") {
+          for (const opt of bd.options ?? []) {
+            if ((opt.tags?.length ?? 0) > 0 && opt.label?.trim()) {
+              allTaggedOptions.push({ id: opt.id, tags: opt.tags });
+            }
+          }
+        }
+      }
+    }
+    if (allTaggedOptions.length === 0) return;
+
+    // Default simulation: first 2 tagged options
+    const defaultTags = [
+      ...new Set(allTaggedOptions.slice(0, 2).flatMap((o) => o.tags)),
+    ];
+    if (defaultTags.length === 0) return;
+
+    // Fetch for each tagged products block
+    for (const block of taggedProductsBlocks) {
+      const bd = block.data as any;
+      fetch("/api/products/by-tags", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          formId: flow?.id ?? storeId,
+          tagIds: defaultTags,
+          strategy: bd.matchStrategy ?? "any",
+          limit: bd.resultLimit ?? 15,
+        }),
+      })
+        .then((r) => r.json())
+        .then(({ products: fetched }) => {
+          setSimProductsByBlock((prev) => ({
+            ...prev,
+            [block.id]: fetched ?? [],
+          }));
+        })
+        .catch(() => {
+          setSimProductsByBlock((prev) => ({ ...prev, [block.id]: [] }));
+        });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step.id, allSteps.map((s) => s.id).join(","), flow?.id, storeId]);
   const addBlock = useCallback(
     (type: BlockType) => {
       const newBlock: CanvasBlock = {
@@ -567,7 +628,7 @@ export function CanvasEditor({
                     {showPreview ? (
                       flow ? (
                         <FlowPlayer
-                          key={`preview-${flow.id}`} // showPreview in key not needed — component only mounts when showPreview=true
+                          key={`preview-${flow.id}`}
                           flow={flow}
                           formId={flow.id}
                           storeId={storeId}
@@ -577,7 +638,6 @@ export function CanvasEditor({
                           isPreview={true}
                         />
                       ) : (
-                        // flow not ready yet — shouldn't normally be visible but safe fallback
                         <div className="flex flex-col items-center justify-center min-h-[400px] gap-3">
                           <div className="w-8 h-8 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
                           <p className="text-sm text-muted-foreground/50">
@@ -587,7 +647,7 @@ export function CanvasEditor({
                       )
                     ) : (
                       // ── Edit mode ──────────────────────────────────────────
-                      <div className="p-5 sm:p-7">
+                      <div className="">
                         <DndContext
                           sensors={sensors}
                           collisionDetection={closestCenter}
@@ -606,6 +666,7 @@ export function CanvasEditor({
                                   isSelected={selectedBlockId === block.id}
                                   onSelect={() => setSelectedBlockId(block.id)}
                                   onDelete={() => deleteBlock(block.id)}
+                                  simProducts={simProductsByBlock[block.id]} // ← ADD
                                 />
                               ))}
                             </div>
@@ -682,6 +743,15 @@ export function CanvasEditor({
               storeId={storeId}
               allSteps={allSteps}
               formId={flow?.id}
+              onSimProductsChange={(
+                blockId,
+                prods, // ← renamed to avoid shadowing useStores `products`
+              ) =>
+                setSimProductsByBlock((prev) => ({
+                  ...prev,
+                  [blockId]: prods,
+                }))
+              }
             />
           )}
         </div>

@@ -3,14 +3,12 @@ import {
   Gift,
   ChevronDown,
   List,
-  Timer,
   Database,
   Clock,
   Monitor,
   Globe,
   CheckCircle2,
   Circle,
-  MapPin,
 } from "lucide-react";
 
 type SubmissionAccordionProps = {
@@ -44,24 +42,43 @@ function getNodeLabel(
   nodeId: string,
   formSchema: DashboardForm | undefined,
 ): string {
-  // 1. Check form schema — only use if it gives a real human label
-  if (formSchema?.questions) {
-    const node = formSchema.questions.find((q: any) => q.id === nodeId) as any;
-    const schemaLabel = node?.label || node?.header || node?.title;
+  // 1. Deep check form schema (handles both flat arrays and nested steps/blocks)
+  const qs = formSchema?.questions as any;
+  if (qs) {
+    let allBlocks: any[] = [];
+    if (Array.isArray(qs)) {
+      qs.forEach((item) => {
+        if (item.blocks) allBlocks.push(...item.blocks);
+        else allBlocks.push(item);
+      });
+    } else if (qs.steps) {
+      qs.steps.forEach((step: any) => {
+        if (step.blocks) allBlocks.push(...step.blocks);
+      });
+    }
 
-    if (schemaLabel && schemaLabel.trim() !== "" && schemaLabel !== nodeId) {
-      return schemaLabel;
+    const node = allBlocks.find((q: any) => q.id === nodeId);
+    if (node) {
+      const schemaLabel = node.label || node.header || node.title;
+      if (schemaLabel && schemaLabel.trim() !== "" && schemaLabel !== nodeId) {
+        return schemaLabel;
+      }
     }
   }
+
   // 2. Static map for known system nodes
   if (NODE_LABEL_MAP[nodeId]) return NODE_LABEL_MAP[nodeId];
-  // 3. Prettify: "node-rec" → "Rec", "node-dietary-pref" → "Dietary Pref"
-  return nodeId
-    .replace(/^node-/, "")
-    .replace(/-/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
 
+  // 3. Prettify fallback: "node-rec" → "Rec", "node-dietary-pref" → "Dietary Pref"
+  if (nodeId.includes("-") || nodeId.includes("_")) {
+    return nodeId
+      .replace(/^node-/, "")
+      .replace(/[-_]/g, " ")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  return nodeId;
+}
 
 export function SubmissionAccordion({
   submission,
@@ -81,13 +98,10 @@ export function SubmissionAccordion({
 
   const { _meta, _quizScore, ...actualAnswers } = submission.answers || {};
 
+  // Reliably fetch the labels using our robust helper function
   const formattedAnswers = Object.entries(actualAnswers).map(
     ([nodeId, val]) => {
-      let label = nodeId;
-      if (formSchema?.questions) {
-        const node = formSchema.questions.find((q: any) => q.id === nodeId);
-        if (node) label = node.label || node.header || `Step (${nodeId})`;
-      }
+      const label = getNodeLabel(nodeId, formSchema);
       return { id: nodeId, label, value: val };
     },
   );
@@ -122,77 +136,6 @@ export function SubmissionAccordion({
     1,
   );
 
-  // Build session summary cells — only include cells with data
-  const summaryItems = [
-    submission.redemptionCode
-      ? {
-          key: "reward",
-          icon: <Gift className="w-3.5 h-3.5" />,
-          label: "Reward Code",
-          primary: submission.redemptionCode,
-          badge: submission.perkRedeemed
-            ? { text: "✓ Redeemed", cls: "bg-green-500/10 text-green-500" }
-            : { text: "Available", cls: "bg-blue-500/10 text-blue-500" },
-        }
-      : null,
-    session?.browser || session?.device_type
-      ? {
-          key: "device",
-          icon: <Monitor className="w-3.5 h-3.5" />,
-          label: "Device",
-          primary:
-            [session?.browser, session?.os].filter(Boolean).join(" · ") || "—",
-          secondary: session?.device_type
-            ? session.device_type.charAt(0).toUpperCase() +
-              session.device_type.slice(1)
-            : null,
-        }
-      : null,
-    session?.city || session?.country || _meta?.zone_id
-      ? {
-          key: "location",
-          icon: <Globe className="w-3.5 h-3.5" />,
-          label: "Location",
-          primary:
-            [session?.city, session?.country].filter(Boolean).join(", ") || "—",
-          secondary: _meta?.zone_id ? `Zone: ${_meta.zone_id}` : null,
-        }
-      : null,
-    {
-      key: "time",
-      icon: <Clock className="w-3.5 h-3.5" />,
-      label: "Submitted",
-      primary: new Date(submission.submittedAt).toLocaleString(undefined, {
-        month: "short",
-        day: "numeric",
-        year: "numeric",
-      }),
-      secondary: [
-        new Date(submission.submittedAt).toLocaleString(undefined, {
-          hour: "numeric",
-          minute: "2-digit",
-        }),
-        displayTotalTime != null
-          ? `${formatSeconds(displayTotalTime)} session`
-          : null,
-      ]
-        .filter(Boolean)
-        .join(" · "),
-    },
-    // Fallback: raw user agent if no session browser info
-    !session?.browser && _meta?.user_agent
-      ? {
-          key: "agent",
-          icon: <Monitor className="w-3.5 h-3.5" />,
-          label: "Agent",
-          primary: _meta.user_agent,
-          secondary: null,
-        }
-      : null,
-  ].filter(Boolean) as any[];
-
-  const colCount = summaryItems.length;
-
   return (
     <div className="border-b border-border last:border-b-0">
       {/* ════════════════════════════════════
@@ -221,11 +164,6 @@ export function SubmissionAccordion({
                   minute: "2-digit",
                 })}
               </span>
-              {displayTotalTime != null && (
-                <span className="text-sm text-muted-foreground/60">
-                  · {formatSeconds(displayTotalTime)} to complete
-                </span>
-              )}
             </div>
           </div>
         </div>
@@ -240,11 +178,7 @@ export function SubmissionAccordion({
               <Circle className="w-3.5 h-3.5" /> {session.status}
             </span>
           ) : null}
-          {submission.perkRedeemed && (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-green-500/10 text-green-500 text-xs font-semibold">
-              <Gift className="w-3.5 h-3.5" /> Redeemed
-            </span>
-          )}
+
           <ChevronDown
             className={`w-4 h-4 text-muted-foreground transition-transform duration-200 ${
               isExpanded ? "rotate-180" : ""
@@ -304,66 +238,6 @@ export function SubmissionAccordion({
               </p>
             )}
           </div>
-
-          {/* ── BLOCK 3: Session Summary ── */}
-          {summaryItems.length > 0 && (
-            <div className="rounded-2xl border border-border overflow-hidden">
-              <div className="px-4 py-2.5 border-b border-border bg-muted/30 flex items-center gap-2">
-                <Database className="w-3.5 h-3.5 text-muted-foreground" />
-                <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Session Summary
-                </span>
-              </div>
-              <div
-                className={`grid divide-border ${
-                  colCount === 4
-                    ? "grid-cols-2 sm:grid-cols-4 divide-x divide-y sm:divide-y-0"
-                    : colCount === 3
-                      ? "grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x"
-                      : colCount === 2
-                        ? "grid-cols-2 divide-x"
-                        : "grid-cols-1"
-                }`}
-              >
-                {summaryItems.map((item: any) => (
-                  <div
-                    key={item.key}
-                    className="px-4 py-3 flex flex-col gap-1 min-w-0"
-                  >
-                    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                      {item.icon}
-                      {item.label}
-                    </span>
-                    {item.key === "reward" ? (
-                      <>
-                        <span className="text-base font-bold font-mono text-foreground tracking-widest truncate">
-                          {item.primary}
-                        </span>
-                        {item.badge && (
-                          <span
-                            className={`text-xs font-bold w-fit px-2 py-0.5 rounded-md ${item.badge.cls}`}
-                          >
-                            {item.badge.text}
-                          </span>
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        <span className="text-sm font-semibold text-foreground truncate">
-                          {item.primary}
-                        </span>
-                        {item.secondary && (
-                          <span className="text-xs text-muted-foreground truncate">
-                            {item.secondary}
-                          </span>
-                        )}
-                      </>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
       )}
     </div>

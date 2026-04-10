@@ -14,9 +14,10 @@ import {
   CheckCircle2,
 } from "lucide-react";
 import type { CanvasFlow } from "@/types/canvas";
-import { useAIFlowGen, type AIMessage } from "@/hooks/useAIFlowGen"
+import { useAIFlowGen, type AIMessage } from "@/hooks/useAIFlowGen";
+import { FlowPreviewCard } from "@/components/dashboard/FlowBuilder/flow/FlowPreviewCard";
 
-// Simple markdown-lite: bold **text** only
+// ── Markdown-lite renderer (bold only) ───────────────────────────────────────
 function RenderText({ text }: { text: string }) {
   const parts = text.split(/(\*\*[^*]+\*\*)/g);
   return (
@@ -32,6 +33,7 @@ function RenderText({ text }: { text: string }) {
   );
 }
 
+// ── Message bubble ────────────────────────────────────────────────────────────
 function MessageBubble({
   msg,
   onApply,
@@ -47,7 +49,9 @@ function MessageBubble({
           <Sparkles className="w-3 h-3 text-primary" />
         </div>
       )}
-      <div className={`max-w-[85%] space-y-2`}>
+
+      <div className="max-w-[88%] space-y-2 min-w-0">
+        {/* Text bubble */}
         <div
           className={`px-3 py-2 rounded-2xl text-xs leading-relaxed ${
             isUser
@@ -58,7 +62,15 @@ function MessageBubble({
           <RenderText text={msg.content} />
         </div>
 
-        {/* Apply button if flow was generated */}
+        {/* Flow preview — shown BEFORE the apply button */}
+        {msg.generatedFlow && (
+          <FlowPreviewCard
+            flow={msg.generatedFlow}
+            tagsSummary={msg.tagsSummary}
+          />
+        )}
+
+        {/* Apply button */}
         {msg.generatedFlow && onApply && (
           <button
             onClick={() => onApply(msg.generatedFlow!)}
@@ -78,35 +90,39 @@ function MessageBubble({
   );
 }
 
+// ── Starter prompts ───────────────────────────────────────────────────────────
 const STARTER_PROMPTS = [
   "Create a skincare quiz that recommends products by skin type",
-  "Build a coffee preferences flow with 3 questions",
+  "Build a supplement recommendation flow with 4 questions",
   "Make a lead capture form for a clothing store",
-  "Product recommendation quiz for a supplement brand",
+  "Conference networking qualifier — 3 questions with outcomes",
 ];
 
+// ── Main component ────────────────────────────────────────────────────────────
 interface AIChatPanelProps {
   onApplyFlow: (flow: CanvasFlow) => void;
   isOpen: boolean;
   onClose: () => void;
+  storeId?: string; // ← NEW: passed from FlowBuilder
 }
 
 export function AIChatPanel({
   onApplyFlow,
   isOpen,
   onClose,
+  storeId,
 }: AIChatPanelProps) {
-  const { messages, state, error, sendMessage, reset } = useAIFlowGen();
+  const { messages, state, error, sendMessage, reset } = useAIFlowGen({storeId});
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-scroll to latest message
+  // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Focus input when panel opens
+  // Focus on open
   useEffect(() => {
     if (isOpen) setTimeout(() => textareaRef.current?.focus(), 100);
   }, [isOpen]);
@@ -144,24 +160,27 @@ export function AIChatPanel({
 
       {/* Panel */}
       <div
-        className="relative z-10 w-full sm:w-[400px] h-[85vh] sm:h-[600px] flex flex-col
-        bg-background border border-border/60 rounded-t-3xl sm:rounded-2xl shadow-2xl overflow-hidden
-        animate-in slide-in-from-bottom-4 sm:slide-in-from-right-4 duration-300"
+        className="relative z-10 w-full sm:w-[420px] h-[88vh] sm:h-[640px] flex flex-col
+          bg-background border border-border/60 rounded-t-3xl sm:rounded-2xl
+          shadow-2xl overflow-hidden
+          animate-in slide-in-from-bottom-4 sm:slide-in-from-right-4 duration-300"
       >
         {/* Header */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-border/40 shrink-0">
           <div className="w-8 h-8 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center">
             <Wand2 className="w-4 h-4 text-primary" />
           </div>
-          <div className="flex-1">
+          <div className="flex-1 min-w-0">
             <p className="text-sm font-semibold text-foreground">
               AI Flow Builder
             </p>
-            <p className="text-[10px] text-muted-foreground">
-              Describe your flow in plain English
+            <p className="text-[10px] text-muted-foreground truncate">
+              {storeId
+                ? "Store tags enabled — smart product matching active"
+                : "Describe your flow in plain English"}
             </p>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1 shrink-0">
             {messages.length > 0 && (
               <button
                 onClick={reset}
@@ -193,8 +212,9 @@ export function AIChatPanel({
                   Describe your flow
                 </p>
                 <p className="text-xs text-muted-foreground leading-relaxed max-w-[280px] mx-auto">
-                  Tell me what kind of quiz or form you need and I'll generate
-                  it instantly.
+                  Tell me what quiz or form you need. I'll ask if I need
+                  clarification, then generate it with proper routing and
+                  product tag matching.
                 </p>
               </div>
 
@@ -227,14 +247,14 @@ export function AIChatPanel({
 
               {/* Loading indicator */}
               {state === "loading" && (
-                <div className="flex items-center gap-2 px-3 py-2">
+                <div className="flex items-center gap-2 px-1 py-1">
                   <div className="w-6 h-6 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
                     <Sparkles className="w-3 h-3 text-primary" />
                   </div>
                   <div className="flex items-center gap-1.5 px-3 py-2 rounded-2xl rounded-tl-sm bg-muted/60 border border-border/40">
                     <Loader2 className="w-3 h-3 text-primary animate-spin" />
                     <span className="text-xs text-muted-foreground">
-                      Generating flow...
+                      Building flow…
                     </span>
                   </div>
                 </div>
@@ -253,29 +273,23 @@ export function AIChatPanel({
         </div>
 
         {/* Input */}
-        <div className="px-3 pb-3 pt-2 border-t border-border/40 shrink-0">
-          <div
-            className="flex items-end gap-2 p-1.5 rounded-2xl border border-border/60
-            bg-muted/20 focus-within:border-primary/40 focus-within:bg-background transition-all shadow-sm"
-          >
+        <div className="p-3 border-t border-border/40 shrink-0 bg-background">
+          <div className="flex items-end gap-2 p-2 rounded-xl border border-border/60 bg-muted/10 focus-within:border-primary/40 focus-within:ring-1 focus-within:ring-primary/20 transition-all">
             <textarea
               ref={textareaRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKey}
-              placeholder="Describe your flow... (Enter to send)"
-              rows={1}
-              disabled={state === "loading"}
-              className="flex-1 resize-none bg-transparent text-xs text-foreground placeholder:text-muted-foreground/50
-                outline-none px-2 py-1.5 max-h-28 leading-relaxed disabled:opacity-50"
-              style={{ minHeight: "36px" }}
+              placeholder="Describe your flow... (Enter to send, Shift+Enter for newline)"
+              rows={2}
+              className="flex-1 text-xs bg-transparent outline-none resize-none text-foreground placeholder:text-muted-foreground/50 leading-relaxed"
             />
             <button
               onClick={handleSend}
               disabled={!input.trim() || state === "loading"}
-              className="shrink-0 w-8 h-8 rounded-xl bg-primary flex items-center justify-center
-                text-primary-foreground hover:bg-primary/90 transition-all
-                disabled:opacity-40 disabled:cursor-not-allowed"
+              className="p-2 rounded-lg bg-primary text-primary-foreground
+                disabled:opacity-40 disabled:cursor-not-allowed
+                hover:bg-primary/90 active:scale-95 transition-all shrink-0"
             >
               {state === "loading" ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -284,7 +298,9 @@ export function AIChatPanel({
               )}
             </button>
           </div>
-        
+          <p className="text-[9px] text-muted-foreground/40 text-center mt-1.5">
+            AI can make mistakes — always review before applying
+          </p>
         </div>
       </div>
     </div>

@@ -8,7 +8,6 @@ import {
   Users,
   Search,
   AlertCircle,
-  Tag,
   Eye,
   EyeOff,
   ChevronRight,
@@ -35,6 +34,7 @@ type Customer = {
   skus_shown_all?: string[];
   // Hydrated
   tagNames?: string[];
+  submission_count?: number; // Added to track actual submissions
 };
 
 type RespondersProps = {
@@ -58,68 +58,82 @@ export function Responders({ onNavigateToUserProfile }: RespondersProps) {
     return phone.substring(0, 5) + " ••••••";
   };
 
-const loadData = async () => {
-  setLoading(true);
-  setNoStore(false);
-  try {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user?.id) return;
+  const loadData = async () => {
+    setLoading(true);
+    setNoStore(false);
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user?.id) return;
 
-    console.log("user", user);
+      console.log("user", user);
 
-    // Step 1: Get all forms owned by this user
-    const { data: forms } = await supabase
-      .from("forms")
-      .select("id")
-      .eq("owner_id", user.id);
+      // Step 1: Get all forms owned by this user
+      const { data: forms } = await supabase
+        .from("forms")
+        .select("id")
+        .eq("owner_id", user.id);
 
       console.log("forms", forms);
 
-    if (!forms || forms.length === 0) {
-      setCustomers([]);
-      return;
+      if (!forms || forms.length === 0) {
+        setCustomers([]);
+        return;
+      }
+
+      const formIds = forms.map((f) => f.id);
+
+      // Step 2: Get all responses to those forms that have a customer linked
+      const { data: responses } = await supabase
+        .from("responses")
+        .select("customer_id")
+        .in("form_id", formIds)
+        .not("customer_id", "is", null);
+
+      if (!responses || responses.length === 0) {
+        setCustomers([]);
+        return;
+      }
+
+      // ── NEW LOGIC: Calculate submission frequency per customer ──
+      const submissionCounts: Record<string, number> = {};
+      responses.forEach((r) => {
+        if (r.customer_id) {
+          submissionCounts[r.customer_id] =
+            (submissionCounts[r.customer_id] || 0) + 1;
+        }
+      });
+
+      // Step 3: Unique customer IDs only
+      const customerIds = Object.keys(submissionCounts);
+
+      // Step 4: Fetch those customer records
+      const { data: rows } = await supabase
+        .from("customers")
+        .select("*")
+        .in("id", customerIds)
+        .order("last_active", { ascending: false, nullsFirst: false });
+
+      // Step 5: Hydrate customer records with submission counts
+      const hydratedCustomers = (rows || []).map((customer) => ({
+        ...customer,
+        submission_count: submissionCounts[customer.id] || 0,
+      }));
+
+      setCustomers(hydratedCustomers);
+    } catch (err) {
+      console.error("loadData failed:", err);
+    } finally {
+      setLoading(false);
     }
-
-    const formIds = forms.map((f) => f.id);
-
-    // Step 2: Get all responses to those forms that have a customer linked
-    const { data: responses } = await supabase
-      .from("responses")
-      .select("customer_id")
-      .in("form_id", formIds)
-      .not("customer_id", "is", null);
-
-    if (!responses || responses.length === 0) {
-      setCustomers([]);
-      return;
-    }
-
-    // Step 3: Unique customer IDs only
-    const customerIds = [...new Set(responses.map((r) => r.customer_id))];
-
-    // Step 4: Fetch those customer records
-    const { data: rows } = await supabase
-      .from("customers")
-      .select("*")
-      .in("id", customerIds)
-      .order("last_active", { ascending: false, nullsFirst: false });
-
-    setCustomers(rows || []);
-  } catch (err) {
-    console.error("loadData failed:", err);
-  } finally {
-    setLoading(false);
-  }
-};
-
-
+  };
 
   useEffect(() => {
     loadData();
   }, []);
 
+  // Filter Logic
   const filtered = customers.filter((c) => {
     if (!searchTerm) return true;
     const s = searchTerm.toLowerCase();
@@ -161,7 +175,7 @@ const loadData = async () => {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
               type="text"
-              placeholder="Search by name, email, phone, or tag..."
+              placeholder="Search by name, email, phone..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="w-full pl-10 pr-4 py-2.5 bg-muted rounded-xl border border-border focus:outline-none focus:border-primary text-sm"
@@ -199,7 +213,7 @@ const loadData = async () => {
                       Phone
                     </th>
                     <th className="px-5 py-3 text-left text-muted-foreground font-medium">
-                      Visits
+                      Submissions
                     </th>
                     <th className="px-5 py-3 text-left text-muted-foreground font-medium">
                       Last Active
@@ -211,120 +225,123 @@ const loadData = async () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((customer) => (
-                    <tr
-                      key={customer.id}
-                      className="border-b border-border last:border-0 hover:bg-muted/50 transition-colors cursor-pointer group"
-                      onClick={() => {
-                        trackEvent("Customer Profile Clicked", {
-                          customerId: customer.id,
-                          hasEmail: !!customer.email,
-                          hasPhone: !!customer.phone,
-                          visitCount: customer.visit_count,
-                        });
-                        onNavigateToUserProfile?.(customer.id);
-                      }}
-                    >
-                      {/* Name + Email */}
-                      <td className="px-5 py-4">
-                        <p className="font-medium text-foreground">
-                          {customer.name ||
-                            customer.phone ||
-                            customer.email ||
-                            "Anonymous"}
-                        </p>
-                        {customer.email && (
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            {customer.email}
+                  {filtered.map((customer) => {
+                    const submissionsCount = customer.submission_count ?? 0;
+
+                    return (
+                      <tr
+                        key={customer.id}
+                        className="border-b border-border last:border-0 hover:bg-muted/50 transition-colors cursor-pointer group"
+                        onClick={() => {
+                          trackEvent("Customer Profile Clicked", {
+                            customerId: customer.id,
+                            hasEmail: !!customer.email,
+                            hasPhone: !!customer.phone,
+                            submissionsCount: submissionsCount,
+                          });
+                          onNavigateToUserProfile?.(customer.id);
+                        }}
+                      >
+                        {/* Name + Email */}
+                        <td className="px-5 py-4">
+                          <p className="font-medium text-foreground">
+                            {customer.name ||
+                              customer.phone ||
+                              customer.email ||
+                              "Anonymous"}
                           </p>
-                        )}
-                      </td>
+                          {customer.email && (
+                            <p className="text-xs text-muted-foreground mt-0.5">
+                              {customer.email}
+                            </p>
+                          )}
+                        </td>
 
-                      {/* Phone (masked) */}
-                      <td className="px-5 py-4">
-                        {!customer.phone ? (
-                          <span className="text-muted-foreground">–</span>
-                        ) : revealedPhones.has(customer.id) ? (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setRevealedPhones((prev) => {
-                                const n = new Set(prev);
-                                n.delete(customer.id);
-                                return n;
-                              });
-                            }}
-                            className="font-mono text-foreground flex items-center gap-1.5 hover:text-primary transition-colors"
-                          >
-                            {customer.phone}
-                            <EyeOff className="w-3.5 h-3.5 text-muted-foreground" />
-                          </button>
-                        ) : (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setRevealedPhones((prev) =>
-                                new Set(prev).add(customer.id),
-                              );
-                            }}
-                            className="font-mono text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5"
-                          >
-                            {maskPhone(customer.phone)}
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                        )}
-                      </td>
+                        {/* Phone (masked) */}
+                        <td className="px-5 py-4">
+                          {!customer.phone ? (
+                            <span className="text-muted-foreground">–</span>
+                          ) : revealedPhones.has(customer.id) ? (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRevealedPhones((prev) => {
+                                  const n = new Set(prev);
+                                  n.delete(customer.id);
+                                  return n;
+                                });
+                              }}
+                              className="font-mono text-foreground flex items-center gap-1.5 hover:text-primary transition-colors"
+                            >
+                              {customer.phone}
+                              <EyeOff className="w-3.5 h-3.5 text-muted-foreground" />
+                            </button>
+                          ) : (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRevealedPhones((prev) =>
+                                  new Set(prev).add(customer.id),
+                                );
+                              }}
+                              className="font-mono text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5"
+                            >
+                              {maskPhone(customer.phone)}
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </td>
 
-                      {/* Tags */}
-                      {/* Removed tags column */}
-
-                      {/* Visit Count */}
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-1.5">
-                          <ShoppingBag className="w-3.5 h-3.5 text-muted-foreground" />
-                          <span className="tabular-nums text-foreground">
-                            {customer.visit_count ?? 0}
-                          </span>
-                        </div>
-                      </td>
-
-                      {/* Last Active */}
-                      <td className="px-5 py-4">
-                        {customer.last_active ? (
-                          <div className="flex items-center gap-1.5 text-muted-foreground text-xs">
-                            <Clock className="w-3.5 h-3.5" />
-                            {formatInStoreTime(new Date(customer.last_active))}
+                        {/* Submissions Count */}
+                        <td className="px-5 py-4">
+                          <div className="flex items-center gap-1.5">
+                            <ShoppingBag className="w-3.5 h-3.5 text-muted-foreground" />
+                            <span className="tabular-nums text-foreground font-medium">
+                              {submissionsCount}
+                            </span>
                           </div>
-                        ) : (
-                          <span className="text-muted-foreground text-xs">
-                            Never
-                          </span>
-                        )}
-                      </td>
+                        </td>
 
-                      {/* Status Badge */}
-                      <td className="px-5 py-4">
-                        {(customer.visit_count ?? 0) >= 4 ? (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-gradient-to-r from-primary to-accent text-primary-foreground text-xs font-medium">
-                            VIP
-                          </span>
-                        ) : (customer.visit_count ?? 0) >= 2 ? (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-foreground text-background text-xs font-medium">
-                            Repeat
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-yellow-100 text-yellow-800 text-xs font-medium">
-                            New
-                          </span>
-                        )}
-                      </td>
+                        {/* Last Active */}
+                        <td className="px-5 py-4">
+                          {customer.last_active ? (
+                            <div className="flex items-center gap-1.5 text-muted-foreground text-xs">
+                              <Clock className="w-3.5 h-3.5" />
+                              {formatInStoreTime(
+                                new Date(customer.last_active),
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-muted-foreground text-xs">
+                              Never
+                            </span>
+                          )}
+                        </td>
 
-                      {/* Arrow */}
-                      <td className="px-4 py-4 text-right">
-                        <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
-                      </td>
-                    </tr>
-                  ))}
+                        {/* Status Badge */}
+                        <td className="px-5 py-4">
+                          {submissionsCount >= 4 ? (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-gradient-to-r from-primary to-accent text-primary-foreground text-xs font-medium">
+                              Repeat
+                            </span>
+                          ) : submissionsCount >= 2 ? (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-foreground text-background text-xs font-medium">
+                              Repeat
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full bg-yellow-100 text-yellow-800 text-xs font-medium">
+                              New
+                            </span>
+                          )}
+                        </td>
+
+                        {/* Arrow */}
+                        <td className="px-4 py-4 text-right">
+                          <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
